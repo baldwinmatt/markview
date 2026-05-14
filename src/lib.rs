@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use pulldown_cmark::{html, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    html, CodeBlockKind, CowStr, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+};
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -325,6 +327,34 @@ impl AppModel {
         Ok(ids)
     }
 
+    pub fn refresh_changed_paths<'a, I, F, E>(
+        &mut self,
+        changed_paths: I,
+        mut load: F,
+    ) -> Result<Vec<u64>, E>
+    where
+        I: IntoIterator<Item = &'a Path>,
+        F: FnMut(&Path) -> Result<String, E>,
+    {
+        let changed_paths = changed_paths.into_iter().collect::<Vec<_>>();
+        let ids = self
+            .tabs
+            .iter()
+            .filter(|tab| {
+                tab.path
+                    .as_deref()
+                    .is_some_and(|path| changed_paths.contains(&path))
+            })
+            .map(|tab| tab.id)
+            .collect::<Vec<_>>();
+
+        for id in &ids {
+            self.refresh_tab(*id, &mut load)?;
+        }
+
+        Ok(ids)
+    }
+
     pub fn refresh_file_backed<F, E>(&mut self, mut load: F) -> Result<Vec<u64>, E>
     where
         F: FnMut(&Path) -> Result<String, E>,
@@ -444,11 +474,18 @@ pub fn app_view(model: &AppModel) -> AppView {
 
 fn render_html_body(document: &MarkdownDocument) -> String {
     let mut body = String::new();
-    html::push_html(
-        &mut body,
-        Parser::new_ext(document.source(), markdown_options()),
-    );
+    let parser = Parser::new_ext(document.source(), markdown_options()).map(sanitize_html_event);
+    html::push_html(&mut body, parser);
     body
+}
+
+fn sanitize_html_event(event: Event<'_>) -> Event<'_> {
+    match event {
+        Event::Html(html) | Event::InlineHtml(html) => {
+            Event::Text(CowStr::Boxed(html.to_string().into_boxed_str()))
+        }
+        event => event,
+    }
 }
 
 fn render_terminal(markdown: &str, options: RenderOptions) -> String {
@@ -1099,6 +1136,15 @@ mod tests {
     }
 
     #[test]
+    fn html_renderer_displays_raw_html_as_text() {
+        let html = render_html("<svg onload=\"window.ipc.postMessage('open')\"></svg>");
+
+        assert!(html.contains("&lt;svg"));
+        assert!(html.contains("onload"));
+        assert!(!html.contains("<svg onload"));
+    }
+
+    #[test]
     fn renders_full_html_document() {
         let document = MarkdownDocument::with_title(
             "# Hello\n\nThis is **rendered** Markdown.",
@@ -1249,6 +1295,26 @@ mod tests {
     }
 
     #[test]
+    fn app_model_refreshes_only_tabs_matching_changed_paths() {
+        let mut model = AppModel::new();
+        let first = model.open_file(PathBuf::from("/tmp/one.md"), "# One".to_owned());
+        model.open_file(PathBuf::from("/tmp/two.md"), "# Two".to_owned());
+        model.open_untitled("stdin", "# Piped".to_owned());
+
+        let changed = [Path::new("/tmp/one.md")];
+        let refreshed = model
+            .refresh_changed_paths(changed, |path| {
+                Ok::<_, std::convert::Infallible>(format!("# Fresh {}", path.display()))
+            })
+            .expect("refresh");
+
+        assert_eq!(refreshed, vec![first]);
+        assert_eq!(model.tabs()[0].document().source(), "# Fresh /tmp/one.md");
+        assert_eq!(model.tabs()[1].document().source(), "# Two");
+        assert_eq!(model.tabs()[2].document().source(), "# Piped");
+    }
+
+    #[test]
     fn app_model_refreshes_all_file_backed_tabs_for_directory_events() {
         let mut model = AppModel::new();
         let first = model.open_file(PathBuf::from("README.md"), "# Old readme".to_owned());
@@ -1278,6 +1344,19 @@ mod tests {
             model.watched_directories(),
             vec![PathBuf::from("."), PathBuf::from("docs")]
         );
+    }
+
+    #[test]
+    fn app_model_drops_watched_directory_after_last_tab_in_directory_closes() {
+        let mut model = AppModel::new();
+        let readme = model.open_file(PathBuf::from("README.md"), String::new());
+        let guide = model.open_file(PathBuf::from("docs/guide.md"), String::new());
+
+        assert!(model.close(guide));
+
+        assert_eq!(model.watched_directories(), vec![PathBuf::from(".")]);
+        assert!(model.close(readme));
+        assert!(model.watched_directories().is_empty());
     }
 
     #[test]

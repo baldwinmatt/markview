@@ -34,9 +34,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let proxy = event_loop.create_proxy();
     let mut watcher = FileWatcher::new(proxy.clone())?;
 
-    for directory in model.watched_directories() {
-        watcher.watch(directory)?;
-    }
+    watcher.sync(model.watched_directories())?;
 
     let window = WindowBuilder::new()
         .with_title(window_title(&model))
@@ -76,11 +74,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             Event::UserEvent(UserEvent::CloseTab(id)) => {
                 model.close(id);
+                if let Err(error) = watcher.sync(model.watched_directories()) {
+                    eprintln!("markview-gui: {error}");
+                }
                 sync_view(&webview, &model);
                 window.set_title(&window_title(&model));
             }
-            Event::UserEvent(UserEvent::FilesChanged) => {
-                if let Err(error) = model.refresh_file_backed(|path| fs::read_to_string(path)) {
+            Event::UserEvent(UserEvent::FilesChanged(paths)) => {
+                if let Err(error) = model
+                    .refresh_changed_paths(paths.iter().map(PathBuf::as_path), |path| {
+                        fs::read_to_string(path)
+                    })
+                {
                     eprintln!("markview-gui: {error}");
                 }
                 sync_view(&webview, &model);
@@ -131,7 +136,7 @@ fn initial_model(input: Option<PathBuf>) -> Result<AppModel, Box<dyn std::error:
     match input {
         Some(path) => {
             let source = fs::read_to_string(&path)?;
-            model.open_file(path, source);
+            model.open_file(normalize_path(path), source);
         }
         None if !io::stdin().is_terminal() => {
             let mut source = String::new();
@@ -157,10 +162,8 @@ fn open_document(
     };
 
     let source = fs::read_to_string(&path)?;
-    model.open_file(path.clone(), source);
-    if let Some(parent) = path.parent() {
-        watcher.watch(parent.to_path_buf())?;
-    }
+    model.open_file(normalize_path(path), source);
+    watcher.sync(model.watched_directories())?;
     Ok(())
 }
 
@@ -185,7 +188,7 @@ enum UserEvent {
     RefreshRequested,
     SelectTab(u64),
     CloseTab(u64),
-    FilesChanged,
+    FilesChanged(Vec<PathBuf>),
 }
 
 struct FileWatcher {
@@ -199,7 +202,8 @@ impl FileWatcher {
             move |result: notify::Result<notify::Event>| {
                 if let Ok(event) = result {
                     if is_refresh_event(&event.kind) {
-                        let _ = proxy.send_event(UserEvent::FilesChanged);
+                        let paths = event.paths.into_iter().map(normalize_path).collect();
+                        let _ = proxy.send_event(UserEvent::FilesChanged(paths));
                     }
                 }
             },
@@ -212,12 +216,24 @@ impl FileWatcher {
         })
     }
 
-    fn watch(&mut self, directory: PathBuf) -> notify::Result<()> {
-        let directory = normalize_path(directory);
-        if self.watched_directories.insert(directory.clone()) {
-            self.watcher
-                .watch(&directory, RecursiveMode::NonRecursive)?;
+    fn sync<I>(&mut self, directories: I) -> notify::Result<()>
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        let next = directories
+            .into_iter()
+            .map(normalize_path)
+            .collect::<HashSet<_>>();
+
+        for directory in next.difference(&self.watched_directories) {
+            self.watcher.watch(directory, RecursiveMode::NonRecursive)?;
         }
+
+        for directory in self.watched_directories.difference(&next) {
+            self.watcher.unwatch(directory)?;
+        }
+
+        self.watched_directories = next;
         Ok(())
     }
 }

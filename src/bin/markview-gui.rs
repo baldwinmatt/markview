@@ -367,10 +367,89 @@ body {{
   color: var(--fg);
 }}
 .tab-close svg {{ width: 12px; height: 12px; }}
-main {{
-  width: min(860px, calc(100vw - 48px));
+.findbar {{
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}}
+.find-input {{
+  appearance: none;
+  width: 220px;
+  height: 30px;
+  border: 1px solid var(--rule);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--fg);
+  padding: 0 9px;
+  font: inherit;
+  font-size: 0.88rem;
+}}
+.find-count {{
+  min-width: 54px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  text-align: right;
+}}
+.content-shell {{
+  display: grid;
+  grid-template-columns: minmax(170px, 250px) minmax(0, 1fr);
+  gap: 28px;
+  width: min(1120px, calc(100vw - 48px));
   margin: 0 auto;
+  padding: 0 0 64px;
+}}
+.toc {{
+  position: sticky;
+  top: 0;
+  align-self: start;
+  max-height: calc(100vh - 86px);
+  overflow: auto;
+  padding: 38px 0 0;
+}}
+.toc-list {{
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}}
+.toc-link {{
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  width: 100%;
+  min-height: 28px;
+  border-radius: 6px;
+  padding: 4px 8px;
+  text-align: left;
+  font: inherit;
+  font-size: 0.88rem;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}}
+.toc-link:hover {{
+  background: var(--chrome);
+  color: var(--fg);
+}}
+.toc-empty {{
+  color: var(--muted);
+  font-size: 0.86rem;
+  padding: 4px 8px;
+}}
+main {{
   padding: 40px 0 64px;
+  min-width: 0;
+}}
+mark.find-hit {{
+  background: #facc15;
+  color: #1f2937;
+  border-radius: 3px;
+  padding: 0 1px;
+}}
+mark.find-hit.active {{
+  background: #fb923c;
 }}
 h1, h2, h3, h4, h5, h6 {{
   line-height: 1.2;
@@ -424,6 +503,19 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
   text-align: center;
 }}
 .empty-state h1 {{ color: var(--fg); font-size: 1.8rem; }}
+@media (max-width: 760px) {{
+  .find-input {{ width: 150px; }}
+  .content-shell {{
+    display: block;
+    width: min(860px, calc(100vw - 32px));
+  }}
+  .toc {{
+    position: static;
+    max-height: none;
+    padding-top: 18px;
+  }}
+  main {{ padding-top: 24px; }}
+}}
 </style>
 </head>
 <body>
@@ -442,16 +534,42 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
       <path d="M6 22v-5h5"></path>
     </svg>
   </button>
+  <div class="findbar">
+    <input class="find-input" id="find-input" placeholder="Find" aria-label="Find in document">
+    <button class="tool-button" title="Previous match" aria-label="Previous match" id="find-prev">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="m18 15-6-6-6 6"></path>
+      </svg>
+    </button>
+    <button class="tool-button" title="Next match" aria-label="Next match" id="find-next">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="m6 9 6 6 6-6"></path>
+      </svg>
+    </button>
+    <span class="find-count" id="find-count"></span>
+  </div>
 </header>
 <nav class="tabs" id="tabs"></nav>
-<main id="document"></main>
+<div class="content-shell">
+  <aside class="toc" id="toc"></aside>
+  <main id="document"></main>
+</div>
 <script>
 window.markview = {{
   state: {state},
+  scrollPositions: new Map(),
+  findQuery: '',
+  findIndex: -1,
+  findHits: [],
   setState(next) {{
+    const previousId = this.state ? this.state.activeTabId : null;
+    if (previousId !== null) {{
+      this.scrollPositions.set(previousId, window.scrollY);
+    }}
     this.state = next;
     const tabs = document.getElementById('tabs');
     const pane = document.getElementById('document');
+    const toc = document.getElementById('toc');
     tabs.replaceChildren();
     for (const tab of next.tabs) {{
       const button = document.createElement('button');
@@ -474,8 +592,141 @@ window.markview = {{
       tabs.appendChild(button);
     }}
     pane.innerHTML = next.activeHtml;
+    const renderedHeadings = pane.querySelectorAll('h1,h2,h3,h4,h5,h6');
+    next.headings.forEach((heading, index) => {{
+      if (renderedHeadings[index]) {{
+        renderedHeadings[index].id = heading.id;
+      }}
+    }});
+    toc.replaceChildren();
+    if (next.headings.length === 0) {{
+      const empty = document.createElement('div');
+      empty.className = 'toc-empty';
+      empty.textContent = 'No headings';
+      toc.appendChild(empty);
+    }} else {{
+      const list = document.createElement('div');
+      list.className = 'toc-list';
+      for (const heading of next.headings) {{
+        const item = document.createElement('button');
+        item.className = 'toc-link';
+        item.style.paddingLeft = `${{8 + Math.max(0, heading.level - 1) * 12}}px`;
+        item.textContent = heading.title;
+        item.title = heading.title;
+        item.onclick = () => {{
+          const target = document.getElementById(heading.id);
+          if (target) {{
+            target.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+            history.replaceState(null, '', `#${{heading.id}}`);
+          }}
+        }};
+        list.appendChild(item);
+      }}
+      toc.appendChild(list);
+    }}
+    this.applyFind();
+    const restoreY = this.scrollPositions.get(next.activeTabId) || 0;
+    requestAnimationFrame(() => window.scrollTo(0, restoreY));
+  }},
+  applyFind() {{
+    const pane = document.getElementById('document');
+    const count = document.getElementById('find-count');
+    unwrapFindMarks(pane);
+    this.findHits = [];
+    this.findIndex = -1;
+    const query = this.findQuery.trim();
+    if (query.length === 0) {{
+      count.textContent = '';
+      return;
+    }}
+    this.findHits = highlightText(pane, query);
+    if (this.findHits.length > 0) {{
+      this.findIndex = 0;
+      this.activateFindHit(0);
+    }}
+    count.textContent = this.findHits.length === 0 ? '0/0' : `1/${{this.findHits.length}}`;
+  }},
+  activateFindHit(index) {{
+    if (this.findHits.length === 0) {{
+      document.getElementById('find-count').textContent = '0/0';
+      return;
+    }}
+    this.findHits.forEach(hit => hit.classList.remove('active'));
+    this.findIndex = (index + this.findHits.length) % this.findHits.length;
+    const hit = this.findHits[this.findIndex];
+    hit.classList.add('active');
+    hit.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+    document.getElementById('find-count').textContent = `${{this.findIndex + 1}}/${{this.findHits.length}}`;
+  }},
+  findNext() {{
+    this.activateFindHit(this.findIndex + 1);
+  }},
+  findPrevious() {{
+    this.activateFindHit(this.findIndex - 1);
   }}
 }};
+function unwrapFindMarks(root) {{
+  for (const mark of [...root.querySelectorAll('mark.find-hit')]) {{
+    mark.replaceWith(document.createTextNode(mark.textContent));
+  }}
+  root.normalize();
+}}
+function highlightText(root, query) {{
+  const hits = [];
+  const needle = query.toLocaleLowerCase();
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {{
+    acceptNode(node) {{
+      if (!node.nodeValue || !node.nodeValue.toLocaleLowerCase().includes(needle)) {{
+        return NodeFilter.FILTER_REJECT;
+      }}
+      const parent = node.parentElement;
+      if (!parent || parent.closest('script,style,mark')) {{
+        return NodeFilter.FILTER_REJECT;
+      }}
+      return NodeFilter.FILTER_ACCEPT;
+    }}
+  }});
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  for (const node of nodes) {{
+    const text = node.nodeValue;
+    const lower = text.toLocaleLowerCase();
+    const fragment = document.createDocumentFragment();
+    let cursor = 0;
+    let index = lower.indexOf(needle);
+    while (index !== -1) {{
+      fragment.appendChild(document.createTextNode(text.slice(cursor, index)));
+      const mark = document.createElement('mark');
+      mark.className = 'find-hit';
+      mark.textContent = text.slice(index, index + query.length);
+      fragment.appendChild(mark);
+      hits.push(mark);
+      cursor = index + query.length;
+      index = lower.indexOf(needle, cursor);
+    }}
+    fragment.appendChild(document.createTextNode(text.slice(cursor)));
+    node.replaceWith(fragment);
+  }}
+  return hits;
+}}
+document.getElementById('find-input').addEventListener('input', event => {{
+  window.markview.findQuery = event.target.value;
+  window.markview.applyFind();
+}});
+document.getElementById('find-input').addEventListener('keydown', event => {{
+  if (event.key === 'Enter') {{
+    event.preventDefault();
+    event.shiftKey ? window.markview.findPrevious() : window.markview.findNext();
+  }}
+}});
+document.getElementById('find-next').onclick = () => window.markview.findNext();
+document.getElementById('find-prev').onclick = () => window.markview.findPrevious();
+window.addEventListener('keydown', event => {{
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f') {{
+    event.preventDefault();
+    document.getElementById('find-input').focus();
+  }}
+}});
 window.markview.setState(window.markview.state);
 </script>
 </body>
@@ -506,9 +757,22 @@ fn view_js(view: &AppView) -> String {
         .active_tab_id
         .map(|id| id.to_string())
         .unwrap_or_else(|| "null".to_owned());
+    let headings = view
+        .headings
+        .iter()
+        .map(|heading| {
+            format!(
+                "{{level:{},title:{},id:{}}}",
+                heading.level,
+                js_string(&heading.title),
+                js_string(&heading.id)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
 
     format!(
-        "{{tabs:[{tabs}],activeTabId:{active_tab_id},activeHtml:{}}}",
+        "{{tabs:[{tabs}],activeTabId:{active_tab_id},activeHtml:{},headings:[{headings}]}}",
         js_string(&view.active_html)
     )
 }

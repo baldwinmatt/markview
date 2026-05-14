@@ -444,6 +444,7 @@ pub struct AppView {
     pub tabs: Vec<TabView>,
     pub active_tab_id: Option<u64>,
     pub active_html: String,
+    pub headings: Vec<HeadingView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -453,7 +454,16 @@ pub struct TabView {
     pub path: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadingView {
+    pub level: u8,
+    pub title: String,
+    pub id: String,
+}
+
 pub fn app_view(model: &AppModel) -> AppView {
+    let active_document = model.active_tab().map(DocumentTab::document);
+
     AppView {
         tabs: model
             .tabs()
@@ -465,10 +475,10 @@ pub fn app_view(model: &AppModel) -> AppView {
             })
             .collect(),
         active_tab_id: model.active_tab_id(),
-        active_html: model
-            .active_tab()
-            .map(|tab| render_html_body(tab.document()))
+        active_html: active_document
+            .map(render_html_body)
             .unwrap_or_else(empty_state_html),
+        headings: active_document.map(extract_headings).unwrap_or_default(),
     }
 }
 
@@ -477,6 +487,93 @@ fn render_html_body(document: &MarkdownDocument) -> String {
     let parser = Parser::new_ext(document.source(), markdown_options()).map(sanitize_html_event);
     html::push_html(&mut body, parser);
     body
+}
+
+fn extract_headings(document: &MarkdownDocument) -> Vec<HeadingView> {
+    let mut headings = Vec::new();
+    let mut active_heading: Option<(u8, String)> = None;
+    let mut used_ids = Vec::new();
+
+    for event in Parser::new_ext(document.source(), markdown_options()).map(sanitize_html_event) {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                active_heading = Some((heading_level_number(level), String::new()));
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                if let Some((level, title)) = active_heading.take() {
+                    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+                    if !title.is_empty() {
+                        let id = unique_slug(&title, &mut used_ids);
+                        headings.push(HeadingView { level, title, id });
+                    }
+                }
+            }
+            Event::Text(text) | Event::Code(text) => {
+                if let Some((_, title)) = active_heading.as_mut() {
+                    title.push_str(&text);
+                    title.push(' ');
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some((_, title)) = active_heading.as_mut() {
+                    title.push(' ');
+                }
+            }
+            _ => {}
+        }
+    }
+
+    headings
+}
+
+fn heading_level_number(level: HeadingLevel) -> u8 {
+    match level {
+        HeadingLevel::H1 => 1,
+        HeadingLevel::H2 => 2,
+        HeadingLevel::H3 => 3,
+        HeadingLevel::H4 => 4,
+        HeadingLevel::H5 => 5,
+        HeadingLevel::H6 => 6,
+    }
+}
+
+fn unique_slug(title: &str, used_ids: &mut Vec<String>) -> String {
+    let base = slugify(title);
+    let mut id = base.clone();
+    let mut suffix = 2;
+
+    while used_ids.iter().any(|used| used == &id) {
+        id = format!("{base}-{suffix}");
+        suffix += 1;
+    }
+
+    used_ids.push(id.clone());
+    id
+}
+
+fn slugify(title: &str) -> String {
+    let mut slug = String::new();
+    let mut previous_dash = false;
+
+    for ch in title.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            previous_dash = false;
+        } else if !previous_dash && !slug.is_empty() {
+            slug.push('-');
+            previous_dash = true;
+        }
+    }
+
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+
+    if slug.is_empty() {
+        "section".to_owned()
+    } else {
+        slug
+    }
 }
 
 fn sanitize_html_event(event: Event<'_>) -> Event<'_> {
@@ -1362,11 +1459,47 @@ mod tests {
     #[test]
     fn app_view_contains_tabs_and_active_html() {
         let mut model = AppModel::new();
-        let id = model.open_file(PathBuf::from("notes.md"), "# Notes".to_owned());
+        let id = model.open_file(
+            PathBuf::from("notes.md"),
+            "# Notes\n\n## Details".to_owned(),
+        );
         let view = app_view(&model);
 
         assert_eq!(view.active_tab_id, Some(id));
         assert_eq!(view.tabs[0].title, "notes.md");
         assert!(view.active_html.contains("<h1>Notes</h1>"));
+        assert_eq!(
+            view.headings,
+            vec![
+                HeadingView {
+                    level: 1,
+                    title: "Notes".to_owned(),
+                    id: "notes".to_owned(),
+                },
+                HeadingView {
+                    level: 2,
+                    title: "Details".to_owned(),
+                    id: "details".to_owned(),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn app_view_generates_unique_heading_ids() {
+        let mut model = AppModel::new();
+        model.open_file(
+            PathBuf::from("notes.md"),
+            "# Intro!\n\n## Intro\n\n### Intro".to_owned(),
+        );
+        let view = app_view(&model);
+
+        assert_eq!(
+            view.headings
+                .iter()
+                .map(|heading| heading.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["intro", "intro-2", "intro-3"]
+        );
     }
 }

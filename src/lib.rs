@@ -11,6 +11,29 @@ const CYAN: &str = "\x1b[36m";
 const GREEN: &str = "\x1b[32m";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalStyle {
+    Bold,
+    Dim,
+    Italic,
+    Underline,
+    Cyan,
+    Green,
+}
+
+impl TerminalStyle {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Bold => BOLD,
+            Self::Dim => DIM,
+            Self::Italic => ITALIC,
+            Self::Underline => UNDERLINE,
+            Self::Cyan => CYAN,
+            Self::Green => GREEN,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderOptions {
     pub color: bool,
     pub width: usize,
@@ -182,7 +205,7 @@ fn parse_width(value: &str) -> Result<usize, CliError> {
 }
 
 pub fn help() -> &'static str {
-    "Usage: markview [OPTIONS] [FILE]\n\nReads FILE or stdin and renders Markdown for the terminal.\n\nOptions:\n  -w, --width <COLUMNS>  Wrap text to a target width (minimum 20, default 88)\n      --no-color         Disable ANSI styling\n  -h, --help             Show this help\n"
+    "Usage: markview [OPTIONS] [FILE]\n\nReads FILE or stdin and renders Markdown for the terminal.\n\nOptions:\n  -w, --width <COLUMNS>  Wrap text to a target width (minimum 20, default 88)\n      --no-color         Disable ANSI colors while keeping bold text attributes\n  -h, --help             Show this help\n"
 }
 
 pub fn render(markdown: &str, options: RenderOptions) -> String {
@@ -576,6 +599,7 @@ struct Renderer {
     code_block: bool,
     table_depth: usize,
     pending_link: Option<String>,
+    pending_space: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -594,6 +618,7 @@ impl Renderer {
             code_block: false,
             table_depth: 0,
             pending_link: None,
+            pending_space: false,
         }
     }
 
@@ -609,7 +634,7 @@ impl Renderer {
                     self.push_text(&text);
                 }
             }
-            Event::Code(code) => self.push_styled(&format!("`{code}`"), GREEN),
+            Event::Code(code) => self.push_styled(&format!("`{code}`"), &[TerminalStyle::Green]),
             Event::Html(html) | Event::InlineHtml(html) => self.push_text(&html),
             Event::SoftBreak => self.push_text(" "),
             Event::HardBreak => self.flush_line(),
@@ -619,10 +644,12 @@ impl Renderer {
                 self.out.push('\n');
                 self.blank();
             }
-            Event::InlineMath(math) => self.push_styled(&format!("${math}$"), GREEN),
+            Event::InlineMath(math) => {
+                self.push_styled(&format!("${math}$"), &[TerminalStyle::Green]);
+            }
             Event::DisplayMath(math) => {
                 self.blank();
-                self.push_styled(&format!("$$\n{math}\n$$"), GREEN);
+                self.push_styled(&format!("$$\n{math}\n$$"), &[TerminalStyle::Green]);
                 self.blank();
             }
             Event::FootnoteReference(reference) => self.push_text(&format!("[^{reference}]")),
@@ -637,7 +664,9 @@ impl Renderer {
             Tag::Paragraph => {}
             Tag::Heading { level, .. } => {
                 self.blank();
-                self.push_styled(&heading_prefix(level), CYAN);
+                self.push_style(TerminalStyle::Bold);
+                self.push_style(TerminalStyle::Cyan);
+                self.push_text(&heading_prefix(level));
             }
             Tag::BlockQuote(_) => {
                 self.flush_line();
@@ -647,7 +676,7 @@ impl Renderer {
                 self.blank();
                 if let CodeBlockKind::Fenced(language) = kind {
                     if !language.is_empty() {
-                        self.push_styled(language.as_ref(), DIM);
+                        self.push_styled(language.as_ref(), &[TerminalStyle::Dim]);
                         self.flush_line();
                     }
                 }
@@ -673,8 +702,8 @@ impl Renderer {
                 };
                 self.push_text(&marker);
             }
-            Tag::Emphasis => self.push_style(ITALIC),
-            Tag::Strong => self.push_style(BOLD),
+            Tag::Emphasis => self.push_style(TerminalStyle::Italic),
+            Tag::Strong => self.push_style(TerminalStyle::Bold),
             Tag::Strikethrough => self.push_text("~"),
             Tag::Link { dest_url, .. } => self.pending_link = Some(dest_url.to_string()),
             Tag::Image {
@@ -685,7 +714,7 @@ impl Renderer {
                 } else {
                     format!("[image: {title} - {dest_url}]")
                 };
-                self.push_styled(&label, UNDERLINE);
+                self.push_styled(&label, &[TerminalStyle::Underline]);
             }
             Tag::Table(_) => {
                 self.blank();
@@ -704,7 +733,12 @@ impl Renderer {
 
     fn end(&mut self, tag: TagEnd) {
         match tag {
-            TagEnd::Paragraph | TagEnd::Heading(_) => {
+            TagEnd::Paragraph => {
+                self.flush_line();
+                self.blank();
+            }
+            TagEnd::Heading(_) => {
+                self.push_reset();
                 self.flush_line();
                 self.blank();
             }
@@ -726,7 +760,7 @@ impl Renderer {
             TagEnd::Strikethrough => self.push_text("~"),
             TagEnd::Link => {
                 if let Some(dest) = self.pending_link.take() {
-                    self.push_styled(&format!(" ({dest})"), DIM);
+                    self.push_styled(&format!(" ({dest})"), &[TerminalStyle::Dim]);
                 }
             }
             TagEnd::Image => {}
@@ -750,6 +784,8 @@ impl Renderer {
             self.push_word(word);
         }
 
+        self.pending_space = text.chars().last().is_some_and(char::is_whitespace);
+
         if text.ends_with('\n') {
             self.flush_line();
         }
@@ -758,50 +794,63 @@ impl Renderer {
     fn push_word(&mut self, word: &str) {
         let indent = self.indent();
         let limit = self.options.width.max(indent.len() + 20);
+        let has_visible_text = line_has_visible_text(&self.line);
         let projected =
-            self.line.chars().count() + word.chars().count() + usize::from(!self.line.is_empty());
+            visible_len(&self.line) + word.chars().count() + usize::from(has_visible_text);
 
-        if projected > limit && !self.line.trim().is_empty() {
+        if projected > limit && has_visible_text {
             self.flush_line();
         }
 
-        if self.line.is_empty() {
+        if !line_has_visible_text(&self.line) {
             self.line.push_str(&indent);
-        } else if !self.line.ends_with(' ') && !attaches_to_previous(word) {
+        } else if !line_ends_with_visible_space(&self.line) && !attaches_to_previous(word) {
             self.line.push(' ');
         }
 
         self.line.push_str(word);
+        self.pending_space = false;
     }
 
-    fn push_style(&mut self, style: &str) {
-        if self.options.color {
-            self.line.push_str(style);
+    fn push_style(&mut self, style: TerminalStyle) {
+        if self.should_emit_style(style) {
+            if self.pending_space && line_has_visible_text(&self.line) && !self.line.ends_with(' ')
+            {
+                self.line.push(' ');
+            }
+            self.line.push_str(style.code());
+            self.pending_space = false;
         }
     }
 
     fn push_reset(&mut self) {
-        if self.options.color {
-            self.line.push_str(RESET);
-        }
+        self.line.push_str(RESET);
     }
 
-    fn push_styled(&mut self, text: &str, style: &str) {
-        self.push_style(style);
+    fn push_styled(&mut self, text: &str, styles: &[TerminalStyle]) {
+        let mut emitted_style = false;
+        for style in styles {
+            if self.should_emit_style(*style) {
+                self.line.push_str(style.code());
+                emitted_style = true;
+            }
+        }
         self.push_text(text);
-        self.push_reset();
+        if emitted_style {
+            self.push_reset();
+        }
     }
 
     fn write_code(&mut self, code: &str) {
         for raw_line in code.lines() {
             let indent = self.indent();
-            if self.options.color {
-                self.out.push_str(DIM);
+            if self.should_emit_style(TerminalStyle::Dim) {
+                self.out.push_str(TerminalStyle::Dim.code());
             }
             self.out.push_str(&indent);
             self.out.push_str("    ");
             self.out.push_str(raw_line);
-            if self.options.color {
+            if self.should_emit_style(TerminalStyle::Dim) {
                 self.out.push_str(RESET);
             }
             self.out.push('\n');
@@ -809,11 +858,12 @@ impl Renderer {
     }
 
     fn flush_line(&mut self) {
-        if !self.line.trim().is_empty() {
+        if line_has_visible_text(&self.line) {
             self.out.push_str(self.line.trim_end());
             self.out.push('\n');
         }
         self.line.clear();
+        self.pending_space = false;
     }
 
     fn blank(&mut self) {
@@ -839,6 +889,10 @@ impl Renderer {
         let list = "  ".repeat(self.list_stack.len().saturating_sub(1));
         format!("{quote}{list}")
     }
+
+    fn should_emit_style(&self, style: TerminalStyle) -> bool {
+        self.options.color || style == TerminalStyle::Bold
+    }
 }
 
 fn heading_prefix(level: HeadingLevel) -> String {
@@ -860,6 +914,54 @@ fn attaches_to_previous(word: &str) -> bool {
     )
 }
 
+fn line_has_visible_text(line: &str) -> bool {
+    visible_len(line) > 0
+}
+
+fn line_ends_with_visible_space(line: &str) -> bool {
+    last_visible_char(line).is_some_and(char::is_whitespace)
+}
+
+fn last_visible_char(line: &str) -> Option<char> {
+    let mut last = None;
+    let mut chars = line.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for code in chars.by_ref() {
+                if code.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            last = Some(ch);
+        }
+    }
+
+    last
+}
+
+fn visible_len(line: &str) -> usize {
+    let mut len = 0;
+    let mut chars = line.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for code in chars.by_ref() {
+                if code.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else if !ch.is_whitespace() || len > 0 {
+            len += 1;
+        }
+    }
+
+    len
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -874,12 +976,33 @@ mod tests {
         )
     }
 
+    fn strip_ansi(input: &str) -> String {
+        let mut stripped = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' && chars.peek() == Some(&'[') {
+                chars.next();
+                for code in chars.by_ref() {
+                    if code.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                stripped.push(ch);
+            }
+        }
+
+        stripped
+    }
+
     #[test]
     fn renders_headings_and_paragraphs() {
         let rendered = plain("# Hello\n\nThis is **small** and _fast_.\n");
+        let text = strip_ansi(&rendered);
 
-        assert!(rendered.contains("# Hello\n"));
-        assert!(rendered.contains("This is small and fast."));
+        assert!(text.contains("# Hello\n"));
+        assert!(text.contains("This is small and fast."));
     }
 
     #[test]
@@ -950,6 +1073,29 @@ mod tests {
             Cli::parse(["--width", "12"]).expect_err("invalid width"),
             CliError::InvalidWidth("12".to_owned())
         );
+    }
+
+    #[test]
+    fn renders_headings_with_bold_attribute_without_color() {
+        let rendered = plain("# Bold title");
+
+        assert!(rendered.contains("\x1b[1m# Bold title\x1b[0m"));
+        assert!(!rendered.contains(CYAN));
+    }
+
+    #[test]
+    fn renders_strong_text_with_bold_attribute_without_color() {
+        let rendered = plain("This is **important**.");
+
+        assert!(rendered.contains("This is \x1b[1mimportant\x1b[0m."));
+        assert_eq!(strip_ansi(&rendered), "This is important.\n");
+    }
+
+    #[test]
+    fn no_color_keeps_links_plain() {
+        let rendered = plain("[Rust](https://www.rust-lang.org/)");
+
+        assert_eq!(rendered, "Rust (https://www.rust-lang.org/)\n");
     }
 
     #[test]

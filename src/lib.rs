@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use pulldown_cmark::{html, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
@@ -193,6 +193,241 @@ pub fn render_html(markdown: &str) -> String {
     HtmlRenderer.render_document(&MarkdownDocument::new(markdown))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentTab {
+    id: u64,
+    path: Option<PathBuf>,
+    document: MarkdownDocument,
+}
+
+impl DocumentTab {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    pub fn document(&self) -> &MarkdownDocument {
+        &self.document
+    }
+
+    pub fn title(&self) -> &str {
+        self.document.title()
+    }
+
+    pub fn is_file_backed(&self) -> bool {
+        self.path.is_some()
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AppModel {
+    tabs: Vec<DocumentTab>,
+    active_tab: Option<u64>,
+    next_tab_id: u64,
+}
+
+impl AppModel {
+    pub fn new() -> Self {
+        Self {
+            tabs: Vec::new(),
+            active_tab: None,
+            next_tab_id: 1,
+        }
+    }
+
+    pub fn open_file(&mut self, path: PathBuf, source: String) -> u64 {
+        let document = MarkdownDocument::from_path(source, &path);
+        self.push_tab(Some(path), document)
+    }
+
+    pub fn open_untitled(&mut self, title: impl Into<String>, source: String) -> u64 {
+        let document = MarkdownDocument::with_title(source, title);
+        self.push_tab(None, document)
+    }
+
+    pub fn select(&mut self, id: u64) -> bool {
+        if self.tabs.iter().any(|tab| tab.id == id) {
+            self.active_tab = Some(id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn close(&mut self, id: u64) -> bool {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return false;
+        };
+        let was_active = self.active_tab == Some(id);
+        self.tabs.remove(index);
+
+        if self.tabs.is_empty() {
+            self.active_tab = None;
+        } else if was_active {
+            let next_index = index.min(self.tabs.len() - 1);
+            self.active_tab = Some(self.tabs[next_index].id);
+        }
+
+        true
+    }
+
+    pub fn refresh_active<F, E>(&mut self, mut load: F) -> Result<Option<u64>, E>
+    where
+        F: FnMut(&Path) -> Result<String, E>,
+    {
+        let Some(id) = self.active_tab else {
+            return Ok(None);
+        };
+        self.refresh_tab(id, &mut load)
+    }
+
+    pub fn refresh_path<F, E>(&mut self, path: &Path, mut load: F) -> Result<Vec<u64>, E>
+    where
+        F: FnMut(&Path) -> Result<String, E>,
+    {
+        let ids = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.path.as_deref() == Some(path))
+            .map(|tab| tab.id)
+            .collect::<Vec<_>>();
+
+        for id in &ids {
+            self.refresh_tab(*id, &mut load)?;
+        }
+
+        Ok(ids)
+    }
+
+    pub fn refresh_file_backed<F, E>(&mut self, mut load: F) -> Result<Vec<u64>, E>
+    where
+        F: FnMut(&Path) -> Result<String, E>,
+    {
+        let ids = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.is_file_backed())
+            .map(|tab| tab.id)
+            .collect::<Vec<_>>();
+
+        for id in &ids {
+            self.refresh_tab(*id, &mut load)?;
+        }
+
+        Ok(ids)
+    }
+
+    pub fn watched_directories(&self) -> Vec<PathBuf> {
+        let mut directories = Vec::new();
+        for path in self.watched_paths() {
+            if let Some(parent) = path.parent() {
+                let directory = if parent.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    parent.to_path_buf()
+                };
+                if !directories.iter().any(|known| known == &directory) {
+                    directories.push(directory);
+                }
+            }
+        }
+        directories
+    }
+
+    pub fn tabs(&self) -> &[DocumentTab] {
+        &self.tabs
+    }
+
+    pub fn active_tab(&self) -> Option<&DocumentTab> {
+        let id = self.active_tab?;
+        self.tabs.iter().find(|tab| tab.id == id)
+    }
+
+    pub fn active_tab_id(&self) -> Option<u64> {
+        self.active_tab
+    }
+
+    pub fn watched_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for tab in &self.tabs {
+            if let Some(path) = &tab.path {
+                if !paths.iter().any(|known| known == path) {
+                    paths.push(path.clone());
+                }
+            }
+        }
+        paths
+    }
+
+    fn push_tab(&mut self, path: Option<PathBuf>, document: MarkdownDocument) -> u64 {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.tabs.push(DocumentTab { id, path, document });
+        self.active_tab = Some(id);
+        id
+    }
+
+    fn refresh_tab<F, E>(&mut self, id: u64, load: &mut F) -> Result<Option<u64>, E>
+    where
+        F: FnMut(&Path) -> Result<String, E>,
+    {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
+            return Ok(None);
+        };
+        let Some(path) = tab.path.clone() else {
+            return Ok(None);
+        };
+        let source = load(&path)?;
+        tab.document = MarkdownDocument::from_path(source, &path);
+        Ok(Some(id))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppView {
+    pub tabs: Vec<TabView>,
+    pub active_tab_id: Option<u64>,
+    pub active_html: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabView {
+    pub id: u64,
+    pub title: String,
+    pub path: Option<String>,
+}
+
+pub fn app_view(model: &AppModel) -> AppView {
+    AppView {
+        tabs: model
+            .tabs()
+            .iter()
+            .map(|tab| TabView {
+                id: tab.id(),
+                title: tab.title().to_owned(),
+                path: tab.path().map(|path| path.display().to_string()),
+            })
+            .collect(),
+        active_tab_id: model.active_tab_id(),
+        active_html: model
+            .active_tab()
+            .map(|tab| render_html_body(tab.document()))
+            .unwrap_or_else(empty_state_html),
+    }
+}
+
+fn render_html_body(document: &MarkdownDocument) -> String {
+    let mut body = String::new();
+    html::push_html(
+        &mut body,
+        Parser::new_ext(document.source(), markdown_options()),
+    );
+    body
+}
+
 fn render_terminal(markdown: &str, options: RenderOptions) -> String {
     let parser = Parser::new_ext(markdown, markdown_options());
     let mut renderer = Renderer::new(options);
@@ -205,11 +440,7 @@ fn render_terminal(markdown: &str, options: RenderOptions) -> String {
 }
 
 fn render_html_document(document: &MarkdownDocument) -> String {
-    let mut body = String::new();
-    html::push_html(
-        &mut body,
-        Parser::new_ext(document.source(), markdown_options()),
-    );
+    let body = render_html_body(document);
 
     format!(
         r#"<!doctype html>
@@ -310,6 +541,11 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
         escape_html(document.title()),
         body
     )
+}
+
+fn empty_state_html() -> String {
+    r#"<section class="empty-state"><h1>No document open</h1><p>Use Open to choose a Markdown file.</p></section>"#
+        .to_owned()
 }
 
 fn markdown_options() -> Options {
@@ -751,5 +987,161 @@ mod tests {
 
         assert!(terminal.contains("link (https://example.com)."));
         assert!(html.contains(r#"<a href="https://example.com">link</a>"#));
+    }
+
+    #[test]
+    fn app_model_opens_tabs_and_tracks_active_tab() {
+        let mut model = AppModel::new();
+        let first = model.open_file(PathBuf::from("first.md"), "# First".to_owned());
+        let second = model.open_file(PathBuf::from("second.md"), "# Second".to_owned());
+
+        assert_eq!(model.tabs().len(), 2);
+        assert_eq!(model.active_tab_id(), Some(second));
+
+        assert!(model.select(first));
+        assert_eq!(model.active_tab().map(DocumentTab::title), Some("first.md"));
+    }
+
+    #[test]
+    fn app_model_closes_inactive_tab_without_changing_active_tab() {
+        let mut model = AppModel::new();
+        let first = model.open_file(PathBuf::from("first.md"), "# First".to_owned());
+        let second = model.open_file(PathBuf::from("second.md"), "# Second".to_owned());
+
+        assert!(model.close(first));
+
+        assert_eq!(model.tabs().len(), 1);
+        assert_eq!(model.active_tab_id(), Some(second));
+        assert_eq!(
+            model.active_tab().map(DocumentTab::title),
+            Some("second.md")
+        );
+    }
+
+    #[test]
+    fn app_model_closes_active_tab_and_selects_neighbor() {
+        let mut model = AppModel::new();
+        let first = model.open_file(PathBuf::from("first.md"), "# First".to_owned());
+        let second = model.open_file(PathBuf::from("second.md"), "# Second".to_owned());
+        let third = model.open_file(PathBuf::from("third.md"), "# Third".to_owned());
+
+        assert!(model.select(second));
+        assert!(model.close(second));
+
+        assert_eq!(model.active_tab_id(), Some(third));
+        assert_eq!(
+            model.tabs().iter().map(DocumentTab::id).collect::<Vec<_>>(),
+            vec![first, third]
+        );
+    }
+
+    #[test]
+    fn app_model_closes_last_tab_to_empty_state() {
+        let mut model = AppModel::new();
+        let id = model.open_file(PathBuf::from("only.md"), "# Only".to_owned());
+
+        assert!(model.close(id));
+
+        assert!(model.tabs().is_empty());
+        assert_eq!(model.active_tab_id(), None);
+        assert_eq!(model.active_tab(), None);
+    }
+
+    #[test]
+    fn app_model_refreshes_active_file_backed_tab() {
+        let mut model = AppModel::new();
+        let id = model.open_file(PathBuf::from("notes.md"), "# Old".to_owned());
+
+        let refreshed = model
+            .refresh_active(|path| {
+                assert_eq!(path, Path::new("notes.md"));
+                Ok::<_, std::convert::Infallible>("# New".to_owned())
+            })
+            .expect("refresh");
+
+        assert_eq!(refreshed, Some(id));
+        assert_eq!(
+            model.active_tab().map(|tab| tab.document().source()),
+            Some("# New")
+        );
+    }
+
+    #[test]
+    fn app_model_skips_manual_refresh_for_untitled_tab() {
+        let mut model = AppModel::new();
+        model.open_untitled("stdin", "# Piped".to_owned());
+
+        let refreshed = model
+            .refresh_active(|_| Ok::<_, std::convert::Infallible>("# Changed".to_owned()))
+            .expect("refresh");
+
+        assert_eq!(refreshed, None);
+        assert_eq!(
+            model.active_tab().map(|tab| tab.document().source()),
+            Some("# Piped")
+        );
+    }
+
+    #[test]
+    fn app_model_refreshes_all_tabs_for_changed_path() {
+        let mut model = AppModel::new();
+        let path = PathBuf::from("shared.md");
+        let first = model.open_file(path.clone(), "# One".to_owned());
+        let second = model.open_file(path.clone(), "# Two".to_owned());
+
+        let refreshed = model
+            .refresh_path(&path, |_| {
+                Ok::<_, std::convert::Infallible>("# Fresh".to_owned())
+            })
+            .expect("refresh");
+
+        assert_eq!(refreshed, vec![first, second]);
+        assert!(model
+            .tabs()
+            .iter()
+            .all(|tab| tab.document().source() == "# Fresh"));
+    }
+
+    #[test]
+    fn app_model_refreshes_all_file_backed_tabs_for_directory_events() {
+        let mut model = AppModel::new();
+        let first = model.open_file(PathBuf::from("README.md"), "# Old readme".to_owned());
+        let second = model.open_file(PathBuf::from("docs/guide.md"), "# Old guide".to_owned());
+        model.open_untitled("stdin", "# Piped".to_owned());
+
+        let refreshed = model
+            .refresh_file_backed(|path| {
+                Ok::<_, std::convert::Infallible>(format!("# Fresh {}", path.display()))
+            })
+            .expect("refresh");
+
+        assert_eq!(refreshed, vec![first, second]);
+        assert_eq!(model.tabs()[0].document().source(), "# Fresh README.md");
+        assert_eq!(model.tabs()[1].document().source(), "# Fresh docs/guide.md");
+        assert_eq!(model.tabs()[2].document().source(), "# Piped");
+    }
+
+    #[test]
+    fn app_model_reports_unique_watched_directories() {
+        let mut model = AppModel::new();
+        model.open_file(PathBuf::from("README.md"), String::new());
+        model.open_file(PathBuf::from("docs/guide.md"), String::new());
+        model.open_file(PathBuf::from("docs/notes.md"), String::new());
+
+        assert_eq!(
+            model.watched_directories(),
+            vec![PathBuf::from("."), PathBuf::from("docs")]
+        );
+    }
+
+    #[test]
+    fn app_view_contains_tabs_and_active_html() {
+        let mut model = AppModel::new();
+        let id = model.open_file(PathBuf::from("notes.md"), "# Notes".to_owned());
+        let view = app_view(&model);
+
+        assert_eq!(view.active_tab_id, Some(id));
+        assert_eq!(view.tabs[0].title, "notes.md");
+        assert!(view.active_html.contains("<h1>Notes</h1>"));
     }
 }

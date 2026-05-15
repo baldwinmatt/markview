@@ -284,11 +284,19 @@ fn app_shell_html(view: &AppView) -> String {
   }}
 }}
 * {{ box-sizing: border-box; }}
+html {{
+  height: 100%;
+  overflow: hidden;
+}}
 body {{
   margin: 0;
+  height: 100%;
+  overflow: hidden;
   background: var(--bg);
   color: var(--fg);
   font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  display: grid;
+  grid-template-rows: 46px 38px minmax(0, 1fr);
 }}
 .toolbar {{
   height: 46px;
@@ -298,6 +306,7 @@ body {{
   padding: 0 12px;
   background: var(--chrome);
   border-bottom: 1px solid var(--rule);
+  min-width: 0;
 }}
 .tool-button {{
   appearance: none;
@@ -323,6 +332,7 @@ body {{
   background: var(--chrome-strong);
   border-bottom: 1px solid var(--rule);
   overflow-x: auto;
+  min-width: 0;
 }}
 .tab {{
   appearance: none;
@@ -372,6 +382,7 @@ body {{
   align-items: center;
   gap: 6px;
   margin-left: auto;
+  min-width: 0;
 }}
 .find-input {{
   appearance: none;
@@ -390,6 +401,10 @@ body {{
   color: var(--muted);
   font-size: 0.82rem;
   text-align: right;
+}}
+.scroll-root {{
+  min-height: 0;
+  overflow: auto;
 }}
 .content-shell {{
   display: grid;
@@ -550,9 +565,11 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
   </div>
 </header>
 <nav class="tabs" id="tabs"></nav>
-<div class="content-shell">
-  <aside class="toc" id="toc"></aside>
-  <main id="document"></main>
+<div class="scroll-root" id="scroll-root">
+  <div class="content-shell">
+    <aside class="toc" id="toc"></aside>
+    <main id="document"></main>
+  </div>
 </div>
 <script>
 window.markview = {{
@@ -562,9 +579,10 @@ window.markview = {{
   findIndex: -1,
   findHits: [],
   setState(next) {{
+    const scroller = document.getElementById('scroll-root');
     const previousId = this.state ? this.state.activeTabId : null;
     if (previousId !== null) {{
-      this.scrollPositions.set(previousId, window.scrollY);
+      this.scrollPositions.set(previousId, scroller.scrollTop);
     }}
     this.state = next;
     const tabs = document.getElementById('tabs');
@@ -616,7 +634,7 @@ window.markview = {{
         item.onclick = () => {{
           const target = document.getElementById(heading.id);
           if (target) {{
-            target.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+            scrollInside(target, 'start');
             history.replaceState(null, '', `#${{heading.id}}`);
           }}
         }};
@@ -626,7 +644,9 @@ window.markview = {{
     }}
     this.applyFind();
     const restoreY = this.scrollPositions.get(next.activeTabId) || 0;
-    requestAnimationFrame(() => window.scrollTo(0, restoreY));
+    requestAnimationFrame(() => {{
+      scroller.scrollTop = restoreY;
+    }});
   }},
   applyFind() {{
     const pane = document.getElementById('document');
@@ -655,7 +675,7 @@ window.markview = {{
     this.findIndex = (index + this.findHits.length) % this.findHits.length;
     const hit = this.findHits[this.findIndex];
     hit.classList.add('active');
-    hit.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+    scrollInside(hit, 'center');
     document.getElementById('find-count').textContent = `${{this.findIndex + 1}}/${{this.findHits.length}}`;
   }},
   findNext() {{
@@ -670,6 +690,17 @@ function unwrapFindMarks(root) {{
     mark.replaceWith(document.createTextNode(mark.textContent));
   }}
   root.normalize();
+}}
+function scrollInside(target, block) {{
+  const scroller = document.getElementById('scroll-root');
+  const targetRect = target.getBoundingClientRect();
+  const scrollerRect = scroller.getBoundingClientRect();
+  const offset = targetRect.top - scrollerRect.top + scroller.scrollTop;
+  const centered = offset - (scroller.clientHeight / 2) + (targetRect.height / 2);
+  scroller.scrollTo({{
+    top: block === 'center' ? centered : offset,
+    behavior: 'smooth'
+  }});
 }}
 function highlightText(root, query) {{
   const hits = [];

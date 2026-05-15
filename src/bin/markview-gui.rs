@@ -54,7 +54,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 *control_flow = ControlFlow::Exit;
             }
             Event::UserEvent(UserEvent::OpenRequested) => {
-                if let Err(error) = open_document(&mut model, &mut watcher) {
+                if let Err(error) = open_document(&window, &mut model, &mut watcher) {
                     eprintln!("markview-gui: {error}");
                 }
                 sync_view(&webview, &model);
@@ -150,10 +150,12 @@ fn initial_model(input: Option<PathBuf>) -> Result<AppModel, Box<dyn std::error:
 }
 
 fn open_document(
+    window: &tao::window::Window,
     model: &mut AppModel,
     watcher: &mut FileWatcher,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(path) = rfd::FileDialog::new()
+        .set_parent(window)
         .add_filter("Markdown", &["md", "markdown", "mdown"])
         .add_filter("Text", &["txt"])
         .pick_file()
@@ -756,6 +758,9 @@ window.addEventListener('keydown', event => {{
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f') {{
     event.preventDefault();
     document.getElementById('find-input').focus();
+  }} else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'o') {{
+    event.preventDefault();
+    window.ipc.postMessage('open');
   }}
 }});
 window.markview.setState(window.markview.state);

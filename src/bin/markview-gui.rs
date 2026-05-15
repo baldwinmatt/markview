@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
+use std::process::Command;
 use std::process::ExitCode;
 
 use markview::{app_view, AppModel, AppView};
@@ -72,6 +73,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("markview-gui: {error}");
                 }
             }
+            Event::UserEvent(UserEvent::OpenExternal(url)) => {
+                if let Err(error) = open_external_url(&url) {
+                    eprintln!("markview-gui: failed to open link: {error}");
+                }
+            }
+            Event::UserEvent(UserEvent::DroppedFiles(paths)) => {
+                if let Err(error) = open_dropped_documents(paths, &mut model, &mut watcher) {
+                    eprintln!("markview-gui: {error}");
+                }
+                sync_view(&webview, &model);
+                window.set_title(&window_title(&model));
+            }
             Event::UserEvent(UserEvent::SelectTab(id)) => {
                 model.select(id);
                 sync_view(&webview, &model);
@@ -106,6 +119,7 @@ fn build_webview(
     proxy: EventLoopProxy<UserEvent>,
     initial_view: &AppView,
 ) -> wry::Result<WebView> {
+    let ipc_proxy = proxy.clone();
     let handler = move |request: Request<String>| {
         let body = request.body();
         let event = match body.as_str() {
@@ -126,13 +140,35 @@ fn build_webview(
         };
 
         if let Some(event) = event {
-            let _ = proxy.send_event(event);
+            let _ = ipc_proxy.send_event(event);
+        }
+    };
+
+    let navigation_proxy = proxy.clone();
+    let navigation_handler = move |url: String| {
+        if is_external_url(&url) {
+            let _ = navigation_proxy.send_event(UserEvent::OpenExternal(url));
+            false
+        } else {
+            true
+        }
+    };
+
+    let drop_proxy = proxy;
+    let drag_drop_handler = move |event: wry::DragDropEvent| {
+        if let wry::DragDropEvent::Drop { paths, .. } = event {
+            let _ = drop_proxy.send_event(UserEvent::DroppedFiles(paths));
+            true
+        } else {
+            false
         }
     };
 
     WebViewBuilder::new()
         .with_html(app_shell_html(initial_view))
         .with_ipc_handler(handler)
+        .with_navigation_handler(navigation_handler)
+        .with_drag_drop_handler(drag_drop_handler)
         .build(window)
 }
 
@@ -155,6 +191,17 @@ fn initial_model(input: Option<PathBuf>) -> Result<AppModel, Box<dyn std::error:
     Ok(model)
 }
 
+fn open_path(
+    path: PathBuf,
+    model: &mut AppModel,
+    watcher: &mut FileWatcher,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source = fs::read_to_string(&path)?;
+    model.open_file(normalize_path(path), source);
+    watcher.sync(model.watched_directories())?;
+    Ok(())
+}
+
 fn open_document(
     window: &tao::window::Window,
     model: &mut AppModel,
@@ -169,9 +216,18 @@ fn open_document(
         return Ok(());
     };
 
-    let source = fs::read_to_string(&path)?;
-    model.open_file(normalize_path(path), source);
-    watcher.sync(model.watched_directories())?;
+    open_path(path, model, watcher)?;
+    Ok(())
+}
+
+fn open_dropped_documents(
+    paths: Vec<PathBuf>,
+    model: &mut AppModel,
+    watcher: &mut FileWatcher,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for path in paths.into_iter().filter(|path| is_markdown_path(path)) {
+        open_path(path, model, watcher)?;
+    }
     Ok(())
 }
 
@@ -195,6 +251,8 @@ enum UserEvent {
     OpenRequested,
     RefreshRequested,
     PrintRequested,
+    OpenExternal(String),
+    DroppedFiles(Vec<PathBuf>),
     SelectTab(u64),
     CloseTab(u64),
     FilesChanged(Vec<PathBuf>),
@@ -256,6 +314,49 @@ fn is_refresh_event(kind: &EventKind) -> bool {
 
 fn normalize_path(path: PathBuf) -> PathBuf {
     path.canonicalize().unwrap_or(path)
+}
+
+fn is_external_url(url: &str) -> bool {
+    url.starts_with("https://") || url.starts_with("http://")
+}
+
+fn is_markdown_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "md" | "markdown" | "mdown"
+            )
+        })
+}
+
+fn open_external_url(url: &str) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        run_external_open(Command::new("open").arg(url))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        run_external_open(Command::new("cmd").args(["/C", "start", "", url]))
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        run_external_open(Command::new("xdg-open").arg(url))
+    }
+}
+
+fn run_external_open(command: &mut Command) -> io::Result<()> {
+    let status = command.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "external opener exited with {status}"
+        )))
+    }
 }
 
 fn app_shell_html(view: &AppView) -> String {
@@ -915,4 +1016,27 @@ impl GuiCli {
 
 fn help() -> &'static str {
     "Usage: markview-gui [FILE]\n\nOpens FILE as rendered Markdown in a native WebKit window.\n\nOptions:\n  -h, --help  Show this help"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn identifies_external_http_links() {
+        assert!(is_external_url("https://example.com"));
+        assert!(is_external_url("http://example.com"));
+        assert!(!is_external_url("file:///tmp/readme.md"));
+        assert!(!is_external_url("#intro"));
+    }
+
+    #[test]
+    fn identifies_markdown_drop_paths() {
+        assert!(is_markdown_path(Path::new("README.md")));
+        assert!(is_markdown_path(Path::new("guide.MARKDOWN")));
+        assert!(is_markdown_path(Path::new("notes.mdown")));
+        assert!(!is_markdown_path(Path::new("notes.txt")));
+        assert!(!is_markdown_path(Path::new("README")));
+    }
 }

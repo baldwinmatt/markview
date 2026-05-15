@@ -67,6 +67,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 sync_view(&webview, &model);
                 window.set_title(&window_title(&model));
             }
+            Event::UserEvent(UserEvent::PrintRequested) => {
+                if let Err(error) = webview.print() {
+                    eprintln!("markview-gui: {error}");
+                }
+            }
             Event::UserEvent(UserEvent::SelectTab(id)) => {
                 model.select(id);
                 sync_view(&webview, &model);
@@ -106,6 +111,7 @@ fn build_webview(
         let event = match body.as_str() {
             "open" => Some(UserEvent::OpenRequested),
             "refresh" => Some(UserEvent::RefreshRequested),
+            "print" => Some(UserEvent::PrintRequested),
             _ if body.starts_with("select:") => body
                 .trim_start_matches("select:")
                 .parse::<u64>()
@@ -188,6 +194,7 @@ fn window_title(model: &AppModel) -> String {
 enum UserEvent {
     OpenRequested,
     RefreshRequested,
+    PrintRequested,
     SelectTab(u64),
     CloseTab(u64),
     FilesChanged(Vec<PathBuf>),
@@ -533,6 +540,36 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
   }}
   main {{ padding-top: 24px; }}
 }}
+@media print {{
+  html, body {{
+    height: auto;
+    overflow: visible;
+    display: block;
+    background: #fff;
+    color: #000;
+  }}
+  .toolbar, .tabs, .toc {{
+    display: none;
+  }}
+  .scroll-root {{
+    overflow: visible;
+  }}
+  .content-shell {{
+    display: block;
+    width: auto;
+    margin: 0;
+    padding: 0;
+  }}
+  main {{
+    padding: 0;
+  }}
+  a {{
+    color: #000;
+  }}
+  pre, blockquote, code {{
+    break-inside: avoid;
+  }}
+}}
 </style>
 </head>
 <body>
@@ -549,6 +586,13 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
       <path d="M3 12A9 9 0 0 1 18.5 5.8"></path>
       <path d="M18 2v5h-5"></path>
       <path d="M6 22v-5h5"></path>
+    </svg>
+  </button>
+  <button class="tool-button" title="Print" aria-label="Print" onclick="window.ipc.postMessage('print')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M6 9V2h12v7"></path>
+      <path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"></path>
+      <path d="M6 14h12v8H6z"></path>
     </svg>
   </button>
   <div class="findbar">
@@ -761,6 +805,9 @@ window.addEventListener('keydown', event => {{
   }} else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'o') {{
     event.preventDefault();
     window.ipc.postMessage('open');
+  }} else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'p') {{
+    event.preventDefault();
+    window.ipc.postMessage('print');
   }}
 }});
 window.markview.setState(window.markview.state);

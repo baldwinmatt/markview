@@ -659,6 +659,7 @@ body {{
   border-bottom: 1px solid var(--rule);
   overflow-x: auto;
   min-width: 0;
+  scrollbar-width: thin;
 }}
 .tab {{
   appearance: none;
@@ -667,16 +668,19 @@ body {{
   background: var(--chrome);
   color: var(--muted);
   height: 31px;
-  max-width: 220px;
+  width: 190px;
   padding: 0 8px 0 13px;
   border-radius: 7px 7px 0 0;
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  flex: 0 0 190px;
+  min-width: 0;
 }}
 .tab.active {{
   background: var(--bg);
   color: var(--fg);
+  border-color: var(--accent);
 }}
 .tab.stale .tab-title::after {{
   content: " modified";
@@ -709,6 +713,13 @@ body {{
   color: var(--fg);
 }}
 .tab-close svg {{ width: 12px; height: 12px; }}
+.tab-count {{
+  color: var(--muted);
+  font-size: 0.78rem;
+  padding: 0 8px 8px;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}}
 .findbar {{
   display: inline-flex;
   align-items: center;
@@ -1056,6 +1067,7 @@ window.markview = {{
     for (const tab of next.tabs) {{
       const button = document.createElement('button');
       button.className = 'tab' + (tab.id === next.activeTabId ? ' active' : '') + (tab.stale ? ' stale' : '');
+      button.dataset.tabId = String(tab.id);
       button.title = tab.path || tab.title;
       button.onclick = () => window.ipc.postMessage(`select:${{tab.id}}`);
       const label = document.createElement('span');
@@ -1072,6 +1084,12 @@ window.markview = {{
       }};
       button.append(label, close);
       tabs.appendChild(button);
+    }}
+    if (next.tabs.length > 0) {{
+      const count = document.createElement('span');
+      count.className = 'tab-count';
+      count.textContent = `${{next.tabs.length}} open`;
+      tabs.appendChild(count);
     }}
     pane.innerHTML = next.activeHtml;
     for (const action of pane.querySelectorAll('[data-action="open"]')) {{
@@ -1115,6 +1133,10 @@ window.markview = {{
     const restoreY = this.scrollPositions.get(next.activeTabId) || 0;
     requestAnimationFrame(() => {{
       scroller.scrollTop = restoreY;
+      const activeTab = tabs.querySelector('.tab.active');
+      if (activeTab) {{
+        activeTab.scrollIntoView({{ block: 'nearest', inline: 'nearest' }});
+      }}
     }});
   }},
   applyFind() {{
@@ -1394,6 +1416,23 @@ mod tests {
         let error = GuiCli::parse(["--bogus"]).expect_err("unknown flag");
 
         assert_eq!(error, "unknown argument: --bogus");
+    }
+
+    #[test]
+    fn app_shell_includes_tab_overflow_helpers() {
+        let mut model = AppModel::new();
+        model.open_untitled("one", "# One".to_owned());
+        model.open_untitled("two", "# Two".to_owned());
+
+        let html = app_shell_html(&app_view_with_preferences(
+            &model,
+            GuiPreferences::default(),
+        ));
+
+        assert!(html.contains("flex: 0 0 190px"));
+        assert!(html.contains("tab-count"));
+        assert!(html.contains("scrollIntoView"));
+        assert!(html.contains("${next.tabs.length} open"));
     }
 
     #[test]

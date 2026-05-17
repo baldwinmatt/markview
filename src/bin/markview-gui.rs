@@ -1,11 +1,11 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, IsTerminal, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::ExitCode;
 
-use markview::{app_view, AppModel, AppView};
+use markview::{app_view_with_preferences, AppModel, AppView, GuiPreferences};
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
@@ -30,7 +30,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let mut model = initial_model(args.input)?;
+    let preferences_path = preferences_path();
+    let mut preferences = load_preferences(&preferences_path);
+    let mut model = initial_model(&args.inputs, &preferences)?;
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
     let mut watcher = FileWatcher::new(proxy.clone())?;
@@ -39,10 +41,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let window = WindowBuilder::new()
         .with_title(window_title(&model))
-        .with_inner_size(tao::dpi::LogicalSize::new(980.0, 760.0))
+        .with_inner_size(tao::dpi::LogicalSize::new(
+            preferences.window_width as f64,
+            preferences.window_height as f64,
+        ))
         .build(&event_loop)?;
 
-    let webview = build_webview(&window, proxy.clone(), &app_view(&model))?;
+    let webview = build_webview(
+        &window,
+        proxy.clone(),
+        &app_view_with_preferences(&model, preferences.clone()),
+    )?;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -52,21 +61,65 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
+                save_runtime_preferences(
+                    &preferences_path,
+                    &mut preferences,
+                    &model,
+                    Some(&window),
+                );
                 *control_flow = ControlFlow::Exit;
+            }
+            Event::WindowEvent {
+                event: WindowEvent::Resized(_),
+                ..
+            } => {
+                update_window_size(&mut preferences, &window);
             }
             Event::UserEvent(UserEvent::OpenRequested) => {
                 if let Err(error) = open_document(&window, &mut model, &mut watcher) {
                     eprintln!("markview-gui: {error}");
                 }
-                sync_view(&webview, &model);
+                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
+                sync_view(&webview, &model, &preferences);
                 window.set_title(&window_title(&model));
             }
             Event::UserEvent(UserEvent::RefreshRequested) => {
                 if let Err(error) = model.refresh_active(|path| fs::read_to_string(path)) {
                     eprintln!("markview-gui: {error}");
                 }
-                sync_view(&webview, &model);
+                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
+                sync_view(&webview, &model, &preferences);
                 window.set_title(&window_title(&model));
+            }
+            Event::UserEvent(UserEvent::ToggleSidebar) => {
+                preferences.sidebar_visible = !preferences.sidebar_visible;
+                save_runtime_preferences(
+                    &preferences_path,
+                    &mut preferences,
+                    &model,
+                    Some(&window),
+                );
+                sync_view(&webview, &model, &preferences);
+            }
+            Event::UserEvent(UserEvent::ToggleAutoRefresh) => {
+                preferences.auto_refresh = !preferences.auto_refresh;
+                save_runtime_preferences(
+                    &preferences_path,
+                    &mut preferences,
+                    &model,
+                    Some(&window),
+                );
+                sync_view(&webview, &model, &preferences);
+            }
+            Event::UserEvent(UserEvent::CycleTheme) => {
+                preferences.theme = preferences.theme.cycle();
+                save_runtime_preferences(
+                    &preferences_path,
+                    &mut preferences,
+                    &model,
+                    Some(&window),
+                );
+                sync_view(&webview, &model, &preferences);
             }
             Event::UserEvent(UserEvent::PrintRequested) => {
                 if let Err(error) = webview.print() {
@@ -82,12 +135,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(error) = open_dropped_documents(paths, &mut model, &mut watcher) {
                     eprintln!("markview-gui: {error}");
                 }
-                sync_view(&webview, &model);
+                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
+                sync_view(&webview, &model, &preferences);
+                window.set_title(&window_title(&model));
+            }
+            Event::UserEvent(UserEvent::OpenRecent(path)) => {
+                if let Err(error) = open_path(path, &mut model, &mut watcher) {
+                    eprintln!("markview-gui: {error}");
+                }
+                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
+                sync_view(&webview, &model, &preferences);
                 window.set_title(&window_title(&model));
             }
             Event::UserEvent(UserEvent::SelectTab(id)) => {
                 model.select(id);
-                sync_view(&webview, &model);
+                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
+                sync_view(&webview, &model, &preferences);
                 window.set_title(&window_title(&model));
             }
             Event::UserEvent(UserEvent::CloseTab(id)) => {
@@ -95,18 +158,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(error) = watcher.sync(model.watched_directories()) {
                     eprintln!("markview-gui: {error}");
                 }
-                sync_view(&webview, &model);
+                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
+                sync_view(&webview, &model, &preferences);
                 window.set_title(&window_title(&model));
             }
             Event::UserEvent(UserEvent::FilesChanged(paths)) => {
-                if let Err(error) = model
-                    .refresh_changed_paths(paths.iter().map(PathBuf::as_path), |path| {
-                        fs::read_to_string(path)
-                    })
-                {
-                    eprintln!("markview-gui: {error}");
+                if preferences.auto_refresh {
+                    if let Err(error) = model
+                        .refresh_changed_paths(paths.iter().map(PathBuf::as_path), |path| {
+                            fs::read_to_string(path)
+                        })
+                    {
+                        eprintln!("markview-gui: {error}");
+                    }
+                } else {
+                    model.mark_changed_paths_stale(paths.iter().map(PathBuf::as_path));
                 }
-                sync_view(&webview, &model);
+                sync_view(&webview, &model, &preferences);
                 window.set_title(&window_title(&model));
             }
             _ => {}
@@ -126,6 +194,9 @@ fn build_webview(
             "open" => Some(UserEvent::OpenRequested),
             "refresh" => Some(UserEvent::RefreshRequested),
             "print" => Some(UserEvent::PrintRequested),
+            "toggle-sidebar" => Some(UserEvent::ToggleSidebar),
+            "toggle-auto-refresh" => Some(UserEvent::ToggleAutoRefresh),
+            "cycle-theme" => Some(UserEvent::CycleTheme),
             _ if body.starts_with("select:") => body
                 .trim_start_matches("select:")
                 .parse::<u64>()
@@ -136,6 +207,9 @@ fn build_webview(
                 .parse::<u64>()
                 .ok()
                 .map(UserEvent::CloseTab),
+            _ if body.starts_with("recent:") => Some(UserEvent::OpenRecent(PathBuf::from(
+                body.trim_start_matches("recent:"),
+            ))),
             _ => None,
         };
 
@@ -172,23 +246,48 @@ fn build_webview(
         .build(window)
 }
 
-fn initial_model(input: Option<PathBuf>) -> Result<AppModel, Box<dyn std::error::Error>> {
+fn initial_model(
+    inputs: &[PathBuf],
+    preferences: &GuiPreferences,
+) -> Result<AppModel, Box<dyn std::error::Error>> {
     let mut model = AppModel::new();
 
-    match input {
-        Some(path) => {
-            let source = fs::read_to_string(&path)?;
-            model.open_file(normalize_path(path), source);
-        }
-        None if !io::stdin().is_terminal() => {
+    if inputs.is_empty() {
+        if !io::stdin().is_terminal() {
             let mut source = String::new();
             io::stdin().read_to_string(&mut source)?;
             model.open_untitled("stdin", source);
+        } else {
+            model = restore_files(preferences);
         }
-        None => {}
+    } else {
+        for path in inputs {
+            let source = fs::read_to_string(&path)?;
+            model.open_file(normalize_path(path.clone()), source);
+        }
     }
 
     Ok(model)
+}
+
+fn restore_files(preferences: &GuiPreferences) -> AppModel {
+    let mut model = AppModel::new();
+    for path in &preferences.last_open_files {
+        if let Ok(source) = fs::read_to_string(path) {
+            model.open_file(normalize_path(path.clone()), source);
+        }
+    }
+    if let Some(active_file) = &preferences.active_file {
+        let active_file = normalize_path(active_file.clone());
+        if let Some(tab) = model
+            .tabs()
+            .iter()
+            .find(|tab| tab.path() == Some(active_file.as_path()))
+        {
+            model.select(tab.id());
+        }
+    }
+    model
 }
 
 fn open_path(
@@ -231,8 +330,11 @@ fn open_dropped_documents(
     Ok(())
 }
 
-fn sync_view(webview: &WebView, model: &AppModel) {
-    let script = format!("window.markview.setState({});", view_js(&app_view(model)));
+fn sync_view(webview: &WebView, model: &AppModel, preferences: &GuiPreferences) {
+    let script = format!(
+        "window.markview.setState({});",
+        view_js(&app_view_with_preferences(model, preferences.clone()))
+    );
     if let Err(error) = webview.evaluate_script(&script) {
         eprintln!("markview-gui: failed to update view: {error}");
     }
@@ -251,8 +353,12 @@ enum UserEvent {
     OpenRequested,
     RefreshRequested,
     PrintRequested,
+    ToggleSidebar,
+    ToggleAutoRefresh,
+    CycleTheme,
     OpenExternal(String),
     DroppedFiles(Vec<PathBuf>),
+    OpenRecent(PathBuf),
     SelectTab(u64),
     CloseTab(u64),
     FilesChanged(Vec<PathBuf>),
@@ -314,6 +420,73 @@ fn is_refresh_event(kind: &EventKind) -> bool {
 
 fn normalize_path(path: PathBuf) -> PathBuf {
     path.canonicalize().unwrap_or(path)
+}
+
+fn preferences_path() -> PathBuf {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return PathBuf::from(".markview-preferences");
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library")
+            .join("Application Support")
+            .join("markview")
+            .join("preferences.conf")
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        home.join(".config")
+            .join("markview")
+            .join("preferences.conf")
+    }
+}
+
+fn load_preferences(path: &Path) -> GuiPreferences {
+    fs::read_to_string(path)
+        .map(|source| GuiPreferences::parse(&source))
+        .unwrap_or_default()
+}
+
+fn save_preferences(path: &Path, preferences: &GuiPreferences) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, preferences.serialize())
+}
+
+fn save_runtime_preferences(
+    path: &Path,
+    preferences: &mut GuiPreferences,
+    model: &AppModel,
+    window: Option<&tao::window::Window>,
+) {
+    persist_open_state(path, preferences, model, window);
+}
+
+fn persist_open_state(
+    path: &Path,
+    preferences: &mut GuiPreferences,
+    model: &AppModel,
+    window: Option<&tao::window::Window>,
+) {
+    if let Some(window) = window {
+        update_window_size(preferences, window);
+    }
+    preferences.record_open_files(
+        model.watched_paths(),
+        model.active_tab().and_then(|tab| tab.path()),
+    );
+    if let Err(error) = save_preferences(path, preferences) {
+        eprintln!("markview-gui: failed to save preferences: {error}");
+    }
+}
+
+fn update_window_size(preferences: &mut GuiPreferences, window: &tao::window::Window) {
+    let size = window.inner_size().to_logical::<u32>(window.scale_factor());
+    preferences.window_width = size.width;
+    preferences.window_height = size.height;
 }
 
 fn is_external_url(url: &str) -> bool {
@@ -393,6 +566,30 @@ fn app_shell_html(view: &AppView) -> String {
     --quote-bg: #211f1c;
   }}
 }}
+:root[data-theme="light"] {{
+  color-scheme: light;
+  --chrome: #ece8e1;
+  --chrome-strong: #ded8cf;
+  --bg: #f8f7f4;
+  --fg: #242220;
+  --muted: #6c665f;
+  --rule: #d8d2ca;
+  --accent: #0f766e;
+  --code-bg: #ebe6de;
+  --quote-bg: #f1ede7;
+}}
+:root[data-theme="dark"] {{
+  color-scheme: dark;
+  --chrome: #211f1c;
+  --chrome-strong: #302c27;
+  --bg: #181715;
+  --fg: #eeeae4;
+  --muted: #aaa39a;
+  --rule: #39342f;
+  --accent: #5eead4;
+  --code-bg: #25221f;
+  --quote-bg: #211f1c;
+}}
 * {{ box-sizing: border-box; }}
 html {{
   height: 100%;
@@ -432,7 +629,26 @@ body {{
   cursor: default;
 }}
 .tool-button:hover {{ border-color: var(--accent); }}
+.tool-button.active {{
+  border-color: var(--accent);
+  color: var(--accent);
+}}
 .tool-button svg {{ width: 17px; height: 17px; }}
+.recent-select {{
+  appearance: none;
+  height: 30px;
+  max-width: 180px;
+  border: 1px solid var(--rule);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--fg);
+  padding: 0 26px 0 9px;
+  font: inherit;
+  font-size: 0.86rem;
+}}
+.recent-select:disabled {{
+  color: var(--muted);
+}}
 .tabs {{
   height: 38px;
   display: flex;
@@ -461,6 +677,12 @@ body {{
 .tab.active {{
   background: var(--bg);
   color: var(--fg);
+}}
+.tab.stale .tab-title::after {{
+  content: " modified";
+  color: var(--accent);
+  font-size: 0.78rem;
+  margin-left: 6px;
 }}
 .tab-title {{
   min-width: 0;
@@ -531,6 +753,13 @@ body {{
   max-height: calc(100vh - 86px);
   overflow: auto;
   padding: 38px 0 0;
+}}
+.toc.hidden {{
+  display: none;
+}}
+.content-shell.sidebar-hidden {{
+  grid-template-columns: minmax(0, 1fr);
+  width: min(860px, calc(100vw - 48px));
 }}
 .toc-list {{
   display: flex;
@@ -696,6 +925,28 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
       <path d="M6 14h12v8H6z"></path>
     </svg>
   </button>
+  <button class="tool-button" title="Toggle sidebar" aria-label="Toggle sidebar" id="sidebar-toggle" onclick="window.ipc.postMessage('toggle-sidebar')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <rect x="3" y="4" width="18" height="16" rx="2"></rect>
+      <path d="M9 4v16"></path>
+    </svg>
+  </button>
+  <button class="tool-button" title="Toggle auto-refresh" aria-label="Toggle auto-refresh" id="auto-refresh-toggle" onclick="window.ipc.postMessage('toggle-auto-refresh')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M21 12a9 9 0 0 1-9 9"></path>
+      <path d="M3 12a9 9 0 0 1 9-9"></path>
+      <path d="m16 16 5-4-5-4"></path>
+      <path d="m8 8-5 4 5 4"></path>
+    </svg>
+  </button>
+  <button class="tool-button" title="Cycle theme" aria-label="Cycle theme" id="theme-toggle" onclick="window.ipc.postMessage('cycle-theme')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9Z"></path>
+    </svg>
+  </button>
+  <select class="recent-select" id="recent-files" aria-label="Recent files">
+    <option value="">Recent</option>
+  </select>
   <div class="findbar">
     <input class="find-input" id="find-input" placeholder="Find" aria-label="Find in document">
     <button class="tool-button" title="Previous match" aria-label="Previous match" id="find-prev">
@@ -735,10 +986,29 @@ window.markview = {{
     const tabs = document.getElementById('tabs');
     const pane = document.getElementById('document');
     const toc = document.getElementById('toc');
+    const shell = document.querySelector('.content-shell');
+    const recent = document.getElementById('recent-files');
+    document.documentElement.dataset.theme = next.preferences.theme === 'system' ? '' : next.preferences.theme;
+    document.getElementById('sidebar-toggle').classList.toggle('active', next.preferences.sidebarVisible);
+    document.getElementById('auto-refresh-toggle').classList.toggle('active', next.preferences.autoRefresh);
+    document.getElementById('theme-toggle').title = `Theme: ${{next.preferences.theme}}`;
+    recent.replaceChildren();
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = 'Recent';
+    recent.appendChild(placeholder);
+    for (const path of next.preferences.recentFiles) {{
+      const option = document.createElement('option');
+      option.value = path;
+      option.textContent = fileName(path);
+      option.title = path;
+      recent.appendChild(option);
+    }}
+    recent.disabled = next.preferences.recentFiles.length === 0;
     tabs.replaceChildren();
     for (const tab of next.tabs) {{
       const button = document.createElement('button');
-      button.className = 'tab' + (tab.id === next.activeTabId ? ' active' : '');
+      button.className = 'tab' + (tab.id === next.activeTabId ? ' active' : '') + (tab.stale ? ' stale' : '');
       button.title = tab.path || tab.title;
       button.onclick = () => window.ipc.postMessage(`select:${{tab.id}}`);
       const label = document.createElement('span');
@@ -764,6 +1034,8 @@ window.markview = {{
       }}
     }});
     toc.replaceChildren();
+    toc.classList.toggle('hidden', !next.preferences.sidebarVisible);
+    shell.classList.toggle('sidebar-hidden', !next.preferences.sidebarVisible);
     if (next.headings.length === 0) {{
       const empty = document.createElement('div');
       empty.className = 'toc-empty';
@@ -899,6 +1171,12 @@ document.getElementById('find-input').addEventListener('keydown', event => {{
 }});
 document.getElementById('find-next').onclick = () => window.markview.findNext();
 document.getElementById('find-prev').onclick = () => window.markview.findPrevious();
+document.getElementById('recent-files').addEventListener('change', event => {{
+  if (event.target.value) {{
+    window.ipc.postMessage(`recent:${{event.target.value}}`);
+    event.target.value = '';
+  }}
+}});
 window.addEventListener('keydown', event => {{
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f') {{
     event.preventDefault();
@@ -911,6 +1189,9 @@ window.addEventListener('keydown', event => {{
     window.ipc.postMessage('print');
   }}
 }});
+function fileName(path) {{
+  return path.split(/[\\/]/).filter(Boolean).pop() || path;
+}}
 window.markview.setState(window.markview.state);
 </script>
 </body>
@@ -926,13 +1207,14 @@ fn view_js(view: &AppView) -> String {
         .iter()
         .map(|tab| {
             format!(
-                "{{id:{},title:{},path:{}}}",
+                "{{id:{},title:{},path:{},stale:{}}}",
                 tab.id,
                 js_string(&tab.title),
                 tab.path
                     .as_ref()
                     .map(|path| js_string(path))
-                    .unwrap_or_else(|| "null".to_owned())
+                    .unwrap_or_else(|| "null".to_owned()),
+                tab.stale
             )
         })
         .collect::<Vec<_>>()
@@ -954,10 +1236,20 @@ fn view_js(view: &AppView) -> String {
         })
         .collect::<Vec<_>>()
         .join(",");
+    let recent_files = view
+        .preferences
+        .recent_files
+        .iter()
+        .map(|path| js_string(&path.display().to_string()))
+        .collect::<Vec<_>>()
+        .join(",");
 
     format!(
-        "{{tabs:[{tabs}],activeTabId:{active_tab_id},activeHtml:{},headings:[{headings}]}}",
-        js_string(&view.active_html)
+        "{{tabs:[{tabs}],activeTabId:{active_tab_id},activeHtml:{},headings:[{headings}],preferences:{{theme:{},sidebarVisible:{},autoRefresh:{},recentFiles:[{recent_files}]}}}}",
+        js_string(&view.active_html),
+        js_string(view.preferences.theme.as_str()),
+        view.preferences.sidebar_visible,
+        view.preferences.auto_refresh
     )
 }
 
@@ -985,7 +1277,7 @@ fn js_string(value: &str) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GuiCli {
-    input: Option<PathBuf>,
+    inputs: Vec<PathBuf>,
     help: bool,
 }
 
@@ -995,27 +1287,23 @@ impl GuiCli {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let mut input = None;
+        let mut inputs = Vec::new();
         let mut help = false;
 
         for arg in args.into_iter().map(Into::into) {
             match arg.as_str() {
                 "-h" | "--help" => help = true,
                 _ if arg.starts_with('-') => return Err(format!("unknown argument: {arg}")),
-                _ => {
-                    if input.replace(PathBuf::from(arg)).is_some() {
-                        return Err("expected at most one input file".to_owned());
-                    }
-                }
+                _ => inputs.push(PathBuf::from(arg)),
             }
         }
 
-        Ok(Self { input, help })
+        Ok(Self { inputs, help })
     }
 }
 
 fn help() -> &'static str {
-    "Usage: markview-gui [FILE]\n\nOpens FILE as rendered Markdown in a native WebKit window.\n\nOptions:\n  -h, --help  Show this help"
+    "Usage: markview-gui [FILE]...\n\nOpens Markdown files as rendered tabs in a native WebKit window.\n\nOptions:\n  -h, --help  Show this help"
 }
 
 #[cfg(test)]
@@ -1038,5 +1326,95 @@ mod tests {
         assert!(is_markdown_path(Path::new("notes.mdown")));
         assert!(!is_markdown_path(Path::new("notes.txt")));
         assert!(!is_markdown_path(Path::new("README")));
+    }
+
+    #[test]
+    fn parses_multiple_input_files() {
+        let cli = GuiCli::parse(["README.md", "guide.md"]).expect("parse");
+
+        assert_eq!(
+            cli.inputs,
+            vec![PathBuf::from("README.md"), PathBuf::from("guide.md")]
+        );
+        assert!(!cli.help);
+    }
+
+    #[test]
+    fn rejects_unknown_gui_flags() {
+        let error = GuiCli::parse(["--bogus"]).expect_err("unknown flag");
+
+        assert_eq!(error, "unknown argument: --bogus");
+    }
+
+    #[test]
+    fn saves_and_loads_preferences_file() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("preferences.conf");
+        let preferences = GuiPreferences {
+            theme: markview::ThemePreference::Light,
+            sidebar_visible: false,
+            auto_refresh: false,
+            window_width: 1110,
+            window_height: 720,
+            recent_files: vec![PathBuf::from("/tmp/readme.md")],
+            last_open_files: vec![PathBuf::from("/tmp/readme.md")],
+            active_file: Some(PathBuf::from("/tmp/readme.md")),
+        };
+
+        save_preferences(&path, &preferences).expect("save preferences");
+
+        assert_eq!(load_preferences(&path), preferences);
+    }
+
+    #[test]
+    fn persists_open_state_without_window() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let first = directory.path().join("first.md");
+        let second = directory.path().join("second.md");
+        fs::write(&first, "# First").expect("write first");
+        fs::write(&second, "# Second").expect("write second");
+        let mut model = AppModel::new();
+        model.open_file(first.clone(), "# First".to_owned());
+        model.open_file(second.clone(), "# Second".to_owned());
+        let path = directory.path().join("preferences.conf");
+        let mut preferences = GuiPreferences::default();
+
+        persist_open_state(&path, &mut preferences, &model, None);
+
+        let loaded = load_preferences(&path);
+        assert_eq!(loaded.last_open_files, vec![first.clone(), second.clone()]);
+        assert_eq!(loaded.recent_files, vec![second.clone(), first.clone()]);
+        assert_eq!(loaded.active_file, Some(second));
+    }
+
+    #[test]
+    fn restores_open_files_from_preferences() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let first = directory.path().join("first.md");
+        let second = directory.path().join("second.md");
+        fs::write(&first, "# First").expect("write first");
+        fs::write(&second, "# Second").expect("write second");
+        let preferences = GuiPreferences {
+            last_open_files: vec![first.clone(), second.clone()],
+            active_file: Some(first.clone()),
+            ..GuiPreferences::default()
+        };
+
+        let model = restore_files(&preferences);
+
+        let first = normalize_path(first);
+        assert_eq!(model.tabs().len(), 2);
+        assert_eq!(
+            model.active_tab().and_then(|tab| tab.path()),
+            Some(first.as_path())
+        );
+        assert_eq!(
+            model
+                .tabs()
+                .iter()
+                .map(|tab| tab.document().source())
+                .collect::<Vec<_>>(),
+            vec!["# First", "# Second"]
+        );
     }
 }

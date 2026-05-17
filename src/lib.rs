@@ -41,6 +41,213 @@ pub struct RenderOptions {
     pub width: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemePreference {
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemePreference {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::System => Self::Light,
+            Self::Light => Self::Dark,
+            Self::Dark => Self::System,
+        }
+    }
+}
+
+impl std::str::FromStr for ThemePreference {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "system" => Ok(Self::System),
+            "light" => Ok(Self::Light),
+            "dark" => Ok(Self::Dark),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuiPreferences {
+    pub theme: ThemePreference,
+    pub sidebar_visible: bool,
+    pub auto_refresh: bool,
+    pub window_width: u32,
+    pub window_height: u32,
+    pub recent_files: Vec<PathBuf>,
+    pub last_open_files: Vec<PathBuf>,
+    pub active_file: Option<PathBuf>,
+}
+
+impl Default for GuiPreferences {
+    fn default() -> Self {
+        Self {
+            theme: ThemePreference::System,
+            sidebar_visible: true,
+            auto_refresh: true,
+            window_width: 980,
+            window_height: 760,
+            recent_files: Vec::new(),
+            last_open_files: Vec::new(),
+            active_file: None,
+        }
+    }
+}
+
+impl GuiPreferences {
+    pub fn parse(source: &str) -> Self {
+        let mut preferences = Self::default();
+
+        for line in source.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            match key {
+                "theme" => {
+                    if let Ok(theme) = value.parse() {
+                        preferences.theme = theme;
+                    }
+                }
+                "sidebar_visible" => preferences.sidebar_visible = parse_bool(value, true),
+                "auto_refresh" => preferences.auto_refresh = parse_bool(value, true),
+                "window_width" => {
+                    preferences.window_width = parse_dimension(value, preferences.window_width);
+                }
+                "window_height" => {
+                    preferences.window_height = parse_dimension(value, preferences.window_height);
+                }
+                "recent" => {
+                    push_unique_path(&mut preferences.recent_files, unescape_pref_value(value))
+                }
+                "last_open" => {
+                    push_unique_path(&mut preferences.last_open_files, unescape_pref_value(value));
+                }
+                "active" => {
+                    let path = unescape_pref_value(value);
+                    if !path.as_os_str().is_empty() {
+                        preferences.active_file = Some(path);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        preferences
+    }
+
+    pub fn serialize(&self) -> String {
+        let mut output = String::new();
+        output.push_str("theme=");
+        output.push_str(self.theme.as_str());
+        output.push('\n');
+        output.push_str("sidebar_visible=");
+        output.push_str(if self.sidebar_visible {
+            "true"
+        } else {
+            "false"
+        });
+        output.push('\n');
+        output.push_str("auto_refresh=");
+        output.push_str(if self.auto_refresh { "true" } else { "false" });
+        output.push('\n');
+        output.push_str(&format!("window_width={}\n", self.window_width));
+        output.push_str(&format!("window_height={}\n", self.window_height));
+        for path in &self.recent_files {
+            output.push_str("recent=");
+            output.push_str(&escape_pref_value(&path.to_string_lossy()));
+            output.push('\n');
+        }
+        for path in &self.last_open_files {
+            output.push_str("last_open=");
+            output.push_str(&escape_pref_value(&path.to_string_lossy()));
+            output.push('\n');
+        }
+        if let Some(path) = &self.active_file {
+            output.push_str("active=");
+            output.push_str(&escape_pref_value(&path.to_string_lossy()));
+            output.push('\n');
+        }
+        output
+    }
+
+    pub fn record_open_files<I>(&mut self, paths: I, active: Option<&Path>)
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        self.last_open_files.clear();
+        for path in paths {
+            push_unique_path(&mut self.last_open_files, path.clone());
+            push_recent_path(&mut self.recent_files, path);
+        }
+        self.active_file = active.map(Path::to_path_buf);
+    }
+}
+
+fn parse_bool(value: &str, default: bool) -> bool {
+    match value {
+        "true" => true,
+        "false" => false,
+        _ => default,
+    }
+}
+
+fn parse_dimension(value: &str, default: u32) -> u32 {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|dimension| (320..=4096).contains(dimension))
+        .unwrap_or(default)
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !path.as_os_str().is_empty() && !paths.iter().any(|known| known == &path) {
+        paths.push(path);
+    }
+}
+
+fn push_recent_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    paths.retain(|known| known != &path);
+    paths.insert(0, path);
+    paths.truncate(10);
+}
+
+fn escape_pref_value(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\n', "\\n")
+}
+
+fn unescape_pref_value(value: &str) -> PathBuf {
+    let mut output = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('n') => output.push('\n'),
+                Some('\\') => output.push('\\'),
+                Some(other) => {
+                    output.push('\\');
+                    output.push(other);
+                }
+                None => output.push('\\'),
+            }
+        } else {
+            output.push(ch);
+        }
+    }
+    PathBuf::from(output)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownDocument {
     source: String,
@@ -252,6 +459,7 @@ pub struct AppModel {
     tabs: Vec<DocumentTab>,
     active_tab: Option<u64>,
     next_tab_id: u64,
+    stale_tabs: Vec<u64>,
 }
 
 impl AppModel {
@@ -260,6 +468,7 @@ impl AppModel {
             tabs: Vec::new(),
             active_tab: None,
             next_tab_id: 1,
+            stale_tabs: Vec::new(),
         }
     }
 
@@ -288,6 +497,7 @@ impl AppModel {
         };
         let was_active = self.active_tab == Some(id);
         self.tabs.remove(index);
+        self.stale_tabs.retain(|stale_id| *stale_id != id);
 
         if self.tabs.is_empty() {
             self.active_tab = None;
@@ -297,6 +507,29 @@ impl AppModel {
         }
 
         true
+    }
+
+    pub fn mark_changed_paths_stale<'a, I>(&mut self, changed_paths: I) -> Vec<u64>
+    where
+        I: IntoIterator<Item = &'a Path>,
+    {
+        let changed_paths = changed_paths.into_iter().collect::<Vec<_>>();
+        let ids = self
+            .tabs
+            .iter()
+            .filter(|tab| {
+                tab.path
+                    .as_deref()
+                    .is_some_and(|path| changed_paths.contains(&path))
+            })
+            .map(|tab| tab.id)
+            .collect::<Vec<_>>();
+
+        for id in &ids {
+            self.mark_stale(*id);
+        }
+
+        ids
     }
 
     pub fn refresh_active<F, E>(&mut self, mut load: F) -> Result<Option<u64>, E>
@@ -403,6 +636,10 @@ impl AppModel {
         self.active_tab
     }
 
+    pub fn is_stale(&self, id: u64) -> bool {
+        self.stale_tabs.contains(&id)
+    }
+
     pub fn watched_paths(&self) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         for tab in &self.tabs {
@@ -420,7 +657,14 @@ impl AppModel {
         self.next_tab_id += 1;
         self.tabs.push(DocumentTab { id, path, document });
         self.active_tab = Some(id);
+        self.stale_tabs.retain(|stale_id| *stale_id != id);
         id
+    }
+
+    fn mark_stale(&mut self, id: u64) {
+        if !self.stale_tabs.contains(&id) {
+            self.stale_tabs.push(id);
+        }
     }
 
     fn refresh_tab<F, E>(&mut self, id: u64, load: &mut F) -> Result<Option<u64>, E>
@@ -435,6 +679,7 @@ impl AppModel {
         };
         let source = load(&path)?;
         tab.document = MarkdownDocument::from_path(source, &path);
+        self.stale_tabs.retain(|stale_id| *stale_id != id);
         Ok(Some(id))
     }
 }
@@ -445,6 +690,7 @@ pub struct AppView {
     pub active_tab_id: Option<u64>,
     pub active_html: String,
     pub headings: Vec<HeadingView>,
+    pub preferences: GuiPreferences,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -452,6 +698,7 @@ pub struct TabView {
     pub id: u64,
     pub title: String,
     pub path: Option<String>,
+    pub stale: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -462,6 +709,10 @@ pub struct HeadingView {
 }
 
 pub fn app_view(model: &AppModel) -> AppView {
+    app_view_with_preferences(model, GuiPreferences::default())
+}
+
+pub fn app_view_with_preferences(model: &AppModel, preferences: GuiPreferences) -> AppView {
     let active_document = model.active_tab().map(DocumentTab::document);
 
     AppView {
@@ -472,6 +723,7 @@ pub fn app_view(model: &AppModel) -> AppView {
                 id: tab.id(),
                 title: tab.title().to_owned(),
                 path: tab.path().map(|path| path.display().to_string()),
+                stale: model.is_stale(tab.id()),
             })
             .collect(),
         active_tab_id: model.active_tab_id(),
@@ -479,6 +731,7 @@ pub fn app_view(model: &AppModel) -> AppView {
             .map(render_html_body)
             .unwrap_or_else(empty_state_html),
         headings: active_document.map(extract_headings).unwrap_or_default(),
+        preferences,
     }
 }
 
@@ -1412,6 +1665,27 @@ mod tests {
     }
 
     #[test]
+    fn app_model_marks_changed_paths_stale_until_refreshed() {
+        let mut model = AppModel::new();
+        let first = model.open_file(PathBuf::from("/tmp/one.md"), "# One".to_owned());
+        let second = model.open_file(PathBuf::from("/tmp/two.md"), "# Two".to_owned());
+
+        let stale = model.mark_changed_paths_stale([Path::new("/tmp/one.md")]);
+
+        assert_eq!(stale, vec![first]);
+        assert!(model.is_stale(first));
+        assert!(!model.is_stale(second));
+
+        model
+            .refresh_path(Path::new("/tmp/one.md"), |_| {
+                Ok::<_, std::convert::Infallible>("# Fresh".to_owned())
+            })
+            .expect("refresh");
+
+        assert!(!model.is_stale(first));
+    }
+
+    #[test]
     fn app_model_refreshes_all_file_backed_tabs_for_directory_events() {
         let mut model = AppModel::new();
         let first = model.open_file(PathBuf::from("README.md"), "# Old readme".to_owned());
@@ -1483,6 +1757,8 @@ mod tests {
                 }
             ]
         );
+        assert!(!view.tabs[0].stale);
+        assert_eq!(view.preferences, GuiPreferences::default());
     }
 
     #[test]
@@ -1501,5 +1777,64 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["intro", "intro-2", "intro-3"]
         );
+    }
+
+    #[test]
+    fn app_view_includes_preferences_and_stale_tabs() {
+        let mut model = AppModel::new();
+        let id = model.open_file(PathBuf::from("/tmp/readme.md"), "# Readme".to_owned());
+        model.mark_changed_paths_stale([Path::new("/tmp/readme.md")]);
+
+        let view = app_view_with_preferences(
+            &model,
+            GuiPreferences {
+                theme: ThemePreference::Dark,
+                sidebar_visible: false,
+                auto_refresh: false,
+                ..GuiPreferences::default()
+            },
+        );
+
+        assert_eq!(view.active_tab_id, Some(id));
+        assert!(view.tabs[0].stale);
+        assert_eq!(view.preferences.theme, ThemePreference::Dark);
+        assert!(!view.preferences.sidebar_visible);
+        assert!(!view.preferences.auto_refresh);
+    }
+
+    #[test]
+    fn gui_preferences_round_trip() {
+        let mut preferences = GuiPreferences {
+            theme: ThemePreference::Dark,
+            sidebar_visible: false,
+            auto_refresh: false,
+            window_width: 1200,
+            window_height: 840,
+            ..GuiPreferences::default()
+        };
+        preferences.record_open_files(
+            [
+                PathBuf::from("/tmp/readme.md"),
+                PathBuf::from("/tmp/guide.md"),
+            ],
+            Some(Path::new("/tmp/guide.md")),
+        );
+
+        let parsed = GuiPreferences::parse(&preferences.serialize());
+
+        assert_eq!(parsed, preferences);
+    }
+
+    #[test]
+    fn gui_preferences_ignore_invalid_values() {
+        let preferences = GuiPreferences::parse(
+            "theme=neon\nsidebar_visible=maybe\nauto_refresh=false\nwindow_width=2\nwindow_height=900\n",
+        );
+
+        assert_eq!(preferences.theme, ThemePreference::System);
+        assert!(preferences.sidebar_visible);
+        assert!(!preferences.auto_refresh);
+        assert_eq!(preferences.window_width, 980);
+        assert_eq!(preferences.window_height, 900);
     }
 }

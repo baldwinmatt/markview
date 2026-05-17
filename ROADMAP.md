@@ -19,7 +19,7 @@ Markview is a small, fast, local-first Markdown viewer written in Rust. The proj
 - [x] Improve tab overflow behavior for many open documents.
 - [x] Continue shrinking the GUI entrypoint into smaller modules around app state, webview shell, events, file watching, persistence, and generated HTML.
 - [x] Add focused tests for preferences, tab state, stale state, persistence, restore behavior, and GUI command parsing.
-- [ ] Add focused tests for scroll preservation and watcher-adjacent behavior.
+- [x] Add focused tests for scroll preservation and watcher-adjacent behavior.
 
 ## v0.3: Reading Quality
 

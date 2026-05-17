@@ -1302,4 +1302,38 @@ mod tests {
         assert!(html.contains("scrollIntoView"));
         assert!(html.contains("${next.tabs.length} open"));
     }
+
+    #[test]
+    fn app_shell_preserves_scroll_inside_document_pane() {
+        let mut model = AppModel::new();
+        model.open_untitled("one", "# One".to_owned());
+
+        let html = app_shell_html(&app_view_with_preferences(
+            &model,
+            GuiPreferences::default(),
+        ));
+
+        assert!(html.contains("scrollPositions: new Map()"));
+        assert!(html.contains("this.scrollPositions.set(previousId, scroller.scrollTop)"));
+        assert!(html.contains("const restoreY = this.scrollPositions.get(next.activeTabId) || 0"));
+        assert!(html.contains("scroller.scrollTop = restoreY"));
+        assert!(html.contains("document.getElementById('scroll-root')"));
+    }
+
+    #[test]
+    fn classifies_file_events_that_should_refresh() {
+        assert!(is_refresh_event(&EventKind::Create(
+            notify::event::CreateKind::Any
+        )));
+        assert!(is_refresh_event(&EventKind::Modify(
+            notify::event::ModifyKind::Any
+        )));
+        assert!(is_refresh_event(&EventKind::Remove(
+            notify::event::RemoveKind::Any
+        )));
+        assert!(!is_refresh_event(&EventKind::Access(
+            notify::event::AccessKind::Any
+        )));
+        assert!(!is_refresh_event(&EventKind::Other));
+    }
 }

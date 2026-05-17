@@ -954,7 +954,15 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
 }
 
 fn empty_state_html() -> String {
-    r#"<section class="empty-state"><h1>No document open</h1><p>Use Open to choose a Markdown file.</p></section>"#
+    r#"<section class="empty-state">
+  <div class="empty-eyebrow">markview</div>
+  <h1>No document open</h1>
+  <p>Open a Markdown file, drop one onto this window, or choose a recent file from the toolbar.</p>
+  <div class="empty-actions">
+    <button class="empty-action primary" type="button" data-action="open">Open Markdown</button>
+    <span class="empty-hint">Supports .md, .markdown, and .mdown files</span>
+  </div>
+</section>"#
         .to_owned()
 }
 
@@ -1777,6 +1785,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["intro", "intro-2", "intro-3"]
         );
+    }
+
+    #[test]
+    fn app_view_empty_state_has_open_affordance() {
+        let model = AppModel::new();
+        let view = app_view(&model);
+
+        assert!(view.active_html.contains("No document open"));
+        assert!(view.active_html.contains("data-action=\"open\""));
+        assert!(view.active_html.contains(".md, .markdown, and .mdown"));
     }
 
     #[test]

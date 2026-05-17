@@ -853,10 +853,56 @@ img {{ max-width: 100%; height: auto; }}
 hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
 .empty-state {{
   color: var(--muted);
-  padding-top: 18vh;
-  text-align: center;
+  min-height: calc(100vh - 210px);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 42px 0;
 }}
-.empty-state h1 {{ color: var(--fg); font-size: 1.8rem; }}
+.empty-eyebrow {{
+  color: var(--accent);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}}
+.empty-state h1 {{
+  color: var(--fg);
+  font-size: 2rem;
+  margin: 0;
+}}
+.empty-state p {{
+  max-width: 520px;
+  margin: 0;
+}}
+.empty-actions {{
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  padding-top: 8px;
+}}
+.empty-action {{
+  appearance: none;
+  border: 1px solid var(--rule);
+  background: var(--bg);
+  color: var(--fg);
+  min-height: 34px;
+  border-radius: 7px;
+  padding: 0 12px;
+  font: inherit;
+  font-size: 0.92rem;
+}}
+.empty-action.primary {{
+  border-color: var(--accent);
+  color: var(--accent);
+}}
+.empty-hint {{
+  color: var(--muted);
+  font-size: 0.86rem;
+}}
 @media (max-width: 760px) {{
   .find-input {{ width: 150px; }}
   .content-shell {{
@@ -868,6 +914,7 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
     max-height: none;
     padding-top: 18px;
   }}
+  .empty-state {{ min-height: auto; }}
   main {{ padding-top: 24px; }}
 }}
 @media print {{
@@ -1027,6 +1074,9 @@ window.markview = {{
       tabs.appendChild(button);
     }}
     pane.innerHTML = next.activeHtml;
+    for (const action of pane.querySelectorAll('[data-action="open"]')) {{
+      action.addEventListener('click', () => window.ipc.postMessage('open'));
+    }}
     const renderedHeadings = pane.querySelectorAll('h1,h2,h3,h4,h5,h6');
     next.headings.forEach((heading, index) => {{
       if (renderedHeadings[index]) {{

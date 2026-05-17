@@ -15,7 +15,7 @@ Markview is a small, fast, local-first Markdown viewer written in Rust. The proj
 - [x] Keep README current with actual CLI and GUI behavior.
 - [x] Add GUI preferences for theme, sidebar visibility, auto-refresh, window size, recent files, and restored open files.
 - [x] Add recent files and stale/modified indicators when auto-refresh is disabled.
-- [ ] Improve the empty state for first launch and no-open-document workflows.
+- [x] Improve the empty state for first launch and no-open-document workflows.
 - [ ] Improve tab overflow behavior for many open documents.
 - [ ] Continue shrinking the GUI entrypoint into smaller modules around app state, webview shell, events, file watching, persistence, and generated HTML.
 - [x] Add focused tests for preferences, tab state, stale state, persistence, restore behavior, and GUI command parsing.

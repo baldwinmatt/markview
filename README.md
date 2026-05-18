@@ -36,6 +36,7 @@ The GUI renders Markdown through the system WebKit view and includes:
 
 - Toolbar actions for Open, Refresh, Print, sidebar visibility, auto-refresh, theme selection, recent files, and find-in-document.
 - Tabs for multiple open documents, including per-tab close buttons and overflow scrolling.
+- Markdown document registration for bundled `.app` builds.
 - A table-of-contents sidebar generated from document headings.
 - Auto-refresh for file-backed tabs when files change on disk, with a modified indicator when auto-refresh is disabled.
 - Scroll preservation when switching tabs or refreshing content.
@@ -51,7 +52,7 @@ Preferences are stored locally in `~/Library/Application Support/markview/prefer
 - Proper GUI rendering: the GUI path renders Markdown to HTML/CSS and displays it in the system WebKit WebView on macOS, with toolbar actions and tabs handled through a small Rust/WebView bridge.
 - Portable core: parsing and rendering live in the library; GUI dependencies are optional behind the `gui` feature.
 - Fast enough for local viewing: the terminal renderer is single-pass, and the GUI uses the OS web engine instead of embedding a browser runtime.
-- Local app bundle: `packaging/macos/bundle.sh` wraps the Cargo-built GUI binary in `target/macos/Markview.app` without changing the default cargo workflow.
+- Local app bundle: `packaging/macos/bundle.sh` wraps the Cargo-built GUI binary in `target/macos/Markview.app` with app metadata, a small icon, and Markdown document registration.
 - Tested: terminal rendering, HTML rendering, app tab/refresh state, CLI behavior, and frontend substitution are covered by unit and integration tests.
 
 ## Development workflow

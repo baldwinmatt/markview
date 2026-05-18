@@ -33,7 +33,7 @@ Markview is a small, fast, local-first Markdown viewer written in Rust. The proj
 ## v0.4: Local App Maturity
 
 - [x] Add macOS app bundle support while keeping cargo-based local builds as the default path.
-- [ ] Add app icon, Info.plist metadata, document type registration for Markdown files, and open-with behavior.
+- [x] Add app icon, Info.plist metadata, document type registration for Markdown files, and open-with behavior.
 - [x] Add a CLI path for launching the GUI against one or more files.
 - [x] Store settings in a portable local config location.
 - [ ] Add release notes and a repeatable local packaging command.

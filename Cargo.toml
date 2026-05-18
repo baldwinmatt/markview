@@ -22,7 +22,7 @@ highlight = []
 notify = { version = "8", optional = true }
 objc2 = { version = "0.6", optional = true }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSEvent", "NSMenu", "NSMenuItem"], optional = true }
-objc2-foundation = { version = "0.3", default-features = false, features = ["NSString"], optional = true }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSObject", "NSString"], optional = true }
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
 rfd = { version = "0.15", optional = true }
 tao = { version = "0.35", optional = true }

@@ -45,7 +45,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let proxy = event_loop.create_proxy();
     let mut watcher = FileWatcher::new(proxy.clone())?;
 
-    install_application_menu();
+    install_application_menu(proxy.clone());
     watcher.sync(model.watched_directories())?;
 
     let window = WindowBuilder::new()
@@ -135,6 +135,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("markview-gui: {error}");
                 }
             }
+            Event::UserEvent(UserEvent::FindRequested) => {
+                if let Err(error) =
+                    webview.evaluate_script("document.getElementById('find-input')?.focus();")
+                {
+                    eprintln!("markview-gui: failed to focus find: {error}");
+                }
+            }
             Event::UserEvent(UserEvent::QuitRequested) => {
                 save_runtime_preferences(
                     &preferences_path,
@@ -180,6 +187,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 sync_view(&webview, &model, &preferences);
                 window.set_title(&window_title(&model));
             }
+            Event::UserEvent(UserEvent::CloseActiveTab) => {
+                if let Some(id) = model.active_tab_id() {
+                    model.close(id);
+                    if let Err(error) = watcher.sync(model.watched_directories()) {
+                        eprintln!("markview-gui: {error}");
+                    }
+                    persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
+                    sync_view(&webview, &model, &preferences);
+                    window.set_title(&window_title(&model));
+                }
+            }
             Event::UserEvent(UserEvent::FilesChanged(paths)) => {
                 if preferences.auto_refresh {
                     if let Err(error) = model
@@ -212,6 +230,7 @@ fn build_webview(
             "open" => Some(UserEvent::OpenRequested),
             "refresh" => Some(UserEvent::RefreshRequested),
             "print" => Some(UserEvent::PrintRequested),
+            "find" => Some(UserEvent::FindRequested),
             "quit" => Some(UserEvent::QuitRequested),
             "toggle-sidebar" => Some(UserEvent::ToggleSidebar),
             "toggle-auto-refresh" => Some(UserEvent::ToggleAutoRefresh),
@@ -352,6 +371,7 @@ enum UserEvent {
     OpenRequested,
     RefreshRequested,
     PrintRequested,
+    FindRequested,
     QuitRequested,
     ToggleSidebar,
     ToggleAutoRefresh,
@@ -361,14 +381,99 @@ enum UserEvent {
     OpenRecent(PathBuf),
     SelectTab(u64),
     CloseTab(u64),
+    CloseActiveTab,
     FilesChanged(Vec<PathBuf>),
 }
 
 #[cfg(target_os = "macos")]
-fn install_application_menu() {
-    use objc2::{sel, MainThreadMarker};
+fn install_application_menu(proxy: EventLoopProxy<UserEvent>) {
+    use objc2::rc::Retained;
+    use objc2::runtime::Sel;
+    use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
     use objc2_app_kit::{NSApplication, NSEventModifierFlags, NSMenu, NSMenuItem};
-    use objc2_foundation::NSString;
+    use objc2_foundation::{NSObject, NSObjectProtocol, NSString};
+
+    struct MenuCommandTargetIvars {
+        proxy: EventLoopProxy<UserEvent>,
+    }
+
+    define_class!(
+        // SAFETY: NSObject has no extra subclassing requirements, and the
+        // target only forwards menu actions to tao's event proxy.
+        #[unsafe(super = NSObject)]
+        #[thread_kind = MainThreadOnly]
+        #[ivars = MenuCommandTargetIvars]
+        struct MenuCommandTarget;
+
+        unsafe impl NSObjectProtocol for MenuCommandTarget {}
+
+        impl MenuCommandTarget {
+            #[unsafe(method(markviewOpenDocument))]
+            fn open_document(&self) {
+                let _ = self.ivars().proxy.send_event(UserEvent::OpenRequested);
+            }
+
+            #[unsafe(method(markviewCloseTab))]
+            fn close_tab(&self) {
+                let _ = self.ivars().proxy.send_event(UserEvent::CloseActiveTab);
+            }
+
+            #[unsafe(method(markviewRefresh))]
+            fn refresh(&self) {
+                let _ = self.ivars().proxy.send_event(UserEvent::RefreshRequested);
+            }
+
+            #[unsafe(method(markviewPrint))]
+            fn print(&self) {
+                let _ = self.ivars().proxy.send_event(UserEvent::PrintRequested);
+            }
+
+            #[unsafe(method(markviewFind))]
+            fn find(&self) {
+                let _ = self.ivars().proxy.send_event(UserEvent::FindRequested);
+            }
+
+            #[unsafe(method(markviewToggleSidebar))]
+            fn toggle_sidebar(&self) {
+                let _ = self.ivars().proxy.send_event(UserEvent::ToggleSidebar);
+            }
+
+            #[unsafe(method(markviewToggleAutoRefresh))]
+            fn toggle_auto_refresh(&self) {
+                let _ = self.ivars().proxy.send_event(UserEvent::ToggleAutoRefresh);
+            }
+
+            #[unsafe(method(markviewQuit))]
+            fn quit(&self) {
+                let _ = self.ivars().proxy.send_event(UserEvent::QuitRequested);
+            }
+        }
+    );
+
+    impl MenuCommandTarget {
+        fn new(mtm: MainThreadMarker, proxy: EventLoopProxy<UserEvent>) -> Retained<Self> {
+            let this = mtm
+                .alloc::<Self>()
+                .set_ivars(MenuCommandTargetIvars { proxy });
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+
+    fn menu_item(menu: &NSMenu, target: &MenuCommandTarget, title: &str, action: Sel, key: &str) {
+        let item = unsafe {
+            menu.addItemWithTitle_action_keyEquivalent(
+                &NSString::from_str(title),
+                Some(action),
+                &NSString::from_str(key),
+            )
+        };
+        unsafe {
+            item.setTarget(Some(target));
+        }
+        if !key.is_empty() {
+            item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
+        }
+    }
 
     let Some(mtm) = MainThreadMarker::new() else {
         return;
@@ -376,6 +481,7 @@ fn install_application_menu() {
 
     let app = NSApplication::sharedApplication(mtm);
     let main_menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str(""));
+    let command_target = MenuCommandTarget::new(mtm, proxy);
 
     let app_item = NSMenuItem::new(mtm);
     let app_menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("Markview"));
@@ -403,15 +509,74 @@ fn install_application_menu() {
         );
     }
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
-    unsafe {
-        app_menu.addItemWithTitle_action_keyEquivalent(
-            &NSString::from_str("Quit Markview"),
-            Some(sel!(terminate:)),
-            &NSString::from_str("q"),
-        );
-    }
+    menu_item(
+        &app_menu,
+        &command_target,
+        "Quit Markview",
+        sel!(markviewQuit),
+        "q",
+    );
     app_item.setSubmenu(Some(&app_menu));
     main_menu.addItem(&app_item);
+
+    let file_item = NSMenuItem::new(mtm);
+    let file_menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("File"));
+    menu_item(
+        &file_menu,
+        &command_target,
+        "Open...",
+        sel!(markviewOpenDocument),
+        "o",
+    );
+    menu_item(
+        &file_menu,
+        &command_target,
+        "Close Tab",
+        sel!(markviewCloseTab),
+        "w",
+    );
+    menu_item(
+        &file_menu,
+        &command_target,
+        "Refresh",
+        sel!(markviewRefresh),
+        "r",
+    );
+    file_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    menu_item(
+        &file_menu,
+        &command_target,
+        "Print...",
+        sel!(markviewPrint),
+        "p",
+    );
+    file_item.setSubmenu(Some(&file_menu));
+    main_menu.addItem(&file_item);
+
+    let edit_item = NSMenuItem::new(mtm);
+    let edit_menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("Edit"));
+    menu_item(&edit_menu, &command_target, "Find", sel!(markviewFind), "f");
+    edit_item.setSubmenu(Some(&edit_menu));
+    main_menu.addItem(&edit_item);
+
+    let view_item = NSMenuItem::new(mtm);
+    let view_menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("View"));
+    menu_item(
+        &view_menu,
+        &command_target,
+        "Toggle Sidebar",
+        sel!(markviewToggleSidebar),
+        "",
+    );
+    menu_item(
+        &view_menu,
+        &command_target,
+        "Toggle Auto Refresh",
+        sel!(markviewToggleAutoRefresh),
+        "",
+    );
+    view_item.setSubmenu(Some(&view_menu));
+    main_menu.addItem(&view_item);
 
     let window_item = NSMenuItem::new(mtm);
     let window_menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("Window"));
@@ -431,10 +596,11 @@ fn install_application_menu() {
     main_menu.addItem(&window_item);
 
     app.setMainMenu(Some(&main_menu));
+    let _ = Retained::into_raw(command_target);
 }
 
 #[cfg(not(target_os = "macos"))]
-fn install_application_menu() {}
+fn install_application_menu(_proxy: EventLoopProxy<UserEvent>) {}
 
 struct FileWatcher {
     watcher: RecommendedWatcher,
@@ -1287,6 +1453,9 @@ window.addEventListener('keydown', event => {{
   }} else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'p') {{
     event.preventDefault();
     window.ipc.postMessage('print');
+  }} else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'r') {{
+    event.preventDefault();
+    window.ipc.postMessage('refresh');
   }} else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'q') {{
     event.preventDefault();
     window.ipc.postMessage('quit');
@@ -1463,6 +1632,8 @@ mod tests {
         assert!(html.contains("event.key.toLowerCase() === 'q'"));
         assert!(html.contains("window.ipc.postMessage('quit')"));
         assert!(html.contains("event.key.toLowerCase() === 'w'"));
+        assert!(html.contains("event.key.toLowerCase() === 'r'"));
+        assert!(html.contains("window.ipc.postMessage('refresh')"));
         assert!(
             html.contains("window.ipc.postMessage(`close:${window.markview.state.activeTabId}`)")
         );

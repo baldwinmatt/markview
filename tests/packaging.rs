@@ -31,6 +31,7 @@ fn macos_bundle_script_keeps_cargo_as_the_build_path() {
     assert!(script.contains("Contents/MacOS/${APP_NAME}"));
     assert!(script.contains("Markview.icns.base64"));
     assert!(script.contains("Contents/Resources/Markview.icns"));
+    assert!(script.contains("codesign --force --deep --sign -"));
 }
 
 #[test]

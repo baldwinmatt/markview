@@ -29,5 +29,6 @@ mkdir -p "${BUNDLE_DIR}/Contents/MacOS" "${BUNDLE_DIR}/Contents/Resources"
 cp "packaging/macos/Info.plist" "${BUNDLE_DIR}/Contents/Info.plist"
 cp "${BINARY_DIR}/${BINARY_NAME}" "${BUNDLE_DIR}/Contents/MacOS/${APP_NAME}"
 base64 -D -i "packaging/macos/Markview.icns.base64" -o "${BUNDLE_DIR}/Contents/Resources/Markview.icns"
+codesign --force --deep --sign - "${BUNDLE_DIR}"
 
 echo "Created ${BUNDLE_DIR}"

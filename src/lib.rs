@@ -294,6 +294,31 @@ pub trait FrontendRenderer {
     fn render_document(&self, document: &MarkdownDocument) -> Self::Output;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedDocument {
+    title: String,
+    html: String,
+    headings: Vec<HeadingView>,
+}
+
+impl RenderedDocument {
+    pub fn from_markdown(document: &MarkdownDocument) -> Self {
+        render_document_model(document)
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn html(&self) -> &str {
+        &self.html
+    }
+
+    pub fn headings(&self) -> &[HeadingView] {
+        &self.headings
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalRenderer {
     options: RenderOptions,
@@ -320,7 +345,7 @@ impl FrontendRenderer for HtmlRenderer {
     type Output = String;
 
     fn render_document(&self, document: &MarkdownDocument) -> Self::Output {
-        render_html_document(document)
+        render_html_document(&RenderedDocument::from_markdown(document))
     }
 }
 
@@ -723,7 +748,10 @@ pub fn app_view(model: &AppModel) -> AppView {
 }
 
 pub fn app_view_with_preferences(model: &AppModel, preferences: GuiPreferences) -> AppView {
-    let active_document = model.active_tab().map(DocumentTab::document);
+    let active_document = model
+        .active_tab()
+        .map(DocumentTab::document)
+        .map(RenderedDocument::from_markdown);
 
     AppView {
         tabs: model
@@ -738,20 +766,30 @@ pub fn app_view_with_preferences(model: &AppModel, preferences: GuiPreferences) 
             .collect(),
         active_tab_id: model.active_tab_id(),
         active_html: active_document
-            .map(render_html_body)
+            .as_ref()
+            .map(|document| document.html().to_owned())
             .unwrap_or_else(empty_state_html),
-        headings: active_document.map(extract_headings).unwrap_or_default(),
+        headings: active_document
+            .map(|document| document.headings().to_vec())
+            .unwrap_or_default(),
         preferences,
     }
 }
 
-fn render_html_body(document: &MarkdownDocument) -> String {
+fn render_document_model(document: &MarkdownDocument) -> RenderedDocument {
+    let headings = extract_headings(document);
+    let html = render_html_body(document, &headings);
+
+    RenderedDocument {
+        title: document.title().to_owned(),
+        html,
+        headings,
+    }
+}
+
+fn render_html_body(document: &MarkdownDocument, headings: &[HeadingView]) -> String {
     let mut body = String::new();
-    let mut heading_ids = extract_headings(document)
-        .into_iter()
-        .map(|heading| heading.id)
-        .collect::<Vec<_>>()
-        .into_iter();
+    let mut heading_ids = headings.iter().map(|heading| heading.id.clone());
     let events = Parser::new_ext(document.source(), markdown_options())
         .map(sanitize_html_event)
         .map(|event| add_heading_id(event, &mut heading_ids));
@@ -997,9 +1035,7 @@ fn render_terminal(markdown: &str, options: RenderOptions) -> String {
     renderer.finish()
 }
 
-fn render_html_document(document: &MarkdownDocument) -> String {
-    let body = render_html_body(document);
-
+fn render_html_document(document: &RenderedDocument) -> String {
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -1099,7 +1135,7 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
 </html>
 "#,
         escape_html(document.title()),
-        body
+        document.html()
     )
 }
 
@@ -1728,6 +1764,30 @@ mod tests {
 
         assert!(terminal.contains("link (https://example.com)."));
         assert!(html.contains(r#"<a href="https://example.com">link</a>"#));
+    }
+
+    #[test]
+    fn rendered_document_model_exposes_shared_frontend_output() {
+        let document = MarkdownDocument::with_title("# Intro\n\n## Details", "Guide");
+        let rendered = RenderedDocument::from_markdown(&document);
+
+        assert_eq!(rendered.title(), "Guide");
+        assert!(rendered.html().contains(r#"<h1 id="intro">Intro</h1>"#));
+        assert_eq!(
+            rendered.headings(),
+            &[
+                HeadingView {
+                    level: 1,
+                    title: "Intro".to_owned(),
+                    id: "intro".to_owned(),
+                },
+                HeadingView {
+                    level: 2,
+                    title: "Details".to_owned(),
+                    id: "details".to_owned(),
+                },
+            ]
+        );
     }
 
     #[test]

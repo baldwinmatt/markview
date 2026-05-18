@@ -14,6 +14,13 @@ To build the macOS GUI binary:
 cargo build --features gui --bin markview-gui
 ```
 
+To create a local macOS app bundle around the Cargo-built GUI binary:
+
+```sh
+sh packaging/macos/bundle.sh
+open target/macos/Markview.app
+```
+
 ## Usage
 
 ```sh
@@ -44,6 +51,7 @@ Preferences are stored locally in `~/Library/Application Support/markview/prefer
 - Proper GUI rendering: the GUI path renders Markdown to HTML/CSS and displays it in the system WebKit WebView on macOS, with toolbar actions and tabs handled through a small Rust/WebView bridge.
 - Portable core: parsing and rendering live in the library; GUI dependencies are optional behind the `gui` feature.
 - Fast enough for local viewing: the terminal renderer is single-pass, and the GUI uses the OS web engine instead of embedding a browser runtime.
+- Local app bundle: `packaging/macos/bundle.sh` wraps the Cargo-built GUI binary in `target/macos/Markview.app` without changing the default cargo workflow.
 - Tested: terminal rendering, HTML rendering, app tab/refresh state, CLI behavior, and frontend substitution are covered by unit and integration tests.
 
 ## Development workflow

@@ -794,8 +794,42 @@ body {{
   align-items: center;
   justify-content: center;
   cursor: default;
+  position: relative;
 }}
 .tool-button:hover {{ border-color: var(--accent); }}
+.tool-button[data-tooltip]:hover::after,
+.tool-button[data-tooltip]:focus-visible::after {{
+  content: attr(data-tooltip);
+  position: absolute;
+  top: calc(100% + 7px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 20;
+  white-space: nowrap;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 4px 7px;
+  border-radius: 5px;
+  background: var(--fg);
+  color: var(--bg);
+  font-size: 0.75rem;
+  line-height: 1.2;
+  pointer-events: none;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+}}
+.tool-button[data-tooltip]:hover::before,
+.tool-button[data-tooltip]:focus-visible::before {{
+  content: "";
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 21;
+  border: 5px solid transparent;
+  border-bottom-color: var(--fg);
+  pointer-events: none;
+}}
 .tool-button.active {{
   border-color: var(--accent);
   color: var(--accent);
@@ -1156,13 +1190,13 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
 </head>
 <body>
 <header class="toolbar">
-  <button class="tool-button" title="Open" aria-label="Open" onclick="window.ipc.postMessage('open')">
+  <button class="tool-button" title="Open Markdown file" data-tooltip="Open Markdown file" aria-label="Open Markdown file" onclick="window.ipc.postMessage('open')">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
       <path d="M3 7h5l2 2h11v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"></path>
       <path d="M3 7v11"></path>
     </svg>
   </button>
-  <button class="tool-button" title="Refresh" aria-label="Refresh" onclick="window.ipc.postMessage('refresh')">
+  <button class="tool-button" title="Refresh active document" data-tooltip="Refresh active document" aria-label="Refresh active document" onclick="window.ipc.postMessage('refresh')">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
       <path d="M21 12a9 9 0 0 1-15.5 6.2"></path>
       <path d="M3 12A9 9 0 0 1 18.5 5.8"></path>
@@ -1170,28 +1204,28 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
       <path d="M6 22v-5h5"></path>
     </svg>
   </button>
-  <button class="tool-button" title="Print" aria-label="Print" onclick="window.ipc.postMessage('print')">
+  <button class="tool-button" title="Print document" data-tooltip="Print document" aria-label="Print document" onclick="window.ipc.postMessage('print')">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
       <path d="M6 9V2h12v7"></path>
       <path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"></path>
       <path d="M6 14h12v8H6z"></path>
     </svg>
   </button>
-  <button class="tool-button" title="Toggle sidebar" aria-label="Toggle sidebar" id="sidebar-toggle" onclick="window.ipc.postMessage('toggle-sidebar')">
+  <button class="tool-button" title="Toggle table of contents" data-tooltip="Toggle table of contents" aria-label="Toggle table of contents" id="sidebar-toggle" onclick="window.ipc.postMessage('toggle-sidebar')">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
       <rect x="3" y="4" width="18" height="16" rx="2"></rect>
       <path d="M9 4v16"></path>
     </svg>
   </button>
-  <button class="tool-button" title="Toggle auto-refresh" aria-label="Toggle auto-refresh" id="auto-refresh-toggle" onclick="window.ipc.postMessage('toggle-auto-refresh')">
+  <button class="tool-button" title="Auto-refresh on file changes" data-tooltip="Auto-refresh on file changes" aria-label="Auto-refresh on file changes" id="auto-refresh-toggle" onclick="window.ipc.postMessage('toggle-auto-refresh')">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-      <path d="M21 12a9 9 0 0 1-9 9"></path>
-      <path d="M3 12a9 9 0 0 1 9-9"></path>
-      <path d="m16 16 5-4-5-4"></path>
-      <path d="m8 8-5 4 5 4"></path>
+      <circle cx="12" cy="12" r="8"></circle>
+      <path d="M12 7v5l3 2"></path>
+      <path d="M19 5v5h-5"></path>
+      <path d="M5 19v-5h5"></path>
     </svg>
   </button>
-  <button class="tool-button" title="Cycle theme" aria-label="Cycle theme" id="theme-toggle" onclick="window.ipc.postMessage('cycle-theme')">
+  <button class="tool-button" title="Cycle theme" data-tooltip="Cycle theme" aria-label="Cycle theme" id="theme-toggle" onclick="window.ipc.postMessage('cycle-theme')">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
       <path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9Z"></path>
     </svg>
@@ -1201,12 +1235,12 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
   </select>
   <div class="findbar">
     <input class="find-input" id="find-input" placeholder="Find" aria-label="Find in document">
-    <button class="tool-button" title="Previous match" aria-label="Previous match" id="find-prev">
+    <button class="tool-button" title="Previous match" data-tooltip="Previous match" aria-label="Previous match" id="find-prev">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <path d="m18 15-6-6-6 6"></path>
       </svg>
     </button>
-    <button class="tool-button" title="Next match" aria-label="Next match" id="find-next">
+    <button class="tool-button" title="Next match" data-tooltip="Next match" aria-label="Next match" id="find-next">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <path d="m6 9 6 6 6-6"></path>
       </svg>
@@ -1241,9 +1275,24 @@ window.markview = {{
     const shell = document.querySelector('.content-shell');
     const recent = document.getElementById('recent-files');
     document.documentElement.dataset.theme = next.preferences.theme === 'system' ? '' : next.preferences.theme;
-    document.getElementById('sidebar-toggle').classList.toggle('active', next.preferences.sidebarVisible);
-    document.getElementById('auto-refresh-toggle').classList.toggle('active', next.preferences.autoRefresh);
-    document.getElementById('theme-toggle').title = `Theme: ${{next.preferences.theme}}`;
+    const sidebarToggle = document.getElementById('sidebar-toggle');
+    sidebarToggle.classList.toggle('active', next.preferences.sidebarVisible);
+    const sidebarTip = next.preferences.sidebarVisible ? 'Hide table of contents' : 'Show table of contents';
+    sidebarToggle.title = sidebarTip;
+    sidebarToggle.dataset.tooltip = sidebarTip;
+    sidebarToggle.setAttribute('aria-label', sidebarTip);
+
+    const autoRefreshToggle = document.getElementById('auto-refresh-toggle');
+    autoRefreshToggle.classList.toggle('active', next.preferences.autoRefresh);
+    const autoRefreshTip = next.preferences.autoRefresh ? 'Disable auto-refresh on file changes' : 'Enable auto-refresh on file changes';
+    autoRefreshToggle.title = autoRefreshTip;
+    autoRefreshToggle.dataset.tooltip = autoRefreshTip;
+    autoRefreshToggle.setAttribute('aria-label', autoRefreshTip);
+
+    const themeToggle = document.getElementById('theme-toggle');
+    const themeTip = `Theme: ${{next.preferences.theme}}`;
+    themeToggle.title = themeTip;
+    themeToggle.dataset.tooltip = themeTip;
     recent.replaceChildren();
     const placeholder = document.createElement('option');
     placeholder.value = '';
@@ -1637,6 +1686,21 @@ mod tests {
         assert!(
             html.contains("window.ipc.postMessage(`close:${window.markview.state.activeTabId}`)")
         );
+    }
+
+    #[test]
+    fn toolbar_buttons_have_distinct_tooltips() {
+        let html = app_shell_html(&app_view_with_preferences(
+            &AppModel::new(),
+            GuiPreferences::default(),
+        ));
+
+        assert!(html.contains(".tool-button[data-tooltip]:hover::after"));
+        assert!(html.contains("data-tooltip=\"Refresh active document\""));
+        assert!(html.contains("data-tooltip=\"Auto-refresh on file changes\""));
+        assert!(html.contains("Disable auto-refresh on file changes"));
+        assert!(html.contains("Enable auto-refresh on file changes"));
+        assert!(html.contains("<circle cx=\"12\" cy=\"12\" r=\"8\"></circle>"));
     }
 
     #[test]

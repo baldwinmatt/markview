@@ -765,6 +765,8 @@ pre {{
   padding: 1rem;
 }}
 pre code {{ background: transparent; padding: 0; }}
+.syntax-keyword {{ color: var(--accent); font-weight: 700; }}
+.syntax-comment {{ color: var(--muted); font-style: italic; }}
 table {{
   width: 100%;
   border-collapse: collapse;

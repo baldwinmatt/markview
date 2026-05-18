@@ -746,6 +746,10 @@ fn render_html_body(document: &MarkdownDocument) -> String {
         .map(sanitize_html_event)
         .map(|event| add_heading_id(event, &mut heading_ids));
     html::push_html(&mut body, events);
+    #[cfg(feature = "highlight")]
+    {
+        body = highlight_code_blocks(&body);
+    }
     body
 }
 
@@ -858,6 +862,111 @@ fn slugify(title: &str) -> String {
     }
 }
 
+#[cfg(feature = "highlight")]
+fn highlight_code_blocks(markup: &str) -> String {
+    let mut highlighted = String::with_capacity(markup.len());
+    let mut rest = markup;
+
+    while let Some(start) = rest.find(r#"<pre><code class="language-"#) {
+        highlighted.push_str(&rest[..start]);
+        let block = &rest[start..];
+        let Some(language_end) = block.find(r#"">"#) else {
+            highlighted.push_str(block);
+            return highlighted;
+        };
+        let language = &block[r#"<pre><code class="language-"#.len()..language_end];
+        let content_start = language_end + 2;
+        let Some(content_end) = block[content_start..].find("</code></pre>") else {
+            highlighted.push_str(block);
+            return highlighted;
+        };
+        let content_end = content_start + content_end;
+        let code = &block[content_start..content_end];
+        highlighted.push_str(&block[..content_start]);
+        if matches!(language, "rust" | "rs") {
+            highlighted.push_str(&highlight_rust_code(code));
+        } else {
+            highlighted.push_str(code);
+        }
+        highlighted.push_str("</code></pre>");
+        rest = &block[content_end + "</code></pre>".len()..];
+    }
+
+    highlighted.push_str(rest);
+    highlighted
+}
+
+#[cfg(feature = "highlight")]
+fn highlight_rust_code(code: &str) -> String {
+    let mut highlighted = String::with_capacity(code.len());
+
+    for line in code.split_inclusive('\n') {
+        let (source, newline) = line
+            .strip_suffix('\n')
+            .map(|line| (line, "\n"))
+            .unwrap_or((line, ""));
+        if let Some(comment_start) = source.find("//") {
+            highlighted.push_str(&highlight_rust_keywords(&source[..comment_start]));
+            highlighted.push_str(r#"<span class="syntax-comment">"#);
+            highlighted.push_str(&source[comment_start..]);
+            highlighted.push_str("</span>");
+        } else {
+            highlighted.push_str(&highlight_rust_keywords(source));
+        }
+        highlighted.push_str(newline);
+    }
+
+    highlighted
+}
+
+#[cfg(feature = "highlight")]
+fn highlight_rust_keywords(source: &str) -> String {
+    const KEYWORDS: &[&str] = &[
+        "as", "async", "await", "break", "const", "continue", "crate", "else", "enum", "extern",
+        "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut",
+        "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true",
+        "type", "unsafe", "use", "where", "while",
+    ];
+    let mut highlighted = String::with_capacity(source.len());
+    let mut chars = source.char_indices().peekable();
+
+    while let Some((start, ch)) = chars.next() {
+        if is_rust_ident_start(ch) {
+            let mut end = start + ch.len_utf8();
+            while let Some((next, next_ch)) = chars.peek().copied() {
+                if is_rust_ident_continue(next_ch) {
+                    chars.next();
+                    end = next + next_ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let token = &source[start..end];
+            if KEYWORDS.contains(&token) {
+                highlighted.push_str(r#"<span class="syntax-keyword">"#);
+                highlighted.push_str(token);
+                highlighted.push_str("</span>");
+            } else {
+                highlighted.push_str(token);
+            }
+        } else {
+            highlighted.push(ch);
+        }
+    }
+
+    highlighted
+}
+
+#[cfg(feature = "highlight")]
+fn is_rust_ident_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic()
+}
+
+#[cfg(feature = "highlight")]
+fn is_rust_ident_continue(ch: char) -> bool {
+    is_rust_ident_start(ch) || ch.is_ascii_digit()
+}
+
 fn sanitize_html_event(event: Event<'_>) -> Event<'_> {
     match event {
         Event::Html(html) | Event::InlineHtml(html) => {
@@ -954,6 +1063,8 @@ pre {{
   padding: 1rem;
 }}
 pre code {{ background: transparent; padding: 0; }}
+.syntax-keyword {{ color: var(--accent); font-weight: 700; }}
+.syntax-comment {{ color: var(--muted); font-style: italic; }}
 table {{
   width: 100%;
   border-collapse: collapse;
@@ -1571,6 +1682,17 @@ mod tests {
 
         assert!(html.contains("Footnote text"));
         assert!(html.contains("footnote"));
+    }
+
+    #[cfg(feature = "highlight")]
+    #[test]
+    fn html_renderer_highlights_rust_code_when_enabled() {
+        let html = render_html("```rust\nfn main() {\n    // hi\n    let ready = true;\n}\n```");
+
+        assert!(html.contains(r#"<span class="syntax-keyword">fn</span> main()"#));
+        assert!(html.contains(r#"<span class="syntax-comment">// hi</span>"#));
+        assert!(html.contains(r#"<span class="syntax-keyword">let</span> ready"#));
+        assert!(html.contains(r#"<span class="syntax-keyword">true</span>"#));
     }
 
     #[test]

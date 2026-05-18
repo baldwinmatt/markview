@@ -8,6 +8,7 @@ license = "MIT"
 [features]
 default = []
 gui = ["dep:notify", "dep:rfd", "dep:tao", "dep:wry"]
+highlight = []
 
 [dependencies]
 notify = { version = "8", optional = true }

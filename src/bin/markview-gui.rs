@@ -848,12 +848,16 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
   main {{ padding-top: 24px; }}
 }}
 @media print {{
+  @page {{
+    margin: 0.65in;
+  }}
   html, body {{
     height: auto;
     overflow: visible;
     display: block;
     background: #fff;
     color: #000;
+    font-size: 11pt;
   }}
   .toolbar, .tabs, .toc {{
     display: none;
@@ -870,11 +874,32 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
   main {{
     padding: 0;
   }}
+  h1, h2, h3, h4, h5, h6 {{
+    color: #000;
+    break-after: avoid;
+  }}
   a {{
     color: #000;
   }}
-  pre, blockquote, code {{
+  a[href^="http"]::after {{
+    content: " (" attr(href) ")";
+    font-size: 0.86em;
+    overflow-wrap: anywhere;
+  }}
+  pre, blockquote, table {{
     break-inside: avoid;
+  }}
+  pre, code, blockquote, th {{
+    background: #f5f5f5;
+    color: #000;
+  }}
+  .syntax-keyword, .syntax-comment {{
+    color: #000;
+    font-weight: 700;
+    font-style: normal;
+  }}
+  input[type="checkbox"] {{
+    filter: grayscale(1);
   }}
 }}
 </style>
@@ -1320,6 +1345,20 @@ mod tests {
         assert!(html.contains("const restoreY = this.scrollPositions.get(next.activeTabId) || 0"));
         assert!(html.contains("scroller.scrollTop = restoreY"));
         assert!(html.contains("document.getElementById('scroll-root')"));
+    }
+
+    #[test]
+    fn app_shell_tunes_print_theme() {
+        let html = app_shell_html(&app_view_with_preferences(
+            &AppModel::new(),
+            GuiPreferences::default(),
+        ));
+
+        assert!(html.contains("@page"));
+        assert!(html.contains("a[href^=\"http\"]::after"));
+        assert!(html.contains("break-after: avoid"));
+        assert!(html.contains(".syntax-keyword, .syntax-comment"));
+        assert!(html.contains("input[type=\"checkbox\"]"));
     }
 
     #[test]

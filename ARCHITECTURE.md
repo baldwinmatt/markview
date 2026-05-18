@@ -79,4 +79,4 @@ The bundle includes `Info.plist`, `Markview.icns`, document registration for Mar
 7. Run `cargo build --features gui --bin markview-gui`.
 8. Run `make package-macos`.
 9. Tag the release as `v<version>` after the reviewed release commit lands.
-10. Upload the zip from `target/dist/` to the GitHub release.
+10. Push the tag. The release workflow builds the macOS zip and attaches it to the GitHub release.

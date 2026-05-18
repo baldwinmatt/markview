@@ -62,6 +62,7 @@ Preferences are stored locally in `~/Library/Application Support/markview/prefer
 - Local app bundle: `packaging/macos/bundle.sh` wraps the Cargo-built GUI binary in `target/macos/Markview.app` with app metadata, a small icon, and Markdown document registration.
 - Local packaging: `make package-macos` creates `target/dist/markview-<version>-macos.zip` from a release app bundle.
 - CI-ready: GitHub Actions runs formatting, clippy, CLI/core tests, and macOS GUI feature checks.
+- Release-ready: pushing a `v*` tag packages the macOS app and publishes a GitHub release with the zip attached.
 - Tested: terminal rendering, HTML rendering, app tab/refresh state, CLI behavior, and frontend substitution are covered by unit and integration tests.
 
 For a deeper map of the core types, GUI flow, persistence, packaging, and release process, see [ARCHITECTURE.md](ARCHITECTURE.md).

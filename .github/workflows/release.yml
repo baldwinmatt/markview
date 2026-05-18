@@ -1,0 +1,27 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  macos-release:
+    name: macOS release
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: make package-macos
+      - uses: actions/upload-artifact@v4
+        with:
+          name: markview-macos
+          path: target/dist/*.zip
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: target/dist/*.zip
+          body_path: RELEASE_NOTES.md

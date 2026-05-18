@@ -1604,6 +1604,9 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "notify",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "predicates",
  "pulldown-cmark",
  "rfd",

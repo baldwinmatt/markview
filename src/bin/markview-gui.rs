@@ -45,6 +45,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let proxy = event_loop.create_proxy();
     let mut watcher = FileWatcher::new(proxy.clone())?;
 
+    install_application_menu();
     watcher.sync(model.watched_directories())?;
 
     let window = WindowBuilder::new()
@@ -134,6 +135,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("markview-gui: {error}");
                 }
             }
+            Event::UserEvent(UserEvent::QuitRequested) => {
+                save_runtime_preferences(
+                    &preferences_path,
+                    &mut preferences,
+                    &model,
+                    Some(&window),
+                );
+                *control_flow = ControlFlow::Exit;
+            }
             Event::UserEvent(UserEvent::OpenExternal(url)) => {
                 if let Err(error) = open_external_url(&url) {
                     eprintln!("markview-gui: failed to open link: {error}");
@@ -202,6 +212,7 @@ fn build_webview(
             "open" => Some(UserEvent::OpenRequested),
             "refresh" => Some(UserEvent::RefreshRequested),
             "print" => Some(UserEvent::PrintRequested),
+            "quit" => Some(UserEvent::QuitRequested),
             "toggle-sidebar" => Some(UserEvent::ToggleSidebar),
             "toggle-auto-refresh" => Some(UserEvent::ToggleAutoRefresh),
             "cycle-theme" => Some(UserEvent::CycleTheme),
@@ -341,6 +352,7 @@ enum UserEvent {
     OpenRequested,
     RefreshRequested,
     PrintRequested,
+    QuitRequested,
     ToggleSidebar,
     ToggleAutoRefresh,
     CycleTheme,
@@ -351,6 +363,78 @@ enum UserEvent {
     CloseTab(u64),
     FilesChanged(Vec<PathBuf>),
 }
+
+#[cfg(target_os = "macos")]
+fn install_application_menu() {
+    use objc2::{sel, MainThreadMarker};
+    use objc2_app_kit::{NSApplication, NSEventModifierFlags, NSMenu, NSMenuItem};
+    use objc2_foundation::NSString;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+
+    let app = NSApplication::sharedApplication(mtm);
+    let main_menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str(""));
+
+    let app_item = NSMenuItem::new(mtm);
+    let app_menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("Markview"));
+    unsafe {
+        app_menu.addItemWithTitle_action_keyEquivalent(
+            &NSString::from_str("Hide Markview"),
+            Some(sel!(hide:)),
+            &NSString::from_str("h"),
+        );
+    }
+    let hide_others = unsafe {
+        app_menu.addItemWithTitle_action_keyEquivalent(
+            &NSString::from_str("Hide Others"),
+            Some(sel!(hideOtherApplications:)),
+            &NSString::from_str("h"),
+        )
+    };
+    hide_others
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
+    unsafe {
+        app_menu.addItemWithTitle_action_keyEquivalent(
+            &NSString::from_str("Show All"),
+            Some(sel!(unhideAllApplications:)),
+            &NSString::from_str(""),
+        );
+    }
+    app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    unsafe {
+        app_menu.addItemWithTitle_action_keyEquivalent(
+            &NSString::from_str("Quit Markview"),
+            Some(sel!(terminate:)),
+            &NSString::from_str("q"),
+        );
+    }
+    app_item.setSubmenu(Some(&app_menu));
+    main_menu.addItem(&app_item);
+
+    let window_item = NSMenuItem::new(mtm);
+    let window_menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("Window"));
+    unsafe {
+        window_menu.addItemWithTitle_action_keyEquivalent(
+            &NSString::from_str("Minimize"),
+            Some(sel!(performMiniaturize:)),
+            &NSString::from_str("m"),
+        );
+        window_menu.addItemWithTitle_action_keyEquivalent(
+            &NSString::from_str("Zoom"),
+            Some(sel!(performZoom:)),
+            &NSString::from_str(""),
+        );
+    }
+    window_item.setSubmenu(Some(&window_menu));
+    main_menu.addItem(&window_item);
+
+    app.setMainMenu(Some(&main_menu));
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_application_menu() {}
 
 struct FileWatcher {
     watcher: RecommendedWatcher,
@@ -1203,6 +1287,14 @@ window.addEventListener('keydown', event => {{
   }} else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'p') {{
     event.preventDefault();
     window.ipc.postMessage('print');
+  }} else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'q') {{
+    event.preventDefault();
+    window.ipc.postMessage('quit');
+  }} else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'w') {{
+    if (window.markview.state.activeTabId !== null) {{
+      event.preventDefault();
+      window.ipc.postMessage(`close:${{window.markview.state.activeTabId}}`);
+    }}
   }}
 }});
 function fileName(path) {{
@@ -1359,6 +1451,21 @@ mod tests {
         assert!(html.contains("break-after: avoid"));
         assert!(html.contains(".syntax-keyword, .syntax-comment"));
         assert!(html.contains("input[type=\"checkbox\"]"));
+    }
+
+    #[test]
+    fn app_shell_includes_native_feeling_shortcuts() {
+        let html = app_shell_html(&app_view_with_preferences(
+            &AppModel::new(),
+            GuiPreferences::default(),
+        ));
+
+        assert!(html.contains("event.key.toLowerCase() === 'q'"));
+        assert!(html.contains("window.ipc.postMessage('quit')"));
+        assert!(html.contains("event.key.toLowerCase() === 'w'"));
+        assert!(
+            html.contains("window.ipc.postMessage(`close:${window.markview.state.activeTabId}`)")
+        );
     }
 
     #[test]

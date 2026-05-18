@@ -40,8 +40,8 @@ Markview is a small, fast, local-first Markdown viewer written in Rust. The proj
 
 ## v1.0: Stable Little Tool
 
-- [ ] Stabilize renderer and frontend boundaries for alternate frontend engines.
-- [ ] Document architecture, renderer traits, GUI event flow, persistence, and release process.
+- [x] Stabilize renderer and frontend boundaries for alternate frontend engines.
+- [x] Document architecture, renderer traits, GUI event flow, persistence, and release process.
 - [ ] Add CI for the test/build matrix: CLI tests, GUI feature build on macOS, formatting, and clippy.
 - [ ] Publish GitHub releases once packaging is stable.
 

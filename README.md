@@ -55,12 +55,15 @@ Preferences are stored locally in `~/Library/Application Support/markview/prefer
 ## Design
 
 - Pluggable frontends: `FrontendRenderer` separates document input from terminal and HTML output.
+- Shared rendered model: `RenderedDocument` exposes HTML body content and heading navigation data for alternate frontend engines.
 - Proper GUI rendering: the GUI path renders Markdown to HTML/CSS and displays it in the system WebKit WebView on macOS, with toolbar actions and tabs handled through a small Rust/WebView bridge.
 - Portable core: parsing and rendering live in the library; GUI dependencies are optional behind the `gui` feature.
 - Fast enough for local viewing: the terminal renderer is single-pass, and the GUI uses the OS web engine instead of embedding a browser runtime.
 - Local app bundle: `packaging/macos/bundle.sh` wraps the Cargo-built GUI binary in `target/macos/Markview.app` with app metadata, a small icon, and Markdown document registration.
 - Local packaging: `make package-macos` creates `target/dist/markview-<version>-macos.zip` from a release app bundle.
 - Tested: terminal rendering, HTML rendering, app tab/refresh state, CLI behavior, and frontend substitution are covered by unit and integration tests.
+
+For a deeper map of the core types, GUI flow, persistence, packaging, and release process, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Development workflow
 

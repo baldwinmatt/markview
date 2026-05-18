@@ -34,6 +34,34 @@ fn macos_bundle_script_keeps_cargo_as_the_build_path() {
 }
 
 #[test]
+fn macos_package_script_creates_versioned_release_zip() {
+    let script = fs::read_to_string("packaging/macos/package.sh").expect("read package script");
+
+    assert!(script.contains("BUILD_MODE=release"));
+    assert!(script.contains("packaging/macos/bundle.sh"));
+    assert!(script.contains("target/dist"));
+    assert!(script.contains("markview-${VERSION}-macos.zip"));
+    assert!(script.contains("ditto -c -k --keepParent"));
+}
+
+#[test]
+fn makefile_exposes_packaging_command() {
+    let makefile = fs::read_to_string("Makefile").expect("read Makefile");
+
+    assert!(makefile.contains("package-macos:"));
+    assert!(makefile.contains("sh packaging/macos/package.sh"));
+}
+
+#[test]
+fn release_notes_cover_packaged_release() {
+    let notes = fs::read_to_string("RELEASE_NOTES.md").expect("read release notes");
+
+    assert!(notes.contains("## 0.1.0"));
+    assert!(notes.contains("macOS `.app` bundle"));
+    assert!(notes.contains("repeatable zip packaging command"));
+}
+
+#[test]
 fn macos_icon_payload_is_an_icns_file() {
     let encoded = fs::read_to_string("packaging/macos/Markview.icns.base64").expect("read icon");
     let decoded = decode_base64(encoded.trim()).expect("decode icon");

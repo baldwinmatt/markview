@@ -737,9 +737,38 @@ pub fn app_view_with_preferences(model: &AppModel, preferences: GuiPreferences) 
 
 fn render_html_body(document: &MarkdownDocument) -> String {
     let mut body = String::new();
-    let parser = Parser::new_ext(document.source(), markdown_options()).map(sanitize_html_event);
-    html::push_html(&mut body, parser);
+    let mut heading_ids = extract_headings(document)
+        .into_iter()
+        .map(|heading| heading.id)
+        .collect::<Vec<_>>()
+        .into_iter();
+    let events = Parser::new_ext(document.source(), markdown_options())
+        .map(sanitize_html_event)
+        .map(|event| add_heading_id(event, &mut heading_ids));
+    html::push_html(&mut body, events);
     body
+}
+
+fn add_heading_id<'a>(
+    event: Event<'a>,
+    heading_ids: &mut impl Iterator<Item = String>,
+) -> Event<'a> {
+    match event {
+        Event::Start(Tag::Heading {
+            level,
+            id: None,
+            classes,
+            attrs,
+        }) => Event::Start(Tag::Heading {
+            level,
+            id: heading_ids
+                .next()
+                .map(|id| CowStr::Boxed(id.into_boxed_str())),
+            classes,
+            attrs,
+        }),
+        event => event,
+    }
 }
 
 fn extract_headings(document: &MarkdownDocument) -> Vec<HeadingView> {
@@ -967,7 +996,10 @@ fn empty_state_html() -> String {
 }
 
 fn markdown_options() -> Options {
-    Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH
+    Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES
 }
 
 fn escape_html(value: &str) -> String {
@@ -1511,9 +1543,34 @@ mod tests {
         let html = HtmlRenderer.render_document(&document);
 
         assert!(html.contains("<title>Notes &lt;draft&gt;</title>"));
-        assert!(html.contains("<h1>Hello</h1>"));
+        assert!(html.contains(r#"<h1 id="hello">Hello</h1>"#));
         assert!(html.contains("<strong>rendered</strong>"));
         assert!(html.contains("<main>"));
+    }
+
+    #[test]
+    fn html_renderer_adds_heading_ids() {
+        let html = render_html("# Intro!\n\n## Intro\n\n### Details");
+
+        assert!(html.contains(r#"<h1 id="intro">Intro!</h1>"#));
+        assert!(html.contains(r#"<h2 id="intro-2">Intro</h2>"#));
+        assert!(html.contains(r#"<h3 id="details">Details</h3>"#));
+    }
+
+    #[test]
+    fn html_renderer_supports_task_lists() {
+        let html = render_html("- [x] Done\n- [ ] Later");
+
+        assert!(html.contains(r#"<input disabled="" type="checkbox" checked=""/>"#));
+        assert!(html.contains(r#"<input disabled="" type="checkbox"/>"#));
+    }
+
+    #[test]
+    fn html_renderer_supports_footnotes() {
+        let html = render_html("With a note.[^n]\n\n[^n]: Footnote text.");
+
+        assert!(html.contains("Footnote text"));
+        assert!(html.contains("footnote"));
     }
 
     #[test]
@@ -1749,7 +1806,7 @@ mod tests {
 
         assert_eq!(view.active_tab_id, Some(id));
         assert_eq!(view.tabs[0].title, "notes.md");
-        assert!(view.active_html.contains("<h1>Notes</h1>"));
+        assert!(view.active_html.contains(r#"<h1 id="notes">Notes</h1>"#));
         assert_eq!(
             view.headings,
             vec![

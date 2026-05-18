@@ -358,7 +358,14 @@ impl std::error::Error for CliError {}
 pub struct Cli {
     pub input: Option<String>,
     pub options: RenderOptions,
+    pub output: OutputFormat,
     pub help: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Terminal,
+    Html,
 }
 
 impl Cli {
@@ -368,6 +375,7 @@ impl Cli {
         S: Into<String>,
     {
         let mut options = RenderOptions::default();
+        let mut output = OutputFormat::Terminal;
         let mut input = None;
         let mut help = false;
         let mut args = args.into_iter().map(Into::into);
@@ -375,6 +383,7 @@ impl Cli {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "-h" | "--help" => help = true,
+                "--html" => output = OutputFormat::Html,
                 "--no-color" => options.color = false,
                 "-w" | "--width" => {
                     let value = args.next().ok_or(CliError::MissingValue("--width"))?;
@@ -396,6 +405,7 @@ impl Cli {
         Ok(Self {
             input,
             options,
+            output,
             help,
         })
     }
@@ -414,7 +424,7 @@ fn parse_width(value: &str) -> Result<usize, CliError> {
 }
 
 pub fn help() -> &'static str {
-    "Usage: markview [OPTIONS] [FILE]\n\nReads FILE or stdin and renders Markdown for the terminal.\n\nOptions:\n  -w, --width <COLUMNS>  Wrap text to a target width (minimum 20, default 88)\n      --no-color         Disable ANSI colors while keeping bold text attributes\n  -h, --help             Show this help\n"
+    "Usage: markview [OPTIONS] [FILE]\n\nReads FILE or stdin and renders Markdown for the terminal or HTML.\n\nOptions:\n      --html             Render a complete HTML document\n  -w, --width <COLUMNS>  Wrap terminal text to a target width (minimum 20, default 88)\n      --no-color         Disable ANSI colors while keeping bold text attributes\n  -h, --help             Show this help\n"
 }
 
 pub fn render(markdown: &str, options: RenderOptions) -> String {
@@ -1588,12 +1598,13 @@ mod tests {
 
         assert_eq!(cli.input.as_deref(), Some("README.md"));
         assert_eq!(cli.options, RenderOptions::default());
+        assert_eq!(cli.output, OutputFormat::Terminal);
         assert!(!cli.help);
     }
 
     #[test]
     fn parses_cli_options() {
-        let cli = Cli::parse(["--no-color", "--width=40"]).expect("valid args");
+        let cli = Cli::parse(["--html", "--no-color", "--width=40"]).expect("valid args");
 
         assert_eq!(cli.input, None);
         assert_eq!(
@@ -1603,6 +1614,7 @@ mod tests {
                 width: 40,
             }
         );
+        assert_eq!(cli.output, OutputFormat::Html);
     }
 
     #[test]

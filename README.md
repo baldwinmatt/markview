@@ -20,6 +20,7 @@ cargo build --features gui --bin markview-gui
 markview README.md
 cat README.md | markview --no-color
 markview --width 72 notes.md
+markview --html README.md > README.html
 
 cargo run --features gui --bin markview-gui -- README.md docs/notes.md
 ```

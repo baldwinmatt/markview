@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::process::ExitCode;
 
-use markview::{help, render, Cli};
+use markview::{help, render, Cli, FrontendRenderer, HtmlRenderer, MarkdownDocument, OutputFormat};
 
 fn main() -> ExitCode {
     match run() {
@@ -24,7 +24,7 @@ fn run() -> Result<String, Box<dyn std::error::Error>> {
         return Ok(help().to_owned());
     }
 
-    let markdown = match cli.input {
+    let markdown = match cli.input.as_deref() {
         Some(path) => fs::read_to_string(path)?,
         None => {
             let mut input = String::new();
@@ -33,5 +33,15 @@ fn run() -> Result<String, Box<dyn std::error::Error>> {
         }
     };
 
-    Ok(render(&markdown, cli.options))
+    Ok(match cli.output {
+        OutputFormat::Terminal => render(&markdown, cli.options),
+        OutputFormat::Html => {
+            let document = cli
+                .input
+                .as_deref()
+                .map(|path| MarkdownDocument::from_path(&markdown, path))
+                .unwrap_or_else(|| MarkdownDocument::new(&markdown));
+            HtmlRenderer.render_document(&document)
+        }
+    })
 }

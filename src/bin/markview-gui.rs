@@ -270,7 +270,7 @@ fn initial_model(
         }
     } else {
         for path in inputs {
-            let source = fs::read_to_string(&path)?;
+            let source = fs::read_to_string(path)?;
             model.open_file(normalize_path(path.clone()), source);
         }
     }

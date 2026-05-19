@@ -362,8 +362,10 @@ impl Default for RenderOptions {
 pub enum CliError {
     MissingValue(&'static str),
     InvalidWidth(String),
+    InvalidPort(String),
     UnknownArgument(String),
     TooManyInputs,
+    MissingServeInput,
 }
 
 impl std::fmt::Display for CliError {
@@ -371,8 +373,10 @@ impl std::fmt::Display for CliError {
         match self {
             Self::MissingValue(flag) => write!(f, "missing value for {flag}"),
             Self::InvalidWidth(value) => write!(f, "invalid width: {value}"),
+            Self::InvalidPort(value) => write!(f, "invalid port: {value}"),
             Self::UnknownArgument(arg) => write!(f, "unknown argument: {arg}"),
             Self::TooManyInputs => write!(f, "expected at most one input file"),
+            Self::MissingServeInput => write!(f, "--serve requires an input file"),
         }
     }
 }
@@ -384,6 +388,7 @@ pub struct Cli {
     pub input: Option<String>,
     pub options: RenderOptions,
     pub output: OutputFormat,
+    pub serve: Option<u16>,
     pub help: bool,
 }
 
@@ -402,6 +407,7 @@ impl Cli {
         let mut options = RenderOptions::default();
         let mut output = OutputFormat::Terminal;
         let mut input = None;
+        let mut serve = None;
         let mut help = false;
         let mut args = args.into_iter().map(Into::into);
 
@@ -409,6 +415,18 @@ impl Cli {
             match arg.as_str() {
                 "-h" | "--help" => help = true,
                 "--html" => output = OutputFormat::Html,
+                "--serve" => {
+                    serve = Some(DEFAULT_SERVE_PORT);
+                    if let Some(next) = args.next() {
+                        if let Ok(port) = parse_port(&next) {
+                            serve = Some(port);
+                        } else {
+                            set_input(&mut input, next)?;
+                        }
+                    } else {
+                        return Err(CliError::MissingServeInput);
+                    }
+                }
                 "--no-color" => options.color = false,
                 "-w" | "--width" => {
                     let value = args.next().ok_or(CliError::MissingValue("--width"))?;
@@ -418,22 +436,36 @@ impl Cli {
                     let value = arg.trim_start_matches("--width=");
                     options.width = parse_width(value)?;
                 }
-                _ if arg.starts_with('-') => return Err(CliError::UnknownArgument(arg)),
-                _ => {
-                    if input.replace(arg).is_some() {
-                        return Err(CliError::TooManyInputs);
-                    }
+                _ if arg.starts_with("--serve=") => {
+                    let value = arg.trim_start_matches("--serve=");
+                    serve = Some(parse_port(value)?);
                 }
+                _ if arg.starts_with('-') => return Err(CliError::UnknownArgument(arg)),
+                _ => set_input(&mut input, arg)?,
             }
+        }
+
+        if serve.is_some() && input.is_none() && !help {
+            return Err(CliError::MissingServeInput);
         }
 
         Ok(Self {
             input,
             options,
             output,
+            serve,
             help,
         })
     }
+}
+
+pub const DEFAULT_SERVE_PORT: u16 = 7878;
+
+fn set_input(input: &mut Option<String>, value: String) -> Result<(), CliError> {
+    if input.replace(value).is_some() {
+        return Err(CliError::TooManyInputs);
+    }
+    Ok(())
 }
 
 fn parse_width(value: &str) -> Result<usize, CliError> {
@@ -448,8 +480,14 @@ fn parse_width(value: &str) -> Result<usize, CliError> {
     Ok(width)
 }
 
+fn parse_port(value: &str) -> Result<u16, CliError> {
+    value
+        .parse::<u16>()
+        .map_err(|_| CliError::InvalidPort(value.to_owned()))
+}
+
 pub fn help() -> &'static str {
-    "Usage: markview [OPTIONS] [FILE]\n\nReads FILE or stdin and renders Markdown for the terminal or HTML.\n\nOptions:\n      --html             Render a complete HTML document\n  -w, --width <COLUMNS>  Wrap terminal text to a target width (minimum 20, default 88)\n      --no-color         Disable ANSI colors while keeping bold text attributes\n  -h, --help             Show this help\n"
+    "Usage: markview [OPTIONS] [FILE]\n\nReads FILE or stdin and renders Markdown for the terminal or HTML.\n\nOptions:\n      --html             Render a complete HTML document\n      --serve [PORT]     Serve FILE as HTML on localhost (default port 7878)\n  -w, --width <COLUMNS>  Wrap terminal text to a target width (minimum 20, default 88)\n      --no-color         Disable ANSI colors while keeping bold text attributes\n  -h, --help             Show this help\n"
 }
 
 pub fn render(markdown: &str, options: RenderOptions) -> String {
@@ -1635,6 +1673,7 @@ mod tests {
         assert_eq!(cli.input.as_deref(), Some("README.md"));
         assert_eq!(cli.options, RenderOptions::default());
         assert_eq!(cli.output, OutputFormat::Terminal);
+        assert_eq!(cli.serve, None);
         assert!(!cli.help);
     }
 
@@ -1651,6 +1690,31 @@ mod tests {
             }
         );
         assert_eq!(cli.output, OutputFormat::Html);
+        assert_eq!(cli.serve, None);
+    }
+
+    #[test]
+    fn parses_cli_serve_with_default_port() {
+        let cli = Cli::parse(["--serve", "README.md"]).expect("valid serve args");
+
+        assert_eq!(cli.input.as_deref(), Some("README.md"));
+        assert_eq!(cli.serve, Some(DEFAULT_SERVE_PORT));
+    }
+
+    #[test]
+    fn parses_cli_serve_with_explicit_port() {
+        let cli = Cli::parse(["--serve", "8080", "README.md"]).expect("valid serve args");
+
+        assert_eq!(cli.input.as_deref(), Some("README.md"));
+        assert_eq!(cli.serve, Some(8080));
+    }
+
+    #[test]
+    fn rejects_serve_without_input() {
+        assert_eq!(
+            Cli::parse(["--serve"]).expect_err("missing serve input"),
+            CliError::MissingServeInput
+        );
     }
 
     #[test]

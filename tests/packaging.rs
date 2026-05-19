@@ -18,6 +18,8 @@ fn macos_info_plist_has_minimal_app_bundle_metadata() {
     assert!(plist.contains("<string>mdown</string>"));
     assert!(plist.contains("<string>net.daringfireball.markdown</string>"));
     assert!(plist.contains("<string>Viewer</string>"));
+    assert!(plist.contains("<key>LSHandlerRank</key>"));
+    assert!(plist.contains("<string>Alternate</string>"));
 }
 
 #[test]

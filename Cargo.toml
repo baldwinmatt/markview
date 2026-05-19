@@ -8,17 +8,20 @@ license = "MIT"
 [features]
 default = []
 gui = [
+    "dep:libc",
     "dep:notify",
     "dep:objc2",
     "dep:objc2-app-kit",
     "dep:objc2-foundation",
     "dep:rfd",
     "dep:tao",
+    "dep:url",
     "dep:wry",
 ]
 highlight = []
 
 [dependencies]
+libc = { version = "0.2", optional = true }
 notify = { version = "8", optional = true }
 objc2 = { version = "0.6", optional = true }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSEvent", "NSMenu", "NSMenuItem"], optional = true }
@@ -26,6 +29,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["NSO
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
 rfd = { version = "0.15", optional = true }
 tao = { version = "0.35", optional = true }
+url = { version = "2", optional = true }
 wry = { version = "0.55", optional = true }
 
 [[bin]]

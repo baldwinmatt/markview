@@ -5,6 +5,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
 
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
+
 use markview::{app_view_with_preferences, AppModel, AppView, GuiPreferences};
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tao::event::{Event, WindowEvent};
@@ -164,6 +167,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 sync_view(&webview, &model, &preferences);
                 window.set_title(&window_title(&model));
             }
+            Event::Opened { urls } => {
+                let paths = urls
+                    .iter()
+                    .filter_map(opened_url_file_path)
+                    .collect::<Vec<_>>();
+                if let Err(error) = open_paths(paths, &mut model, &mut watcher) {
+                    eprintln!("markview-gui: {error}");
+                }
+                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
+                sync_view(&webview, &model, &preferences);
+                window.set_title(&window_title(&model));
+            }
             Event::UserEvent(UserEvent::OpenRecent(path)) => {
                 if let Err(error) = open_path(path, &mut model, &mut watcher) {
                     eprintln!("markview-gui: {error}");
@@ -291,9 +306,10 @@ fn initial_model(
     let mut model = AppModel::new();
 
     if inputs.is_empty() {
-        if !io::stdin().is_terminal() {
+        let stdin = io::stdin();
+        if should_read_stdin(detect_stdin_source(&stdin)) {
             let mut source = String::new();
-            io::stdin().read_to_string(&mut source)?;
+            stdin.lock().read_to_string(&mut source)?;
             model.open_untitled("stdin", source);
         } else {
             model = restore_files(preferences);
@@ -308,6 +324,50 @@ fn initial_model(
     Ok(model)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StdinSource {
+    Terminal,
+    Pipe,
+    File,
+    Other,
+}
+
+fn should_read_stdin(source: StdinSource) -> bool {
+    matches!(source, StdinSource::Pipe | StdinSource::File)
+}
+
+fn detect_stdin_source(stdin: &io::Stdin) -> StdinSource {
+    if stdin.is_terminal() {
+        return StdinSource::Terminal;
+    }
+
+    #[cfg(unix)]
+    {
+        stdin_source_from_raw_fd(stdin.as_raw_fd()).unwrap_or(StdinSource::Other)
+    }
+
+    #[cfg(not(unix))]
+    {
+        StdinSource::Other
+    }
+}
+
+#[cfg(unix)]
+fn stdin_source_from_raw_fd(fd: RawFd) -> io::Result<StdinSource> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let status = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+    if status != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mode = unsafe { stat.assume_init().st_mode } & libc::S_IFMT;
+    Ok(match mode {
+        libc::S_IFREG => StdinSource::File,
+        libc::S_IFIFO => StdinSource::Pipe,
+        _ => StdinSource::Other,
+    })
+}
+
 fn open_path(
     path: PathBuf,
     model: &mut AppModel,
@@ -317,6 +377,28 @@ fn open_path(
     model.open_file(normalize_path(path), source);
     watcher.sync(model.watched_directories())?;
     Ok(())
+}
+
+fn open_paths<I>(
+    paths: I,
+    model: &mut AppModel,
+    watcher: &mut FileWatcher,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    I: IntoIterator<Item = PathBuf>,
+{
+    for path in paths {
+        open_path(path, model, watcher)?;
+    }
+    Ok(())
+}
+
+fn opened_url_file_path(url: &url::Url) -> Option<PathBuf> {
+    if url.scheme() == "file" {
+        url.to_file_path().ok()
+    } else {
+        None
+    }
 }
 
 fn open_document(
@@ -1701,6 +1783,26 @@ mod tests {
         assert!(html.contains("Disable auto-refresh on file changes"));
         assert!(html.contains("Enable auto-refresh on file changes"));
         assert!(html.contains("<circle cx=\"12\" cy=\"12\" r=\"8\"></circle>"));
+    }
+
+    #[test]
+    fn stdin_tabs_are_only_created_for_pipe_or_file_stdin() {
+        assert!(should_read_stdin(StdinSource::Pipe));
+        assert!(should_read_stdin(StdinSource::File));
+        assert!(!should_read_stdin(StdinSource::Terminal));
+        assert!(!should_read_stdin(StdinSource::Other));
+    }
+
+    #[test]
+    fn opened_events_only_accept_file_urls() {
+        let file_url = url::Url::from_file_path("/tmp/markview.md").expect("file URL");
+        let web_url = url::Url::parse("https://example.com/markview.md").expect("web URL");
+
+        assert_eq!(
+            opened_url_file_path(&file_url),
+            Some(PathBuf::from("/tmp/markview.md"))
+        );
+        assert_eq!(opened_url_file_path(&web_url), None);
     }
 
     #[test]

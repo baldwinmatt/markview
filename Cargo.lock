@@ -1603,6 +1603,7 @@ name = "markview"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "libc",
  "notify",
  "objc2",
  "objc2-app-kit",
@@ -1612,6 +1613,7 @@ dependencies = [
  "rfd",
  "tao",
  "tempfile",
+ "url",
  "wry",
 ]
 

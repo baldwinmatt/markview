@@ -183,7 +183,10 @@ fn serve_events(
     clients: Arc<Mutex<Vec<mpsc::Sender<()>>>>,
 ) -> io::Result<()> {
     let (tx, rx) = mpsc::channel();
-    clients.lock().expect("clients lock").push(tx);
+    clients
+        .lock()
+        .map_err(|_| io::Error::other("clients lock poisoned"))?
+        .push(tx);
     stream.write_all(
         b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n",
     )?;

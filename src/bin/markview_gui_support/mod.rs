@@ -93,15 +93,6 @@ pub(crate) fn save_preferences(path: &Path, preferences: &GuiPreferences) -> io:
     fs::write(path, preferences.serialize())
 }
 
-pub(crate) fn save_runtime_preferences(
-    path: &Path,
-    preferences: &mut GuiPreferences,
-    model: &AppModel,
-    window: Option<&tao::window::Window>,
-) {
-    persist_open_state(path, preferences, model, window);
-}
-
 pub(crate) fn persist_open_state(
     path: &Path,
     preferences: &mut GuiPreferences,

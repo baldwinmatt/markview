@@ -815,8 +815,11 @@ pub fn app_view_with_preferences(model: &AppModel, preferences: GuiPreferences) 
 }
 
 fn render_document_model(document: &MarkdownDocument) -> RenderedDocument {
-    let headings = extract_headings(document);
-    let html = render_html_body(document, &headings);
+    let events = Parser::new_ext(document.source(), markdown_options())
+        .map(sanitize_html_event)
+        .collect::<Vec<_>>();
+    let headings = extract_headings(&events);
+    let html = render_html_body(&events, &headings);
 
     RenderedDocument {
         title: document.title().to_owned(),
@@ -825,11 +828,12 @@ fn render_document_model(document: &MarkdownDocument) -> RenderedDocument {
     }
 }
 
-fn render_html_body(document: &MarkdownDocument, headings: &[HeadingView]) -> String {
+fn render_html_body(events: &[Event<'_>], headings: &[HeadingView]) -> String {
     let mut body = String::new();
     let mut heading_ids = headings.iter().map(|heading| heading.id.clone());
-    let events = Parser::new_ext(document.source(), markdown_options())
-        .map(sanitize_html_event)
+    let events = events
+        .iter()
+        .cloned()
         .map(|event| add_heading_id(event, &mut heading_ids));
     html::push_html(&mut body, events);
     #[cfg(feature = "highlight")]
@@ -861,15 +865,15 @@ fn add_heading_id<'a>(
     }
 }
 
-fn extract_headings(document: &MarkdownDocument) -> Vec<HeadingView> {
+fn extract_headings(events: &[Event<'_>]) -> Vec<HeadingView> {
     let mut headings = Vec::new();
     let mut active_heading: Option<(u8, String)> = None;
     let mut used_ids = Vec::new();
 
-    for event in Parser::new_ext(document.source(), markdown_options()).map(sanitize_html_event) {
+    for event in events {
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
-                active_heading = Some((heading_level_number(level), String::new()));
+                active_heading = Some((heading_level_number(*level), String::new()));
             }
             Event::End(TagEnd::Heading(_)) => {
                 if let Some((level, title)) = active_heading.take() {
@@ -1545,43 +1549,50 @@ fn line_ends_with_visible_space(line: &str) -> bool {
 }
 
 fn last_visible_char(line: &str) -> Option<char> {
-    let mut last = None;
-    let mut chars = line.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next();
-            for code in chars.by_ref() {
-                if code.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            last = Some(ch);
-        }
-    }
-
-    last
+    visible_chars(line).last()
 }
 
 fn visible_len(line: &str) -> usize {
     let mut len = 0;
-    let mut chars = line.chars().peekable();
 
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next();
-            for code in chars.by_ref() {
-                if code.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else if !ch.is_whitespace() || len > 0 {
+    for ch in visible_chars(line) {
+        if !ch.is_whitespace() || len > 0 {
             len += 1;
         }
     }
 
     len
+}
+
+fn visible_chars(line: &str) -> VisibleChars<'_> {
+    VisibleChars {
+        chars: line.chars().peekable(),
+    }
+}
+
+struct VisibleChars<'a> {
+    chars: std::iter::Peekable<std::str::Chars<'a>>,
+}
+
+impl Iterator for VisibleChars<'_> {
+    type Item = char;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(ch) = self.chars.next() {
+            if ch == '\x1b' && self.chars.peek() == Some(&'[') {
+                self.chars.next();
+                for code in self.chars.by_ref() {
+                    if code.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                return Some(ch);
+            }
+        }
+
+        None
+    }
 }
 
 #[cfg(test)]
@@ -1599,23 +1610,7 @@ mod tests {
     }
 
     fn strip_ansi(input: &str) -> String {
-        let mut stripped = String::with_capacity(input.len());
-        let mut chars = input.chars().peekable();
-
-        while let Some(ch) = chars.next() {
-            if ch == '\x1b' && chars.peek() == Some(&'[') {
-                chars.next();
-                for code in chars.by_ref() {
-                    if code.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            } else {
-                stripped.push(ch);
-            }
-        }
-
-        stripped
+        visible_chars(input).collect()
     }
 
     #[test]

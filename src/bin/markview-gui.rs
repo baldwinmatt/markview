@@ -20,7 +20,7 @@ mod gui_support;
 
 use gui_support::{
     help, load_preferences, normalize_path, persist_open_state, preferences_path, restore_files,
-    save_runtime_preferences, update_window_size, GuiCli,
+    update_window_size, GuiCli,
 };
 
 fn main() -> ExitCode {
@@ -73,12 +73,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                save_runtime_preferences(
-                    &preferences_path,
-                    &mut preferences,
-                    &model,
-                    Some(&window),
-                );
+                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
                 *control_flow = ControlFlow::Exit;
             }
             Event::WindowEvent {
@@ -105,32 +100,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             Event::UserEvent(UserEvent::ToggleSidebar) => {
                 preferences.sidebar_visible = !preferences.sidebar_visible;
-                save_runtime_preferences(
-                    &preferences_path,
-                    &mut preferences,
-                    &model,
-                    Some(&window),
-                );
+                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
                 sync_view(&webview, &model, &preferences);
             }
             Event::UserEvent(UserEvent::ToggleAutoRefresh) => {
                 preferences.auto_refresh = !preferences.auto_refresh;
-                save_runtime_preferences(
-                    &preferences_path,
-                    &mut preferences,
-                    &model,
-                    Some(&window),
-                );
+                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
                 sync_view(&webview, &model, &preferences);
             }
             Event::UserEvent(UserEvent::CycleTheme) => {
                 preferences.theme = preferences.theme.cycle();
-                save_runtime_preferences(
-                    &preferences_path,
-                    &mut preferences,
-                    &model,
-                    Some(&window),
-                );
+                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
                 sync_view(&webview, &model, &preferences);
             }
             Event::UserEvent(UserEvent::PrintRequested) => {
@@ -146,12 +126,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Event::UserEvent(UserEvent::QuitRequested) => {
-                save_runtime_preferences(
-                    &preferences_path,
-                    &mut preferences,
-                    &model,
-                    Some(&window),
-                );
+                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
                 *control_flow = ControlFlow::Exit;
             }
             Event::UserEvent(UserEvent::OpenExternal(url)) => {
@@ -1676,6 +1651,9 @@ fn js_string(value: &str) -> String {
             '&' => escaped.push_str("\\u0026"),
             '\u{2028}' => escaped.push_str("\\u2028"),
             '\u{2029}' => escaped.push_str("\\u2029"),
+            ch if (ch as u32) < 0x20 => {
+                escaped.push_str(&format!("\\u{:04x}", ch as u32));
+            }
             _ => escaped.push(ch),
         }
     }
@@ -1803,6 +1781,11 @@ mod tests {
             Some(PathBuf::from("/tmp/markview.md"))
         );
         assert_eq!(opened_url_file_path(&web_url), None);
+    }
+
+    #[test]
+    fn js_string_escapes_json_control_characters() {
+        assert_eq!(js_string("bad\x01name\nok"), r#""bad\u0001name\nok""#);
     }
 
     #[test]

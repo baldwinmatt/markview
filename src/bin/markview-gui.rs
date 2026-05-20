@@ -467,42 +467,42 @@ fn install_application_menu(proxy: EventLoopProxy<UserEvent>) {
         impl MenuCommandTarget {
             #[unsafe(method(markviewOpenDocument))]
             fn open_document(&self) {
-                let _ = self.ivars().proxy.send_event(UserEvent::OpenRequested);
+                self.send(UserEvent::OpenRequested);
             }
 
             #[unsafe(method(markviewCloseTab))]
             fn close_tab(&self) {
-                let _ = self.ivars().proxy.send_event(UserEvent::CloseActiveTab);
+                self.send(UserEvent::CloseActiveTab);
             }
 
             #[unsafe(method(markviewRefresh))]
             fn refresh(&self) {
-                let _ = self.ivars().proxy.send_event(UserEvent::RefreshRequested);
+                self.send(UserEvent::RefreshRequested);
             }
 
             #[unsafe(method(markviewPrint))]
             fn print(&self) {
-                let _ = self.ivars().proxy.send_event(UserEvent::PrintRequested);
+                self.send(UserEvent::PrintRequested);
             }
 
             #[unsafe(method(markviewFind))]
             fn find(&self) {
-                let _ = self.ivars().proxy.send_event(UserEvent::FindRequested);
+                self.send(UserEvent::FindRequested);
             }
 
             #[unsafe(method(markviewToggleSidebar))]
             fn toggle_sidebar(&self) {
-                let _ = self.ivars().proxy.send_event(UserEvent::ToggleSidebar);
+                self.send(UserEvent::ToggleSidebar);
             }
 
             #[unsafe(method(markviewToggleAutoRefresh))]
             fn toggle_auto_refresh(&self) {
-                let _ = self.ivars().proxy.send_event(UserEvent::ToggleAutoRefresh);
+                self.send(UserEvent::ToggleAutoRefresh);
             }
 
             #[unsafe(method(markviewQuit))]
             fn quit(&self) {
-                let _ = self.ivars().proxy.send_event(UserEvent::QuitRequested);
+                self.send(UserEvent::QuitRequested);
             }
         }
     );
@@ -513,6 +513,10 @@ fn install_application_menu(proxy: EventLoopProxy<UserEvent>) {
                 .alloc::<Self>()
                 .set_ivars(MenuCommandTargetIvars { proxy });
             unsafe { msg_send![super(this), init] }
+        }
+
+        fn send(&self, event: UserEvent) {
+            let _ = self.ivars().proxy.send_event(event);
         }
     }
 
@@ -1313,6 +1317,11 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
   </div>
 </div>
 <script>
+function setTip(el, tip) {{
+  el.title = tip;
+  el.dataset.tooltip = tip;
+  el.setAttribute('aria-label', tip);
+}}
 window.markview = {{
   state: {state},
   scrollPositions: new Map(),
@@ -1334,22 +1343,14 @@ window.markview = {{
     document.documentElement.dataset.theme = next.preferences.theme === 'system' ? '' : next.preferences.theme;
     const sidebarToggle = document.getElementById('sidebar-toggle');
     sidebarToggle.classList.toggle('active', next.preferences.sidebarVisible);
-    const sidebarTip = next.preferences.sidebarVisible ? 'Hide table of contents' : 'Show table of contents';
-    sidebarToggle.title = sidebarTip;
-    sidebarToggle.dataset.tooltip = sidebarTip;
-    sidebarToggle.setAttribute('aria-label', sidebarTip);
+    setTip(sidebarToggle, next.preferences.sidebarVisible ? 'Hide table of contents' : 'Show table of contents');
 
     const autoRefreshToggle = document.getElementById('auto-refresh-toggle');
     autoRefreshToggle.classList.toggle('active', next.preferences.autoRefresh);
-    const autoRefreshTip = next.preferences.autoRefresh ? 'Disable auto-refresh on file changes' : 'Enable auto-refresh on file changes';
-    autoRefreshToggle.title = autoRefreshTip;
-    autoRefreshToggle.dataset.tooltip = autoRefreshTip;
-    autoRefreshToggle.setAttribute('aria-label', autoRefreshTip);
+    setTip(autoRefreshToggle, next.preferences.autoRefresh ? 'Disable auto-refresh on file changes' : 'Enable auto-refresh on file changes');
 
     const themeToggle = document.getElementById('theme-toggle');
-    const themeTip = `Theme: ${{next.preferences.theme}}`;
-    themeToggle.title = themeTip;
-    themeToggle.dataset.tooltip = themeTip;
+    setTip(themeToggle, `Theme: ${{next.preferences.theme}}`);
     recent.replaceChildren();
     const placeholder = document.createElement('option');
     placeholder.value = '';

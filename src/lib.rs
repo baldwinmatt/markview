@@ -886,7 +886,7 @@ fn extract_headings(events: &[Event<'_>]) -> Vec<HeadingView> {
             }
             Event::Text(text) | Event::Code(text) => {
                 if let Some((_, title)) = active_heading.as_mut() {
-                    title.push_str(&text);
+                    title.push_str(text);
                     title.push(' ');
                 }
             }

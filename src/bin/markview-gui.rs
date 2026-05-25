@@ -8,7 +8,9 @@ use std::process::ExitCode;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
 
-use markview::{app_view_with_preferences, AppModel, AppView, GuiPreferences};
+use markview::{
+    app_view_with_preferences, AppModel, AppView, FrontendRenderer, GuiPreferences, HtmlRenderer,
+};
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
@@ -118,6 +120,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("markview-gui: {error}");
                 }
             }
+            Event::UserEvent(UserEvent::ExportHtmlRequested) => {
+                if let Err(error) = export_html(&window, &model) {
+                    eprintln!("markview-gui: {error}");
+                }
+            }
             Event::UserEvent(UserEvent::FindRequested) => {
                 if let Err(error) =
                     webview.evaluate_script("document.getElementById('find-input')?.focus();")
@@ -220,6 +227,7 @@ fn build_webview(
             "open" => Some(UserEvent::OpenRequested),
             "refresh" => Some(UserEvent::RefreshRequested),
             "print" => Some(UserEvent::PrintRequested),
+            "export-html" => Some(UserEvent::ExportHtmlRequested),
             "find" => Some(UserEvent::FindRequested),
             "quit" => Some(UserEvent::QuitRequested),
             "toggle-sidebar" => Some(UserEvent::ToggleSidebar),
@@ -405,6 +413,41 @@ fn open_dropped_documents(
     Ok(())
 }
 
+fn export_html(
+    window: &tao::window::Window,
+    model: &AppModel,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(tab) = model.active_tab() else {
+        return Ok(());
+    };
+
+    let default_name = tab
+        .path()
+        .and_then(|p| p.file_stem())
+        .and_then(|s| s.to_str())
+        .unwrap_or_else(|| tab.title())
+        .to_owned()
+        + ".html";
+
+    let mut dialog = rfd::FileDialog::new()
+        .set_parent(window)
+        .add_filter("HTML", &["html"])
+        .set_file_name(&default_name);
+
+    if let Some(dir) = tab.path().and_then(|p| p.parent()) {
+        if !dir.as_os_str().is_empty() {
+            dialog = dialog.set_directory(dir);
+        }
+    }
+
+    let Some(dest) = dialog.save_file() else {
+        return Ok(());
+    };
+
+    fs::write(dest, HtmlRenderer.render_document(tab.document()))?;
+    Ok(())
+}
+
 fn sync_view(webview: &WebView, model: &AppModel, preferences: &GuiPreferences) {
     let script = format!(
         "window.markview.setState({});",
@@ -439,6 +482,7 @@ enum UserEvent {
     SelectTab(u64),
     CloseTab(u64),
     CloseActiveTab,
+    ExportHtmlRequested,
     FilesChanged(Vec<PathBuf>),
 }
 
@@ -500,6 +544,11 @@ fn install_application_menu(proxy: EventLoopProxy<UserEvent>) {
                 self.send(UserEvent::ToggleAutoRefresh);
             }
 
+            #[unsafe(method(markviewExportHtml))]
+            fn export_html(&self) {
+                self.send(UserEvent::ExportHtmlRequested);
+            }
+
             #[unsafe(method(markviewQuit))]
             fn quit(&self) {
                 self.send(UserEvent::QuitRequested);
@@ -531,6 +580,21 @@ fn install_application_menu(proxy: EventLoopProxy<UserEvent>) {
         unsafe {
             item.setTarget(Some(target));
         }
+        if !key.is_empty() {
+            item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
+        }
+    }
+
+    // Items with no explicit target route through the responder chain, letting
+    // the focused WebView handle standard editing actions (copy, paste, etc.).
+    fn system_menu_item(menu: &NSMenu, title: &str, action: Sel, key: &str) {
+        let item = unsafe {
+            menu.addItemWithTitle_action_keyEquivalent(
+                &NSString::from_str(title),
+                Some(action),
+                &NSString::from_str(key),
+            )
+        };
         if !key.is_empty() {
             item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
         }
@@ -611,11 +675,21 @@ fn install_application_menu(proxy: EventLoopProxy<UserEvent>) {
         sel!(markviewPrint),
         "p",
     );
+    menu_item(
+        &file_menu,
+        &command_target,
+        "Export as HTML...",
+        sel!(markviewExportHtml),
+        "",
+    );
     file_item.setSubmenu(Some(&file_menu));
     main_menu.addItem(&file_item);
 
     let edit_item = NSMenuItem::new(mtm);
     let edit_menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("Edit"));
+    system_menu_item(&edit_menu, "Copy", sel!(copy:), "c");
+    system_menu_item(&edit_menu, "Select All", sel!(selectAll:), "a");
+    edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
     menu_item(&edit_menu, &command_target, "Find", sel!(markviewFind), "f");
     edit_item.setSubmenu(Some(&edit_menu));
     main_menu.addItem(&edit_item);
@@ -1272,6 +1346,13 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
       <path d="M6 14h12v8H6z"></path>
     </svg>
   </button>
+  <button class="tool-button" title="Export as HTML" data-tooltip="Export as HTML" aria-label="Export as HTML" onclick="window.ipc.postMessage('export-html')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+      <polyline points="7 10 12 15 17 10"></polyline>
+      <line x1="12" y1="15" x2="12" y2="3"></line>
+    </svg>
+  </button>
   <button class="tool-button" title="Toggle table of contents" data-tooltip="Toggle table of contents" aria-label="Toggle table of contents" id="sidebar-toggle" onclick="window.ipc.postMessage('toggle-sidebar')">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
       <rect x="3" y="4" width="18" height="16" rx="2"></rect>
@@ -1571,6 +1652,9 @@ window.addEventListener('keydown', event => {{
       event.preventDefault();
       window.ipc.postMessage(`close:${{window.markview.state.activeTabId}}`);
     }}
+  }} else if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === 'e') {{
+    event.preventDefault();
+    window.ipc.postMessage('export-html');
   }}
 }});
 function fileName(path) {{
@@ -1747,6 +1831,8 @@ mod tests {
         assert!(
             html.contains("window.ipc.postMessage(`close:${window.markview.state.activeTabId}`)")
         );
+        assert!(html.contains("event.shiftKey && event.key.toLowerCase() === 'e'"));
+        assert!(html.contains("window.ipc.postMessage('export-html')"));
     }
 
     #[test]

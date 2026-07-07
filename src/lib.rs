@@ -582,6 +582,51 @@ impl AppModel {
         true
     }
 
+    pub fn close_others(&mut self, id: u64) -> bool {
+        if !self.tabs.iter().any(|tab| tab.id == id) {
+            return false;
+        }
+        let others = self
+            .tabs
+            .iter()
+            .map(DocumentTab::id)
+            .filter(|tab_id| *tab_id != id)
+            .collect::<Vec<_>>();
+        for other_id in others {
+            self.close(other_id);
+        }
+        self.active_tab = Some(id);
+        true
+    }
+
+    pub fn close_to_left(&mut self, id: u64) -> bool {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return false;
+        };
+        let to_close = self.tabs[..index]
+            .iter()
+            .map(DocumentTab::id)
+            .collect::<Vec<_>>();
+        for other_id in to_close {
+            self.close(other_id);
+        }
+        true
+    }
+
+    pub fn close_to_right(&mut self, id: u64) -> bool {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return false;
+        };
+        let to_close = self.tabs[index + 1..]
+            .iter()
+            .map(DocumentTab::id)
+            .collect::<Vec<_>>();
+        for other_id in to_close {
+            self.close(other_id);
+        }
+        true
+    }
+
     pub fn mark_changed_paths_stale<'a, I>(&mut self, changed_paths: I) -> Vec<u64>
     where
         I: IntoIterator<Item = &'a Path>,
@@ -612,6 +657,13 @@ impl AppModel {
         let Some(id) = self.active_tab else {
             return Ok(None);
         };
+        self.refresh_tab(id, &mut load)
+    }
+
+    pub fn refresh<F, E>(&mut self, id: u64, mut load: F) -> Result<Option<u64>, E>
+    where
+        F: FnMut(&Path) -> Result<String, E>,
+    {
         self.refresh_tab(id, &mut load)
     }
 
@@ -1892,6 +1944,79 @@ mod tests {
         assert_eq!(
             model.tabs().iter().map(DocumentTab::id).collect::<Vec<_>>(),
             vec![first, third]
+        );
+    }
+
+    #[test]
+    fn app_model_closes_others_and_activates_target() {
+        let mut model = AppModel::new();
+        model.open_file(PathBuf::from("first.md"), "# First".to_owned());
+        let second = model.open_file(PathBuf::from("second.md"), "# Second".to_owned());
+        model.open_file(PathBuf::from("third.md"), "# Third".to_owned());
+
+        assert!(model.close_others(second));
+
+        assert_eq!(
+            model.tabs().iter().map(DocumentTab::id).collect::<Vec<_>>(),
+            vec![second]
+        );
+        assert_eq!(model.active_tab_id(), Some(second));
+    }
+
+    #[test]
+    fn app_model_closes_to_left() {
+        let mut model = AppModel::new();
+        model.open_file(PathBuf::from("first.md"), "# First".to_owned());
+        model.open_file(PathBuf::from("second.md"), "# Second".to_owned());
+        let third = model.open_file(PathBuf::from("third.md"), "# Third".to_owned());
+        let fourth = model.open_file(PathBuf::from("fourth.md"), "# Fourth".to_owned());
+
+        assert!(model.close_to_left(third));
+
+        assert_eq!(
+            model.tabs().iter().map(DocumentTab::id).collect::<Vec<_>>(),
+            vec![third, fourth]
+        );
+    }
+
+    #[test]
+    fn app_model_closes_to_right() {
+        let mut model = AppModel::new();
+        let first = model.open_file(PathBuf::from("first.md"), "# First".to_owned());
+        model.open_file(PathBuf::from("second.md"), "# Second".to_owned());
+        model.open_file(PathBuf::from("third.md"), "# Third".to_owned());
+
+        assert!(model.close_to_right(first));
+
+        assert_eq!(
+            model.tabs().iter().map(DocumentTab::id).collect::<Vec<_>>(),
+            vec![first]
+        );
+    }
+
+    #[test]
+    fn app_model_refreshes_specific_tab_without_changing_active() {
+        let mut model = AppModel::new();
+        let first = model.open_file(PathBuf::from("first.md"), "# Old".to_owned());
+        let second = model.open_file(PathBuf::from("second.md"), "# Second".to_owned());
+        assert!(model.select(second));
+
+        let refreshed = model
+            .refresh(first, |path| {
+                assert_eq!(path, Path::new("first.md"));
+                Ok::<_, std::convert::Infallible>("# New".to_owned())
+            })
+            .expect("refresh");
+
+        assert_eq!(refreshed, Some(first));
+        assert_eq!(model.active_tab_id(), Some(second));
+        assert_eq!(
+            model
+                .tabs()
+                .iter()
+                .find(|tab| tab.id() == first)
+                .map(|tab| tab.document().source()),
+            Some("# New")
         );
     }
 

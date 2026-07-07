@@ -195,6 +195,46 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     window.set_title(&window_title(&model));
                 }
             }
+            Event::UserEvent(UserEvent::CloseOtherTabs(id)) => {
+                model.close_others(id);
+                if let Err(error) = watcher.sync(model.watched_directories()) {
+                    eprintln!("markview-gui: {error}");
+                }
+                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
+                sync_view(&webview, &model, &preferences);
+                window.set_title(&window_title(&model));
+            }
+            Event::UserEvent(UserEvent::CloseTabsToLeft(id)) => {
+                model.close_to_left(id);
+                if let Err(error) = watcher.sync(model.watched_directories()) {
+                    eprintln!("markview-gui: {error}");
+                }
+                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
+                sync_view(&webview, &model, &preferences);
+                window.set_title(&window_title(&model));
+            }
+            Event::UserEvent(UserEvent::CloseTabsToRight(id)) => {
+                model.close_to_right(id);
+                if let Err(error) = watcher.sync(model.watched_directories()) {
+                    eprintln!("markview-gui: {error}");
+                }
+                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
+                sync_view(&webview, &model, &preferences);
+                window.set_title(&window_title(&model));
+            }
+            Event::UserEvent(UserEvent::ReloadTab(id)) => {
+                if let Err(error) = model.refresh(id, |path| fs::read_to_string(path)) {
+                    eprintln!("markview-gui: {error}");
+                }
+                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
+                sync_view(&webview, &model, &preferences);
+                window.set_title(&window_title(&model));
+            }
+            Event::UserEvent(UserEvent::ExportTabHtml(id)) => {
+                if let Err(error) = export_tab_html(&window, &model, id) {
+                    eprintln!("markview-gui: {error}");
+                }
+            }
             Event::UserEvent(UserEvent::FilesChanged(paths)) => {
                 if preferences.auto_refresh {
                     if let Err(error) = model
@@ -243,6 +283,31 @@ fn build_webview(
                 .parse::<u64>()
                 .ok()
                 .map(UserEvent::CloseTab),
+            _ if body.starts_with("close-others:") => body
+                .trim_start_matches("close-others:")
+                .parse::<u64>()
+                .ok()
+                .map(UserEvent::CloseOtherTabs),
+            _ if body.starts_with("close-left:") => body
+                .trim_start_matches("close-left:")
+                .parse::<u64>()
+                .ok()
+                .map(UserEvent::CloseTabsToLeft),
+            _ if body.starts_with("close-right:") => body
+                .trim_start_matches("close-right:")
+                .parse::<u64>()
+                .ok()
+                .map(UserEvent::CloseTabsToRight),
+            _ if body.starts_with("reload-tab:") => body
+                .trim_start_matches("reload-tab:")
+                .parse::<u64>()
+                .ok()
+                .map(UserEvent::ReloadTab),
+            _ if body.starts_with("export-tab-html:") => body
+                .trim_start_matches("export-tab-html:")
+                .parse::<u64>()
+                .ok()
+                .map(UserEvent::ExportTabHtml),
             _ if body.starts_with("recent:") => Some(UserEvent::OpenRecent(PathBuf::from(
                 body.trim_start_matches("recent:"),
             ))),
@@ -420,7 +485,24 @@ fn export_html(
     let Some(tab) = model.active_tab() else {
         return Ok(());
     };
+    export_document_html(window, tab)
+}
 
+fn export_tab_html(
+    window: &tao::window::Window,
+    model: &AppModel,
+    id: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(tab) = model.tabs().iter().find(|tab| tab.id() == id) else {
+        return Ok(());
+    };
+    export_document_html(window, tab)
+}
+
+fn export_document_html(
+    window: &tao::window::Window,
+    tab: &markview::DocumentTab,
+) -> Result<(), Box<dyn std::error::Error>> {
     let default_name = tab
         .path()
         .and_then(|p| p.file_stem())
@@ -482,7 +564,12 @@ enum UserEvent {
     SelectTab(u64),
     CloseTab(u64),
     CloseActiveTab,
+    CloseOtherTabs(u64),
+    CloseTabsToLeft(u64),
+    CloseTabsToRight(u64),
+    ReloadTab(u64),
     ExportHtmlRequested,
+    ExportTabHtml(u64),
     FilesChanged(Vec<PathBuf>),
 }
 
@@ -1056,6 +1143,43 @@ body {{
   white-space: nowrap;
   flex: 0 0 auto;
 }}
+.context-menu {{
+  position: fixed;
+  z-index: 50;
+  min-width: 180px;
+  background: var(--bg);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 4px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
+}}
+.context-menu.hidden {{
+  display: none;
+}}
+.context-menu-item {{
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--fg);
+  width: 100%;
+  min-height: 30px;
+  border-radius: 5px;
+  padding: 0 10px;
+  text-align: left;
+  font: inherit;
+  font-size: 0.88rem;
+}}
+.context-menu-item:hover:not(:disabled) {{
+  background: var(--chrome-strong);
+}}
+.context-menu-item:disabled {{
+  color: var(--muted);
+}}
+.context-menu-separator {{
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--rule);
+}}
 .findbar {{
   display: inline-flex;
   align-items: center;
@@ -1391,6 +1515,7 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
   </div>
 </header>
 <nav class="tabs" id="tabs"></nav>
+<div class="context-menu hidden" id="tab-context-menu" role="menu"></div>
 <div class="scroll-root" id="scroll-root">
   <div class="content-shell">
     <aside class="toc" id="toc"></aside>
@@ -1452,6 +1577,10 @@ window.markview = {{
       button.dataset.tabId = String(tab.id);
       button.title = tab.path || tab.title;
       button.onclick = () => window.ipc.postMessage(`select:${{tab.id}}`);
+      button.oncontextmenu = (event) => {{
+        event.preventDefault();
+        window.markview.showTabContextMenu(tab.id, event.clientX, event.clientY);
+      }};
       const label = document.createElement('span');
       label.className = 'tab-title';
       label.textContent = tab.title;
@@ -1556,6 +1685,49 @@ window.markview = {{
   }},
   findPrevious() {{
     this.activateFindHit(this.findIndex - 1);
+  }},
+  showTabContextMenu(id, x, y) {{
+    const tabs = this.state.tabs;
+    const index = tabs.findIndex(tab => tab.id === id);
+    if (index === -1) return;
+    const tab = tabs[index];
+    const menu = document.getElementById('tab-context-menu');
+    menu.replaceChildren();
+    const addItem = (label, message, disabled) => {{
+      const item = document.createElement('button');
+      item.className = 'context-menu-item';
+      item.setAttribute('role', 'menuitem');
+      item.textContent = label;
+      item.disabled = Boolean(disabled);
+      if (!disabled) {{
+        item.onclick = () => {{
+          window.ipc.postMessage(message);
+          this.hideTabContextMenu();
+        }};
+      }}
+      menu.appendChild(item);
+    }};
+    const addSeparator = () => {{
+      const separator = document.createElement('div');
+      separator.className = 'context-menu-separator';
+      menu.appendChild(separator);
+    }};
+    addItem('Close', `close:${{id}}`);
+    addItem('Close Others', `close-others:${{id}}`, tabs.length < 2);
+    addItem('Close to the Left', `close-left:${{id}}`, index === 0);
+    addItem('Close to the Right', `close-right:${{id}}`, index === tabs.length - 1);
+    addSeparator();
+    addItem('Reload', `reload-tab:${{id}}`, !tab.path);
+    addItem('Export as HTML...', `export-tab-html:${{id}}`);
+    menu.classList.remove('hidden');
+    const rect = menu.getBoundingClientRect();
+    const maxX = window.innerWidth - rect.width - 8;
+    const maxY = window.innerHeight - rect.height - 8;
+    menu.style.left = `${{Math.max(8, Math.min(x, maxX))}}px`;
+    menu.style.top = `${{Math.max(8, Math.min(y, maxY))}}px`;
+  }},
+  hideTabContextMenu() {{
+    document.getElementById('tab-context-menu').classList.add('hidden');
   }}
 }};
 function unwrapFindMarks(root) {{
@@ -1631,8 +1803,24 @@ document.getElementById('recent-files').addEventListener('change', event => {{
     event.target.value = '';
   }}
 }});
+document.addEventListener('click', event => {{
+  const menu = document.getElementById('tab-context-menu');
+  if (!menu.classList.contains('hidden') && !menu.contains(event.target)) {{
+    window.markview.hideTabContextMenu();
+  }}
+}});
+document.addEventListener('contextmenu', event => {{
+  const menu = document.getElementById('tab-context-menu');
+  if (!menu.contains(event.target) && !event.target.closest('.tab')) {{
+    window.markview.hideTabContextMenu();
+  }}
+}});
+window.addEventListener('resize', () => window.markview.hideTabContextMenu());
+window.addEventListener('blur', () => window.markview.hideTabContextMenu());
 window.addEventListener('keydown', event => {{
-  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f') {{
+  if (event.key === 'Escape') {{
+    window.markview.hideTabContextMenu();
+  }} else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f') {{
     event.preventDefault();
     document.getElementById('find-input').focus();
   }} else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'o') {{
@@ -1783,6 +1971,31 @@ mod tests {
         assert!(html.contains("tab-count"));
         assert!(html.contains("scrollIntoView"));
         assert!(html.contains("${next.tabs.length} open"));
+    }
+
+    #[test]
+    fn app_shell_includes_tab_context_menu() {
+        let mut model = AppModel::new();
+        model.open_untitled("one", "# One".to_owned());
+
+        let html = app_shell_html(&app_view_with_preferences(
+            &model,
+            GuiPreferences::default(),
+        ));
+
+        assert!(html.contains(r#"id="tab-context-menu""#));
+        assert!(html.contains("button.oncontextmenu"));
+        assert!(html.contains("showTabContextMenu(tab.id, event.clientX, event.clientY)"));
+        assert!(html.contains("'Close Others'"));
+        assert!(html.contains("'Close to the Left'"));
+        assert!(html.contains("'Close to the Right'"));
+        assert!(html.contains("'Reload'"));
+        assert!(html.contains("'Export as HTML...'"));
+        assert!(html.contains("close-others:"));
+        assert!(html.contains("close-left:"));
+        assert!(html.contains("close-right:"));
+        assert!(html.contains("reload-tab:"));
+        assert!(html.contains("export-tab-html:"));
     }
 
     #[test]

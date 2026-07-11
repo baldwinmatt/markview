@@ -44,11 +44,17 @@ The flow is:
 3. Build or restore `AppModel`.
 4. Convert the model to `AppView` with `app_view_with_preferences`.
 5. Render the app shell into the WebView.
-6. Receive toolbar, tab, recent-file, print, link, drag/drop, and file-watch events through the event loop.
+6. Receive toolbar, tab, recent-file, print, edit, save, link, drag/drop, and file-watch events through the event loop.
 7. Mutate `AppModel`/`GuiPreferences`.
 8. Rebuild `AppView` and send a small JavaScript state update to the WebView.
 
 The WebView shell should remain a view adapter. File loading, tab state, stale state, preferences, and rendered document data should stay in Rust model types.
+
+## Editing
+
+Each `DocumentTab` tracks an `editing` flag and a `dirty` flag alongside its `MarkdownDocument`. Toggling edit mode (toolbar button, View menu, or Cmd+E) flips `editing`; every keystroke in the editor textarea sends the full source back through `AppModel::update_source`, which updates the tab's document and sets `dirty`. Because the model recomputes `AppView` on every keystroke like any other mutation, the WebView shell has one exception to the "always re-render from state" rule: while a tab is being edited, `setState` leaves an already-mounted `<textarea>` for that tab alone instead of replacing it, so the state push doesn't reset the user's cursor position mid-keystroke.
+
+`AppModel::mark_saved` clears the dirty flag once the GUI writes the source to disk; `AppModel::assign_path` gives an untitled tab a path after a Save As. Manual refresh (toolbar, menu, or per-tab reload) always discards in-progress edits and exits edit mode, since it's an explicit "show me what's on disk" action. Auto-refresh from the file watcher instead skips any tab that is dirty or currently being edited and marks it stale, so unsaved edits are never silently overwritten by an external change.
 
 ## Persistence
 

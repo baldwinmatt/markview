@@ -286,6 +286,14 @@ impl MarkdownDocument {
     pub fn title(&self) -> &str {
         &self.title
     }
+
+    pub fn set_source(&mut self, source: impl Into<String>) {
+        self.source = source.into();
+    }
+
+    pub fn set_title(&mut self, title: impl Into<String>) {
+        self.title = title.into();
+    }
 }
 
 pub trait FrontendRenderer {
@@ -503,6 +511,8 @@ pub struct DocumentTab {
     id: u64,
     path: Option<PathBuf>,
     document: MarkdownDocument,
+    editing: bool,
+    dirty: bool,
 }
 
 impl DocumentTab {
@@ -524,6 +534,14 @@ impl DocumentTab {
 
     pub fn is_file_backed(&self) -> bool {
         self.path.is_some()
+    }
+
+    pub fn is_editing(&self) -> bool {
+        self.editing
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
     }
 }
 
@@ -695,7 +713,7 @@ impl AppModel {
         F: FnMut(&Path) -> Result<String, E>,
     {
         let changed_paths = changed_paths.into_iter().collect::<Vec<_>>();
-        let ids = self
+        let matching = self
             .tabs
             .iter()
             .filter(|tab| {
@@ -703,14 +721,20 @@ impl AppModel {
                     .as_deref()
                     .is_some_and(|path| changed_paths.contains(&path))
             })
-            .map(|tab| tab.id)
+            .map(|tab| (tab.id, tab.editing || tab.dirty))
             .collect::<Vec<_>>();
 
-        for id in &ids {
-            self.refresh_tab(*id, &mut load)?;
+        let mut refreshed = Vec::new();
+        for (id, has_unsaved_edits) in matching {
+            if has_unsaved_edits {
+                self.mark_stale(id);
+            } else {
+                self.refresh_tab(id, &mut load)?;
+                refreshed.push(id);
+            }
         }
 
-        Ok(ids)
+        Ok(refreshed)
     }
 
     pub fn refresh_file_backed<F, E>(&mut self, mut load: F) -> Result<Vec<u64>, E>
@@ -777,10 +801,57 @@ impl AppModel {
         paths
     }
 
+    /// Toggles edit mode for `id`, returning the new editing state.
+    pub fn toggle_editing(&mut self, id: u64) -> Option<bool> {
+        let tab = self.tabs.iter_mut().find(|tab| tab.id == id)?;
+        tab.editing = !tab.editing;
+        Some(tab.editing)
+    }
+
+    /// Replaces the source of `id`'s document and marks it dirty.
+    pub fn update_source(&mut self, id: u64, source: String) -> bool {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
+            return false;
+        };
+        tab.document.set_source(source);
+        tab.dirty = true;
+        true
+    }
+
+    /// Clears the dirty flag for `id`, e.g. after a successful save.
+    pub fn mark_saved(&mut self, id: u64) -> bool {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
+            return false;
+        };
+        tab.dirty = false;
+        true
+    }
+
+    /// Assigns a file path to a previously untitled tab (Save As).
+    pub fn assign_path(&mut self, id: u64, path: PathBuf) -> bool {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
+            return false;
+        };
+        let title = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Markdown")
+            .to_owned();
+        tab.document.set_title(title);
+        tab.path = Some(path);
+        true
+    }
+
     fn push_tab(&mut self, path: Option<PathBuf>, document: MarkdownDocument) -> u64 {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
-        self.tabs.push(DocumentTab { id, path, document });
+        self.tabs.push(DocumentTab {
+            id,
+            path,
+            document,
+            editing: false,
+            dirty: false,
+        });
         self.active_tab = Some(id);
         self.stale_tabs.retain(|stale_id| *stale_id != id);
         id
@@ -804,6 +875,8 @@ impl AppModel {
         };
         let source = load(&path)?;
         tab.document = MarkdownDocument::from_path(source, &path);
+        tab.editing = false;
+        tab.dirty = false;
         self.stale_tabs.retain(|stale_id| *stale_id != id);
         Ok(Some(id))
     }
@@ -814,6 +887,7 @@ pub struct AppView {
     pub tabs: Vec<TabView>,
     pub active_tab_id: Option<u64>,
     pub active_html: String,
+    pub active_source: String,
     pub headings: Vec<HeadingView>,
     pub preferences: GuiPreferences,
 }
@@ -824,6 +898,8 @@ pub struct TabView {
     pub title: String,
     pub path: Option<String>,
     pub stale: bool,
+    pub editing: bool,
+    pub dirty: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -852,6 +928,8 @@ pub fn app_view_with_preferences(model: &AppModel, preferences: GuiPreferences) 
                 title: tab.title().to_owned(),
                 path: tab.path().map(|path| path.display().to_string()),
                 stale: model.is_stale(tab.id()),
+                editing: tab.is_editing(),
+                dirty: tab.is_dirty(),
             })
             .collect(),
         active_tab_id: model.active_tab_id(),
@@ -859,6 +937,10 @@ pub fn app_view_with_preferences(model: &AppModel, preferences: GuiPreferences) 
             .as_ref()
             .map(|document| document.html().to_owned())
             .unwrap_or_else(empty_state_html),
+        active_source: model
+            .active_tab()
+            .map(|tab| tab.document().source().to_owned())
+            .unwrap_or_default(),
         headings: active_document
             .map(|document| document.headings().to_vec())
             .unwrap_or_default(),
@@ -2129,6 +2211,90 @@ mod tests {
     }
 
     #[test]
+    fn app_model_toggles_editing_and_tracks_dirty_state_on_edits() {
+        let mut model = AppModel::new();
+        let id = model.open_file(PathBuf::from("/tmp/notes.md"), "# Notes".to_owned());
+
+        assert!(!model.tabs()[0].is_editing());
+        assert_eq!(model.toggle_editing(id), Some(true));
+        assert!(model.tabs()[0].is_editing());
+        assert!(!model.tabs()[0].is_dirty());
+
+        assert!(model.update_source(id, "# Edited".to_owned()));
+        assert_eq!(model.tabs()[0].document().source(), "# Edited");
+        assert!(model.tabs()[0].is_dirty());
+
+        assert!(model.mark_saved(id));
+        assert!(!model.tabs()[0].is_dirty());
+
+        assert_eq!(model.toggle_editing(id), Some(false));
+        assert!(!model.tabs()[0].is_editing());
+    }
+
+    #[test]
+    fn app_model_editing_operations_on_missing_tab_return_none_or_false() {
+        let mut model = AppModel::new();
+
+        assert_eq!(model.toggle_editing(99), None);
+        assert!(!model.update_source(99, "# Nope".to_owned()));
+        assert!(!model.mark_saved(99));
+        assert!(!model.assign_path(99, PathBuf::from("/tmp/nope.md")));
+    }
+
+    #[test]
+    fn app_model_assigns_path_and_title_for_untitled_tab() {
+        let mut model = AppModel::new();
+        let id = model.open_untitled("stdin", "# Draft".to_owned());
+
+        assert!(model.tabs()[0].path().is_none());
+
+        assert!(model.assign_path(id, PathBuf::from("/tmp/draft.md")));
+
+        assert_eq!(model.tabs()[0].path(), Some(Path::new("/tmp/draft.md")));
+        assert_eq!(model.tabs()[0].title(), "draft.md");
+        assert_eq!(model.tabs()[0].document().source(), "# Draft");
+    }
+
+    #[test]
+    fn app_model_refresh_tab_discards_dirty_edits_and_exits_editing() {
+        let mut model = AppModel::new();
+        let id = model.open_file(PathBuf::from("/tmp/notes.md"), "# Old".to_owned());
+        model.toggle_editing(id);
+        model.update_source(id, "# Unsaved".to_owned());
+
+        model
+            .refresh(id, |_| {
+                Ok::<_, std::convert::Infallible>("# Fresh".to_owned())
+            })
+            .expect("refresh");
+
+        assert_eq!(model.tabs()[0].document().source(), "# Fresh");
+        assert!(!model.tabs()[0].is_editing());
+        assert!(!model.tabs()[0].is_dirty());
+    }
+
+    #[test]
+    fn app_model_refresh_changed_paths_preserves_dirty_tabs_as_stale() {
+        let mut model = AppModel::new();
+        let dirty_id = model.open_file(PathBuf::from("/tmp/one.md"), "# One".to_owned());
+        let clean_id = model.open_file(PathBuf::from("/tmp/two.md"), "# Two".to_owned());
+        model.toggle_editing(dirty_id);
+        model.update_source(dirty_id, "# One edited".to_owned());
+
+        let changed = [Path::new("/tmp/one.md"), Path::new("/tmp/two.md")];
+        let refreshed = model
+            .refresh_changed_paths(changed, |path| {
+                Ok::<_, std::convert::Infallible>(format!("# Fresh {}", path.display()))
+            })
+            .expect("refresh");
+
+        assert_eq!(refreshed, vec![clean_id]);
+        assert!(model.is_stale(dirty_id));
+        assert_eq!(model.tabs()[0].document().source(), "# One edited");
+        assert_eq!(model.tabs()[1].document().source(), "# Fresh /tmp/two.md");
+    }
+
+    #[test]
     fn app_model_refreshes_all_file_backed_tabs_for_directory_events() {
         let mut model = AppModel::new();
         let first = model.open_file(PathBuf::from("README.md"), "# Old readme".to_owned());
@@ -2201,7 +2367,24 @@ mod tests {
             ]
         );
         assert!(!view.tabs[0].stale);
+        assert!(!view.tabs[0].editing);
+        assert!(!view.tabs[0].dirty);
+        assert_eq!(view.active_source, "# Notes\n\n## Details");
         assert_eq!(view.preferences, GuiPreferences::default());
+    }
+
+    #[test]
+    fn app_view_reflects_editing_and_dirty_tab_state() {
+        let mut model = AppModel::new();
+        let id = model.open_file(PathBuf::from("/tmp/notes.md"), "# Notes".to_owned());
+        model.toggle_editing(id);
+        model.update_source(id, "# Edited notes".to_owned());
+
+        let view = app_view(&model);
+
+        assert!(view.tabs[0].editing);
+        assert!(view.tabs[0].dirty);
+        assert_eq!(view.active_source, "# Edited notes");
     }
 
     #[test]

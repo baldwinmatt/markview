@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, IsTerminal, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::ExitCode;
 
@@ -74,7 +74,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
-            } => {
+            } if !any_tab_dirty(&model)
+                || confirm_discard_changes(
+                    &window,
+                    "You have unsaved changes. Discard them and quit?",
+                ) =>
+            {
                 persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
                 *control_flow = ControlFlow::Exit;
             }
@@ -132,7 +137,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("markview-gui: failed to focus find: {error}");
                 }
             }
-            Event::UserEvent(UserEvent::QuitRequested) => {
+            Event::UserEvent(UserEvent::QuitRequested)
+                if !any_tab_dirty(&model)
+                    || confirm_discard_changes(
+                        &window,
+                        "You have unsaved changes. Discard them and quit?",
+                    ) =>
+            {
                 persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
                 *control_flow = ControlFlow::Exit;
             }
@@ -176,16 +187,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 window.set_title(&window_title(&model));
             }
             Event::UserEvent(UserEvent::CloseTab(id)) => {
-                model.close(id);
-                if let Err(error) = watcher.sync(model.watched_directories()) {
-                    eprintln!("markview-gui: {error}");
-                }
-                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
-                sync_view(&webview, &model, &preferences);
-                window.set_title(&window_title(&model));
-            }
-            Event::UserEvent(UserEvent::CloseActiveTab) => {
-                if let Some(id) = model.active_tab_id() {
+                let confirmed = match model.tabs().iter().find(|tab| tab.id() == id) {
+                    Some(tab) if tab.is_dirty() => confirm_discard_changes(
+                        &window,
+                        &format!(
+                            "\"{}\" has unsaved changes. Discard them and close this tab?",
+                            tab.title()
+                        ),
+                    ),
+                    _ => true,
+                };
+                if confirmed {
                     model.close(id);
                     if let Err(error) = watcher.sync(model.watched_directories()) {
                         eprintln!("markview-gui: {error}");
@@ -195,32 +207,81 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     window.set_title(&window_title(&model));
                 }
             }
-            Event::UserEvent(UserEvent::CloseOtherTabs(id)) => {
-                model.close_others(id);
-                if let Err(error) = watcher.sync(model.watched_directories()) {
-                    eprintln!("markview-gui: {error}");
+            Event::UserEvent(UserEvent::CloseActiveTab) => {
+                if let Some(id) = model.active_tab_id() {
+                    let confirmed = match model.active_tab() {
+                        Some(tab) if tab.is_dirty() => confirm_discard_changes(
+                            &window,
+                            &format!(
+                                "\"{}\" has unsaved changes. Discard them and close this tab?",
+                                tab.title()
+                            ),
+                        ),
+                        _ => true,
+                    };
+                    if confirmed {
+                        model.close(id);
+                        if let Err(error) = watcher.sync(model.watched_directories()) {
+                            eprintln!("markview-gui: {error}");
+                        }
+                        persist_open_state(
+                            &preferences_path,
+                            &mut preferences,
+                            &model,
+                            Some(&window),
+                        );
+                        sync_view(&webview, &model, &preferences);
+                        window.set_title(&window_title(&model));
+                    }
                 }
-                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
-                sync_view(&webview, &model, &preferences);
-                window.set_title(&window_title(&model));
+            }
+            Event::UserEvent(UserEvent::CloseOtherTabs(id)) => {
+                let confirmed = !other_tabs_dirty(&model, id)
+                    || confirm_discard_changes(
+                        &window,
+                        "Other open tabs have unsaved changes. Discard them and close those tabs?",
+                    );
+                if confirmed {
+                    model.close_others(id);
+                    if let Err(error) = watcher.sync(model.watched_directories()) {
+                        eprintln!("markview-gui: {error}");
+                    }
+                    persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
+                    sync_view(&webview, &model, &preferences);
+                    window.set_title(&window_title(&model));
+                }
             }
             Event::UserEvent(UserEvent::CloseTabsToLeft(id)) => {
-                model.close_to_left(id);
-                if let Err(error) = watcher.sync(model.watched_directories()) {
-                    eprintln!("markview-gui: {error}");
+                let confirmed = !tabs_to_left_dirty(&model, id)
+                    || confirm_discard_changes(
+                        &window,
+                        "Some of the tabs you're closing have unsaved changes. Discard them and close those tabs?",
+                    );
+                if confirmed {
+                    model.close_to_left(id);
+                    if let Err(error) = watcher.sync(model.watched_directories()) {
+                        eprintln!("markview-gui: {error}");
+                    }
+                    persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
+                    sync_view(&webview, &model, &preferences);
+                    window.set_title(&window_title(&model));
                 }
-                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
-                sync_view(&webview, &model, &preferences);
-                window.set_title(&window_title(&model));
             }
             Event::UserEvent(UserEvent::CloseTabsToRight(id)) => {
-                model.close_to_right(id);
-                if let Err(error) = watcher.sync(model.watched_directories()) {
-                    eprintln!("markview-gui: {error}");
+                let confirmed = !tabs_to_right_dirty(&model, id)
+                    || confirm_discard_changes(
+                        &window,
+                        "Some of the tabs you're closing have unsaved changes. Discard them and close those tabs?",
+                    );
+                if confirmed {
+                    model.close_to_right(id);
+                    if let Err(error) = watcher.sync(model.watched_directories()) {
+                        eprintln!("markview-gui: {error}");
+                    }
+                    persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
+                    sync_view(&webview, &model, &preferences);
+                    window.set_title(&window_title(&model));
                 }
-                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
-                sync_view(&webview, &model, &preferences);
-                window.set_title(&window_title(&model));
             }
             Event::UserEvent(UserEvent::ReloadTab(id)) => {
                 if let Err(error) = model.refresh(id, |path| fs::read_to_string(path)) {
@@ -234,6 +295,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(error) = export_tab_html(&window, &model, id) {
                     eprintln!("markview-gui: {error}");
                 }
+            }
+            Event::UserEvent(UserEvent::ToggleActiveEdit) => {
+                if let Some(id) = model.active_tab_id() {
+                    model.toggle_editing(id);
+                    sync_view(&webview, &model, &preferences);
+                }
+            }
+            Event::UserEvent(UserEvent::EditChanged(id, text)) => {
+                model.update_source(id, text);
+                sync_view(&webview, &model, &preferences);
+                window.set_title(&window_title(&model));
+            }
+            Event::UserEvent(UserEvent::SaveRequested) => {
+                if let Err(error) = save_active(&window, &mut model) {
+                    eprintln!("markview-gui: {error}");
+                }
+                if let Err(error) = watcher.sync(model.watched_directories()) {
+                    eprintln!("markview-gui: {error}");
+                }
+                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
+                sync_view(&webview, &model, &preferences);
+                window.set_title(&window_title(&model));
             }
             Event::UserEvent(UserEvent::FilesChanged(paths)) => {
                 if preferences.auto_refresh {
@@ -273,6 +356,16 @@ fn build_webview(
             "toggle-sidebar" => Some(UserEvent::ToggleSidebar),
             "toggle-auto-refresh" => Some(UserEvent::ToggleAutoRefresh),
             "cycle-theme" => Some(UserEvent::CycleTheme),
+            "toggle-edit" => Some(UserEvent::ToggleActiveEdit),
+            "save" => Some(UserEvent::SaveRequested),
+            _ if body.starts_with("edit:") => {
+                let rest = body.trim_start_matches("edit:");
+                rest.split_once(':').and_then(|(id, text)| {
+                    id.parse::<u64>()
+                        .ok()
+                        .map(|id| UserEvent::EditChanged(id, text.to_owned()))
+                })
+            }
             _ if body.starts_with("select:") => body
                 .trim_start_matches("select:")
                 .parse::<u64>()
@@ -530,6 +623,41 @@ fn export_document_html(
     Ok(())
 }
 
+fn save_active(
+    window: &tao::window::Window,
+    model: &mut AppModel,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(tab) = model.active_tab() else {
+        return Ok(());
+    };
+    let id = tab.id();
+
+    let path = match tab.path() {
+        Some(path) => path.to_path_buf(),
+        None => {
+            let default_name = if is_markdown_path(Path::new(tab.title())) {
+                tab.title().to_owned()
+            } else {
+                format!("{}.md", tab.title())
+            };
+            let Some(chosen) = rfd::FileDialog::new()
+                .set_parent(window)
+                .add_filter("Markdown", &["md", "markdown", "mdown"])
+                .set_file_name(&default_name)
+                .save_file()
+            else {
+                return Ok(());
+            };
+            chosen
+        }
+    };
+
+    fs::write(&path, tab.document().source())?;
+    model.assign_path(id, normalize_path(path));
+    model.mark_saved(id);
+    Ok(())
+}
+
 fn sync_view(webview: &WebView, model: &AppModel, preferences: &GuiPreferences) {
     let script = format!(
         "window.markview.setState({});",
@@ -541,11 +669,52 @@ fn sync_view(webview: &WebView, model: &AppModel, preferences: &GuiPreferences) 
 }
 
 fn window_title(model: &AppModel) -> String {
-    let title = model
-        .active_tab()
-        .map(|tab| tab.title())
-        .unwrap_or("No document");
-    format!("markview - {title}")
+    let Some(tab) = model.active_tab() else {
+        return "markview - No document".to_owned();
+    };
+    let marker = if tab.is_dirty() { "\u{25CF} " } else { "" };
+    format!("markview - {marker}{}", tab.title())
+}
+
+/// Shows a blocking "discard changes?" prompt and returns whether the user confirmed.
+fn confirm_discard_changes(window: &tao::window::Window, message: &str) -> bool {
+    rfd::MessageDialog::new()
+        .set_parent(window)
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title("Unsaved Changes")
+        .set_description(message)
+        .set_buttons(rfd::MessageButtons::YesNo)
+        .show()
+        == rfd::MessageDialogResult::Yes
+}
+
+fn other_tabs_dirty(model: &AppModel, keep_id: u64) -> bool {
+    model
+        .tabs()
+        .iter()
+        .any(|tab| tab.id() != keep_id && tab.is_dirty())
+}
+
+fn tabs_to_left_dirty(model: &AppModel, id: u64) -> bool {
+    let Some(index) = model.tabs().iter().position(|tab| tab.id() == id) else {
+        return false;
+    };
+    model.tabs()[..index]
+        .iter()
+        .any(markview::DocumentTab::is_dirty)
+}
+
+fn tabs_to_right_dirty(model: &AppModel, id: u64) -> bool {
+    let Some(index) = model.tabs().iter().position(|tab| tab.id() == id) else {
+        return false;
+    };
+    model.tabs()[index + 1..]
+        .iter()
+        .any(markview::DocumentTab::is_dirty)
+}
+
+fn any_tab_dirty(model: &AppModel) -> bool {
+    model.tabs().iter().any(|tab| tab.is_dirty())
 }
 
 #[derive(Debug, Clone)]
@@ -571,6 +740,9 @@ enum UserEvent {
     ExportHtmlRequested,
     ExportTabHtml(u64),
     FilesChanged(Vec<PathBuf>),
+    ToggleActiveEdit,
+    EditChanged(u64, String),
+    SaveRequested,
 }
 
 #[cfg(target_os = "macos")]
@@ -609,6 +781,16 @@ fn install_application_menu(proxy: EventLoopProxy<UserEvent>) {
             #[unsafe(method(markviewRefresh))]
             fn refresh(&self) {
                 self.send(UserEvent::RefreshRequested);
+            }
+
+            #[unsafe(method(markviewSave))]
+            fn save(&self) {
+                self.send(UserEvent::SaveRequested);
+            }
+
+            #[unsafe(method(markviewToggleEdit))]
+            fn toggle_edit(&self) {
+                self.send(UserEvent::ToggleActiveEdit);
             }
 
             #[unsafe(method(markviewPrint))]
@@ -755,6 +937,8 @@ fn install_application_menu(proxy: EventLoopProxy<UserEvent>) {
         "r",
     );
     file_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    menu_item(&file_menu, &command_target, "Save", sel!(markviewSave), "s");
+    file_menu.addItem(&NSMenuItem::separatorItem(mtm));
     menu_item(
         &file_menu,
         &command_target,
@@ -783,6 +967,13 @@ fn install_application_menu(proxy: EventLoopProxy<UserEvent>) {
 
     let view_item = NSMenuItem::new(mtm);
     let view_menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("View"));
+    menu_item(
+        &view_menu,
+        &command_target,
+        "Toggle Edit Mode",
+        sel!(markviewToggleEdit),
+        "e",
+    );
     menu_item(
         &view_menu,
         &command_target,
@@ -1111,6 +1302,11 @@ body {{
   font-size: 0.78rem;
   margin-left: 6px;
 }}
+.tab.dirty .tab-title::before {{
+  content: "\25CF ";
+  color: var(--accent);
+  font-size: 0.7rem;
+}}
 .tab-title {{
   min-width: 0;
   overflow: hidden;
@@ -1266,6 +1462,26 @@ body {{
 main {{
   padding: 40px 0 64px;
   min-width: 0;
+}}
+.editor {{
+  appearance: none;
+  display: block;
+  width: 100%;
+  min-height: calc(100vh - 190px);
+  resize: vertical;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--code-bg);
+  color: var(--fg);
+  padding: 16px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.92rem;
+  line-height: 1.6;
+  tab-size: 2;
+}}
+.editor:focus {{
+  outline: none;
+  border-color: var(--accent);
 }}
 mark.find-hit {{
   background: #facc15;
@@ -1463,6 +1679,18 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
       <path d="M6 22v-5h5"></path>
     </svg>
   </button>
+  <button class="tool-button" title="Toggle edit mode" data-tooltip="Toggle edit mode" aria-label="Toggle edit mode" id="edit-toggle" onclick="window.ipc.postMessage('toggle-edit')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"></path>
+    </svg>
+  </button>
+  <button class="tool-button" title="Save active document" data-tooltip="Save active document" aria-label="Save active document" onclick="window.ipc.postMessage('save')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"></path>
+      <path d="M17 21v-8H7v8"></path>
+      <path d="M7 3v5h8"></path>
+    </svg>
+  </button>
   <button class="tool-button" title="Print document" data-tooltip="Print document" aria-label="Print document" onclick="window.ipc.postMessage('print')">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
       <path d="M6 9V2h12v7"></path>
@@ -1557,6 +1785,14 @@ window.markview = {{
 
     const themeToggle = document.getElementById('theme-toggle');
     setTip(themeToggle, `Theme: ${{next.preferences.theme}}`);
+
+    const activeTabView = next.tabs.find(tab => tab.id === next.activeTabId) || null;
+    const isEditingActive = Boolean(activeTabView && activeTabView.editing);
+    const editToggle = document.getElementById('edit-toggle');
+    editToggle.classList.toggle('active', Boolean(activeTabView && activeTabView.editing));
+    editToggle.disabled = !activeTabView;
+    setTip(editToggle, activeTabView && activeTabView.editing ? 'Preview document' : 'Edit document');
+
     recent.replaceChildren();
     const placeholder = document.createElement('option');
     placeholder.value = '';
@@ -1573,7 +1809,7 @@ window.markview = {{
     tabs.replaceChildren();
     for (const tab of next.tabs) {{
       const button = document.createElement('button');
-      button.className = 'tab' + (tab.id === next.activeTabId ? ' active' : '') + (tab.stale ? ' stale' : '');
+      button.className = 'tab' + (tab.id === next.activeTabId ? ' active' : '') + (tab.stale ? ' stale' : '') + (tab.dirty ? ' dirty' : '');
       button.dataset.tabId = String(tab.id);
       button.title = tab.path || tab.title;
       button.onclick = () => window.ipc.postMessage(`select:${{tab.id}}`);
@@ -1602,43 +1838,66 @@ window.markview = {{
       count.textContent = `${{next.tabs.length}} open`;
       tabs.appendChild(count);
     }}
-    pane.innerHTML = next.activeHtml;
-    for (const action of pane.querySelectorAll('[data-action="open"]')) {{
-      action.addEventListener('click', () => window.ipc.postMessage('open'));
-    }}
-    const renderedHeadings = pane.querySelectorAll('h1,h2,h3,h4,h5,h6');
-    next.headings.forEach((heading, index) => {{
-      if (renderedHeadings[index]) {{
-        renderedHeadings[index].id = heading.id;
+    const existingEditor = pane.querySelector('textarea.editor');
+    if (isEditingActive) {{
+      shell.classList.add('sidebar-hidden');
+      toc.classList.add('hidden');
+      if (existingEditor && existingEditor.dataset.tabId === String(next.activeTabId)) {{
+        // Leave the mounted textarea untouched so in-progress typing and
+        // cursor position survive the state push triggered by this edit.
+      }} else {{
+        pane.innerHTML = '';
+        const textarea = document.createElement('textarea');
+        textarea.className = 'editor';
+        textarea.dataset.tabId = String(next.activeTabId);
+        textarea.value = next.activeSource;
+        textarea.spellcheck = false;
+        textarea.placeholder = 'Start writing Markdown...';
+        textarea.addEventListener('input', () => {{
+          window.ipc.postMessage(`edit:${{next.activeTabId}}:${{textarea.value}}`);
+        }});
+        pane.appendChild(textarea);
+        textarea.focus();
       }}
-    }});
-    toc.replaceChildren();
-    toc.classList.toggle('hidden', !next.preferences.sidebarVisible);
-    shell.classList.toggle('sidebar-hidden', !next.preferences.sidebarVisible);
-    if (next.headings.length === 0) {{
-      const empty = document.createElement('div');
-      empty.className = 'toc-empty';
-      empty.textContent = 'No headings';
-      toc.appendChild(empty);
     }} else {{
-      const list = document.createElement('div');
-      list.className = 'toc-list';
-      for (const heading of next.headings) {{
-        const item = document.createElement('button');
-        item.className = 'toc-link';
-        item.style.paddingLeft = `${{8 + Math.max(0, heading.level - 1) * 12}}px`;
-        item.textContent = heading.title;
-        item.title = heading.title;
-        item.onclick = () => {{
-          const target = document.getElementById(heading.id);
-          if (target) {{
-            scrollInside(target, 'start');
-            history.replaceState(null, '', `#${{heading.id}}`);
-          }}
-        }};
-        list.appendChild(item);
+      pane.innerHTML = next.activeHtml;
+      for (const action of pane.querySelectorAll('[data-action="open"]')) {{
+        action.addEventListener('click', () => window.ipc.postMessage('open'));
       }}
-      toc.appendChild(list);
+      const renderedHeadings = pane.querySelectorAll('h1,h2,h3,h4,h5,h6');
+      next.headings.forEach((heading, index) => {{
+        if (renderedHeadings[index]) {{
+          renderedHeadings[index].id = heading.id;
+        }}
+      }});
+      toc.replaceChildren();
+      toc.classList.toggle('hidden', !next.preferences.sidebarVisible);
+      shell.classList.toggle('sidebar-hidden', !next.preferences.sidebarVisible);
+      if (next.headings.length === 0) {{
+        const empty = document.createElement('div');
+        empty.className = 'toc-empty';
+        empty.textContent = 'No headings';
+        toc.appendChild(empty);
+      }} else {{
+        const list = document.createElement('div');
+        list.className = 'toc-list';
+        for (const heading of next.headings) {{
+          const item = document.createElement('button');
+          item.className = 'toc-link';
+          item.style.paddingLeft = `${{8 + Math.max(0, heading.level - 1) * 12}}px`;
+          item.textContent = heading.title;
+          item.title = heading.title;
+          item.onclick = () => {{
+            const target = document.getElementById(heading.id);
+            if (target) {{
+              scrollInside(target, 'start');
+              history.replaceState(null, '', `#${{heading.id}}`);
+            }}
+          }};
+          list.appendChild(item);
+        }}
+        toc.appendChild(list);
+      }}
     }}
     this.applyFind();
     const restoreY = this.scrollPositions.get(next.activeTabId) || 0;
@@ -1843,6 +2102,12 @@ window.addEventListener('keydown', event => {{
   }} else if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === 'e') {{
     event.preventDefault();
     window.ipc.postMessage('export-html');
+  }} else if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === 'e') {{
+    event.preventDefault();
+    window.ipc.postMessage('toggle-edit');
+  }} else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {{
+    event.preventDefault();
+    window.ipc.postMessage('save');
   }}
 }});
 function fileName(path) {{
@@ -1863,14 +2128,16 @@ fn view_js(view: &AppView) -> String {
         .iter()
         .map(|tab| {
             format!(
-                "{{id:{},title:{},path:{},stale:{}}}",
+                "{{id:{},title:{},path:{},stale:{},editing:{},dirty:{}}}",
                 tab.id,
                 js_string(&tab.title),
                 tab.path
                     .as_ref()
                     .map(|path| js_string(path))
                     .unwrap_or_else(|| "null".to_owned()),
-                tab.stale
+                tab.stale,
+                tab.editing,
+                tab.dirty
             )
         })
         .collect::<Vec<_>>()
@@ -1901,8 +2168,9 @@ fn view_js(view: &AppView) -> String {
         .join(",");
 
     format!(
-        "{{tabs:[{tabs}],activeTabId:{active_tab_id},activeHtml:{},headings:[{headings}],preferences:{{theme:{},sidebarVisible:{},autoRefresh:{},recentFiles:[{recent_files}]}}}}",
+        "{{tabs:[{tabs}],activeTabId:{active_tab_id},activeHtml:{},activeSource:{},headings:[{headings}],preferences:{{theme:{},sidebarVisible:{},autoRefresh:{},recentFiles:[{recent_files}]}}}}",
         js_string(&view.active_html),
+        js_string(&view.active_source),
         js_string(view.preferences.theme.as_str()),
         view.preferences.sidebar_visible,
         view.preferences.auto_refresh
@@ -2046,6 +2314,41 @@ mod tests {
         );
         assert!(html.contains("event.shiftKey && event.key.toLowerCase() === 'e'"));
         assert!(html.contains("window.ipc.postMessage('export-html')"));
+        assert!(html.contains("!event.shiftKey && event.key.toLowerCase() === 'e'"));
+        assert!(html.contains("window.ipc.postMessage('toggle-edit')"));
+        assert!(html.contains("event.key.toLowerCase() === 's'"));
+        assert!(html.contains("window.ipc.postMessage('save')"));
+    }
+
+    #[test]
+    fn app_shell_includes_edit_and_save_toolbar_buttons() {
+        let html = app_shell_html(&app_view_with_preferences(
+            &AppModel::new(),
+            GuiPreferences::default(),
+        ));
+
+        assert!(html.contains(r#"id="edit-toggle""#));
+        assert!(html.contains("data-tooltip=\"Toggle edit mode\""));
+        assert!(html.contains("onclick=\"window.ipc.postMessage('save')\""));
+    }
+
+    #[test]
+    fn app_shell_renders_editor_textarea_for_editing_tabs_and_skips_rerender() {
+        let mut model = AppModel::new();
+        let id = model.open_untitled("draft", "# Draft".to_owned());
+        model.toggle_editing(id);
+
+        let html = app_shell_html(&app_view_with_preferences(
+            &model,
+            GuiPreferences::default(),
+        ));
+
+        assert!(html.contains("textarea.className = 'editor'"));
+        assert!(html.contains("existingEditor.dataset.tabId === String(next.activeTabId)"));
+        assert!(
+            html.contains("window.ipc.postMessage(`edit:${next.activeTabId}:${textarea.value}`)")
+        );
+        assert!(html.contains("(tab.dirty ? ' dirty' : '')"));
     }
 
     #[test]
@@ -2089,6 +2392,23 @@ mod tests {
     }
 
     #[test]
+    fn view_js_includes_editing_dirty_and_active_source() {
+        let mut model = AppModel::new();
+        let id = model.open_untitled("draft", "# Draft".to_owned());
+        model.toggle_editing(id);
+        model.update_source(id, "# Draft edited".to_owned());
+
+        let script = view_js(&app_view_with_preferences(
+            &model,
+            GuiPreferences::default(),
+        ));
+
+        assert!(script.contains("editing:true"));
+        assert!(script.contains("dirty:true"));
+        assert!(script.contains("activeSource:\"# Draft edited\""));
+    }
+
+    #[test]
     fn classifies_file_events_that_should_refresh() {
         assert!(is_refresh_event(&EventKind::Create(
             notify::event::CreateKind::Any
@@ -2103,5 +2423,53 @@ mod tests {
             notify::event::AccessKind::Any
         )));
         assert!(!is_refresh_event(&EventKind::Other));
+    }
+
+    #[test]
+    fn detects_dirty_tabs_outside_a_kept_tab() {
+        let mut model = AppModel::new();
+        let kept = model.open_untitled("kept", "# Kept".to_owned());
+        let other = model.open_untitled("other", "# Other".to_owned());
+
+        assert!(!other_tabs_dirty(&model, kept));
+
+        model.toggle_editing(other);
+        model.update_source(other, "# Other edited".to_owned());
+
+        assert!(other_tabs_dirty(&model, kept));
+        assert!(!other_tabs_dirty(&model, other));
+    }
+
+    #[test]
+    fn detects_dirty_tabs_to_the_left_and_right() {
+        let mut model = AppModel::new();
+        let left = model.open_untitled("left", "# Left".to_owned());
+        let middle = model.open_untitled("middle", "# Middle".to_owned());
+        let right = model.open_untitled("right", "# Right".to_owned());
+
+        assert!(!tabs_to_left_dirty(&model, middle));
+        assert!(!tabs_to_right_dirty(&model, middle));
+
+        model.toggle_editing(left);
+        model.update_source(left, "# Left edited".to_owned());
+        assert!(tabs_to_left_dirty(&model, middle));
+        assert!(!tabs_to_right_dirty(&model, middle));
+
+        model.toggle_editing(right);
+        model.update_source(right, "# Right edited".to_owned());
+        assert!(tabs_to_right_dirty(&model, middle));
+    }
+
+    #[test]
+    fn detects_any_dirty_tab() {
+        let mut model = AppModel::new();
+        let id = model.open_untitled("draft", "# Draft".to_owned());
+
+        assert!(!any_tab_dirty(&model));
+
+        model.toggle_editing(id);
+        model.update_source(id, "# Draft edited".to_owned());
+
+        assert!(any_tab_dirty(&model));
     }
 }

@@ -45,6 +45,13 @@ Markview is a small, fast, local-first Markdown viewer written in Rust. The proj
 - [x] Add CI for the test/build matrix: CLI tests, GUI feature build on macOS, formatting, and clippy.
 - [x] Publish GitHub releases once packaging is stable.
 
+## v1.1: Editing
+
+- [x] Add a per-tab Edit/Preview toggle backed by a plain-text Markdown textarea.
+- [x] Track per-tab dirty state and save the active tab back to its file (Save As for untitled tabs).
+- [x] Keep auto-refresh and manual refresh from clobbering unsaved or in-progress edits.
+- [x] Add toolbar buttons, menu items, and keyboard shortcuts (Cmd+E, Cmd+S) for editing and saving.
+
 ## Review Workflow
 
 Every commit should be reviewed before starting the next task:

@@ -40,11 +40,12 @@ cargo run --features gui --bin markview-gui -- README.md docs/notes.md
 
 The GUI renders Markdown through the system WebKit view and includes:
 
-- Toolbar actions for Open, Refresh, Print, sidebar visibility, auto-refresh, theme selection, recent files, and find-in-document.
+- Toolbar actions for Open, Edit/Preview, Save, Refresh, Print, sidebar visibility, auto-refresh, theme selection, recent files, and find-in-document.
+- A per-tab Markdown editor: toggle a tab into a plain-text editor (Cmd+E), edit the raw source, and toggle back to a live preview. Unsaved tabs show a dirty indicator; Cmd+S (or File > Save) writes the active tab back to its file, prompting for a destination if the tab has none yet.
 - Tabs for multiple open documents, including per-tab close buttons and overflow scrolling.
 - Markdown document registration for bundled `.app` builds.
 - A table-of-contents sidebar generated from document headings.
-- Auto-refresh for file-backed tabs when files change on disk, with a modified indicator when auto-refresh is disabled.
+- Auto-refresh for file-backed tabs when files change on disk, with a modified indicator when auto-refresh is disabled or a tab has unsaved edits.
 - Scroll preservation when switching tabs or refreshing content.
 - External `http` and `https` links opened in the default browser.
 - Drag-and-drop opening for `.md`, `.markdown`, and `.mdown` files.

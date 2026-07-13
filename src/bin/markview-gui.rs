@@ -98,12 +98,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 window.set_title(&window_title(&model));
             }
             Event::UserEvent(UserEvent::RefreshRequested) => {
-                if let Err(error) = model.refresh_active(|path| fs::read_to_string(path)) {
-                    eprintln!("markview-gui: {error}");
+                let confirmed = !model.active_tab().is_some_and(markview::DocumentTab::is_dirty)
+                    || confirm_discard_changes(
+                        &window,
+                        "This tab has unsaved changes. Discard them and refresh?",
+                    );
+                if confirmed {
+                    if let Err(error) = model.force_refresh_active(|path| fs::read_to_string(path)) {
+                        eprintln!("markview-gui: {error}");
+                    }
+                    sync_persisted_view(&preferences_path, &mut preferences, &model, &webview, &window);
                 }
-                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
-                sync_view(&webview, &model, &preferences);
-                window.set_title(&window_title(&model));
             }
             Event::UserEvent(UserEvent::ToggleSidebar) => {
                 preferences.sidebar_visible = !preferences.sidebar_visible;
@@ -187,109 +192,122 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 window.set_title(&window_title(&model));
             }
             Event::UserEvent(UserEvent::CloseTab(id)) => {
-                let confirmed = match model.tabs().iter().find(|tab| tab.id() == id) {
-                    Some(tab) if tab.is_dirty() => confirm_discard_changes(
-                        &window,
-                        &format!(
+                let message = model
+                    .tabs()
+                    .iter()
+                    .find(|tab| tab.id() == id)
+                    .map(|tab| {
+                        format!(
                             "\"{}\" has unsaved changes. Discard them and close this tab?",
                             tab.title()
-                        ),
-                    ),
-                    _ => true,
-                };
-                if confirmed {
+                        )
+                    })
+                    .unwrap_or_else(|| "This tab has unsaved changes. Discard them and close it?".to_owned());
+                if confirm_if_dirty(&window, tab_dirty(&model, id), &message) {
                     model.close(id);
-                    if let Err(error) = watcher.sync(model.watched_directories()) {
-                        eprintln!("markview-gui: {error}");
-                    }
-                    persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
-                    sync_view(&webview, &model, &preferences);
-                    window.set_title(&window_title(&model));
+                    sync_after_tab_mutation(
+                        &mut watcher,
+                        &preferences_path,
+                        &mut preferences,
+                        &model,
+                        &webview,
+                        &window,
+                    );
                 }
             }
             Event::UserEvent(UserEvent::CloseActiveTab) => {
                 if let Some(id) = model.active_tab_id() {
-                    let confirmed = match model.active_tab() {
-                        Some(tab) if tab.is_dirty() => confirm_discard_changes(
-                            &window,
-                            &format!(
+                    let message = model
+                        .active_tab()
+                        .map(|tab| {
+                            format!(
                                 "\"{}\" has unsaved changes. Discard them and close this tab?",
                                 tab.title()
-                            ),
-                        ),
-                        _ => true,
-                    };
-                    if confirmed {
+                            )
+                        })
+                        .unwrap_or_else(|| "This tab has unsaved changes. Discard them and close it?".to_owned());
+                    if confirm_if_dirty(&window, tab_dirty(&model, id), &message) {
                         model.close(id);
-                        if let Err(error) = watcher.sync(model.watched_directories()) {
-                            eprintln!("markview-gui: {error}");
-                        }
-                        persist_open_state(
+                        sync_after_tab_mutation(
+                            &mut watcher,
                             &preferences_path,
                             &mut preferences,
                             &model,
-                            Some(&window),
+                            &webview,
+                            &window,
                         );
-                        sync_view(&webview, &model, &preferences);
-                        window.set_title(&window_title(&model));
                     }
                 }
             }
             Event::UserEvent(UserEvent::CloseOtherTabs(id)) => {
-                let confirmed = !other_tabs_dirty(&model, id)
-                    || confirm_discard_changes(
-                        &window,
-                        "Other open tabs have unsaved changes. Discard them and close those tabs?",
-                    );
-                if confirmed {
+                if confirm_if_dirty(
+                    &window,
+                    other_tabs_dirty(&model, id),
+                    "Other open tabs have unsaved changes. Discard them and close those tabs?",
+                ) {
                     model.close_others(id);
-                    if let Err(error) = watcher.sync(model.watched_directories()) {
-                        eprintln!("markview-gui: {error}");
-                    }
-                    persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
-                    sync_view(&webview, &model, &preferences);
-                    window.set_title(&window_title(&model));
+                    sync_after_tab_mutation(
+                        &mut watcher,
+                        &preferences_path,
+                        &mut preferences,
+                        &model,
+                        &webview,
+                        &window,
+                    );
                 }
             }
             Event::UserEvent(UserEvent::CloseTabsToLeft(id)) => {
-                let confirmed = !tabs_to_left_dirty(&model, id)
-                    || confirm_discard_changes(
-                        &window,
-                        "Some of the tabs you're closing have unsaved changes. Discard them and close those tabs?",
-                    );
-                if confirmed {
+                if confirm_if_dirty(
+                    &window,
+                    tabs_to_left_dirty(&model, id),
+                    "Some of the tabs you're closing have unsaved changes. Discard them and close those tabs?",
+                ) {
                     model.close_to_left(id);
-                    if let Err(error) = watcher.sync(model.watched_directories()) {
-                        eprintln!("markview-gui: {error}");
-                    }
-                    persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
-                    sync_view(&webview, &model, &preferences);
-                    window.set_title(&window_title(&model));
+                    sync_after_tab_mutation(
+                        &mut watcher,
+                        &preferences_path,
+                        &mut preferences,
+                        &model,
+                        &webview,
+                        &window,
+                    );
                 }
             }
             Event::UserEvent(UserEvent::CloseTabsToRight(id)) => {
-                let confirmed = !tabs_to_right_dirty(&model, id)
-                    || confirm_discard_changes(
-                        &window,
-                        "Some of the tabs you're closing have unsaved changes. Discard them and close those tabs?",
-                    );
-                if confirmed {
+                if confirm_if_dirty(
+                    &window,
+                    tabs_to_right_dirty(&model, id),
+                    "Some of the tabs you're closing have unsaved changes. Discard them and close those tabs?",
+                ) {
                     model.close_to_right(id);
-                    if let Err(error) = watcher.sync(model.watched_directories()) {
-                        eprintln!("markview-gui: {error}");
-                    }
-                    persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
-                    sync_view(&webview, &model, &preferences);
-                    window.set_title(&window_title(&model));
+                    sync_after_tab_mutation(
+                        &mut watcher,
+                        &preferences_path,
+                        &mut preferences,
+                        &model,
+                        &webview,
+                        &window,
+                    );
                 }
             }
             Event::UserEvent(UserEvent::ReloadTab(id)) => {
-                if let Err(error) = model.refresh(id, |path| fs::read_to_string(path)) {
-                    eprintln!("markview-gui: {error}");
+                let message = model
+                    .tabs()
+                    .iter()
+                    .find(|tab| tab.id() == id)
+                    .map(|tab| {
+                        format!(
+                            "\"{}\" has unsaved changes. Discard them and reload this tab?",
+                            tab.title()
+                        )
+                    })
+                    .unwrap_or_else(|| "This tab has unsaved changes. Discard them and reload it?".to_owned());
+                if confirm_if_dirty(&window, tab_dirty(&model, id), &message) {
+                    if let Err(error) = model.force_refresh(id, |path| fs::read_to_string(path)) {
+                        eprintln!("markview-gui: {error}");
+                    }
+                    sync_persisted_view(&preferences_path, &mut preferences, &model, &webview, &window);
                 }
-                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
-                sync_view(&webview, &model, &preferences);
-                window.set_title(&window_title(&model));
             }
             Event::UserEvent(UserEvent::ExportTabHtml(id)) => {
                 if let Err(error) = export_tab_html(&window, &model, id) {
@@ -308,15 +326,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 window.set_title(&window_title(&model));
             }
             Event::UserEvent(UserEvent::SaveRequested) => {
-                if let Err(error) = save_active(&window, &mut model) {
-                    eprintln!("markview-gui: {error}");
+                match save_active(&window, &mut model) {
+                    Ok(SaveOutcome::Saved { path_changed }) => {
+                        if path_changed {
+                            sync_watcher(&mut watcher, &model);
+                        }
+                    }
+                    Ok(SaveOutcome::Cancelled) => {}
+                    Err(error) => eprintln!("markview-gui: {error}"),
                 }
-                if let Err(error) = watcher.sync(model.watched_directories()) {
-                    eprintln!("markview-gui: {error}");
-                }
-                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
-                sync_view(&webview, &model, &preferences);
-                window.set_title(&window_title(&model));
+                sync_persisted_view(&preferences_path, &mut preferences, &model, &webview, &window);
             }
             Event::UserEvent(UserEvent::FilesChanged(paths)) => {
                 if preferences.auto_refresh {
@@ -623,17 +642,23 @@ fn export_document_html(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveOutcome {
+    Saved { path_changed: bool },
+    Cancelled,
+}
+
 fn save_active(
     window: &tao::window::Window,
     model: &mut AppModel,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<SaveOutcome, Box<dyn std::error::Error>> {
     let Some(tab) = model.active_tab() else {
-        return Ok(());
+        return Ok(SaveOutcome::Cancelled);
     };
     let id = tab.id();
 
-    let path = match tab.path() {
-        Some(path) => path.to_path_buf(),
+    let (path, path_changed) = match tab.path() {
+        Some(path) => (path.to_path_buf(), false),
         None => {
             let default_name = if is_markdown_path(Path::new(tab.title())) {
                 tab.title().to_owned()
@@ -646,16 +671,46 @@ fn save_active(
                 .set_file_name(&default_name)
                 .save_file()
             else {
-                return Ok(());
+                return Ok(SaveOutcome::Cancelled);
             };
-            chosen
+            (chosen, true)
         }
     };
 
     fs::write(&path, tab.document().source())?;
     model.assign_path(id, normalize_path(path));
     model.mark_saved(id);
-    Ok(())
+    Ok(SaveOutcome::Saved { path_changed })
+}
+
+fn sync_watcher(watcher: &mut FileWatcher, model: &AppModel) {
+    if let Err(error) = watcher.sync(model.watched_directories()) {
+        eprintln!("markview-gui: {error}");
+    }
+}
+
+fn sync_after_tab_mutation(
+    watcher: &mut FileWatcher,
+    preferences_path: &Path,
+    preferences: &mut GuiPreferences,
+    model: &AppModel,
+    webview: &WebView,
+    window: &tao::window::Window,
+) {
+    sync_watcher(watcher, model);
+    sync_persisted_view(preferences_path, preferences, model, webview, window);
+}
+
+fn sync_persisted_view(
+    preferences_path: &Path,
+    preferences: &mut GuiPreferences,
+    model: &AppModel,
+    webview: &WebView,
+    window: &tao::window::Window,
+) {
+    persist_open_state(preferences_path, preferences, model, Some(window));
+    sync_view(webview, model, preferences);
+    window.set_title(&window_title(model));
 }
 
 fn sync_view(webview: &WebView, model: &AppModel, preferences: &GuiPreferences) {
@@ -2438,6 +2493,7 @@ mod tests {
 
         assert!(other_tabs_dirty(&model, kept));
         assert!(!other_tabs_dirty(&model, other));
+        assert!(!other_tabs_dirty(&model, 99));
     }
 
     #[test]

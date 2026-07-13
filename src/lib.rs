@@ -878,6 +878,38 @@ impl AppModel {
     where
         F: FnMut(&Path) -> Result<String, E>,
     {
+        if self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .is_some_and(DocumentTab::is_dirty)
+        {
+            return Ok(None);
+        }
+        self.force_refresh_tab(id, load)
+    }
+
+    pub fn force_refresh<F, E>(&mut self, id: u64, mut load: F) -> Result<Option<u64>, E>
+    where
+        F: FnMut(&Path) -> Result<String, E>,
+    {
+        self.force_refresh_tab(id, &mut load)
+    }
+
+    pub fn force_refresh_active<F, E>(&mut self, mut load: F) -> Result<Option<u64>, E>
+    where
+        F: FnMut(&Path) -> Result<String, E>,
+    {
+        let Some(id) = self.active_tab else {
+            return Ok(None);
+        };
+        self.force_refresh_tab(id, &mut load)
+    }
+
+    fn force_refresh_tab<F, E>(&mut self, id: u64, load: &mut F) -> Result<Option<u64>, E>
+    where
+        F: FnMut(&Path) -> Result<String, E>,
+    {
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
             return Ok(None);
         };
@@ -2267,18 +2299,38 @@ mod tests {
     }
 
     #[test]
-    fn app_model_refresh_tab_discards_dirty_edits_and_exits_editing() {
+    fn app_model_refresh_tab_leaves_dirty_edits_unchanged() {
         let mut model = AppModel::new();
         let id = model.open_file(PathBuf::from("/tmp/notes.md"), "# Old".to_owned());
         model.toggle_editing(id);
         model.update_source(id, "# Unsaved".to_owned());
 
-        model
+        let refreshed = model
             .refresh(id, |_| {
                 Ok::<_, std::convert::Infallible>("# Fresh".to_owned())
             })
             .expect("refresh");
 
+        assert_eq!(refreshed, None);
+        assert_eq!(model.tabs()[0].document().source(), "# Unsaved");
+        assert!(model.tabs()[0].is_editing());
+        assert!(model.tabs()[0].is_dirty());
+    }
+
+    #[test]
+    fn app_model_force_refresh_discards_dirty_edits_after_confirmation() {
+        let mut model = AppModel::new();
+        let id = model.open_file(PathBuf::from("/tmp/notes.md"), "# Old".to_owned());
+        model.toggle_editing(id);
+        model.update_source(id, "# Unsaved".to_owned());
+
+        let refreshed = model
+            .force_refresh(id, |_| {
+                Ok::<_, std::convert::Infallible>("# Fresh".to_owned())
+            })
+            .expect("refresh");
+
+        assert_eq!(refreshed, Some(id));
         assert_eq!(model.tabs()[0].document().source(), "# Fresh");
         assert!(!model.tabs()[0].is_editing());
         assert!(!model.tabs()[0].is_dirty());

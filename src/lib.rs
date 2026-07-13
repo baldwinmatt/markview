@@ -270,13 +270,7 @@ impl MarkdownDocument {
     }
 
     pub fn from_path(source: impl Into<String>, path: impl AsRef<Path>) -> Self {
-        let title = path
-            .as_ref()
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("Markdown")
-            .to_owned();
-        Self::with_title(source, title)
+        Self::with_title(source, title_from_path(path.as_ref()))
     }
 
     pub fn source(&self) -> &str {
@@ -294,6 +288,13 @@ impl MarkdownDocument {
     pub fn set_title(&mut self, title: impl Into<String>) {
         self.title = title.into();
     }
+}
+
+fn title_from_path(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Markdown")
+        .to_owned()
 }
 
 pub trait FrontendRenderer {
@@ -832,12 +833,7 @@ impl AppModel {
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
             return false;
         };
-        let title = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("Markdown")
-            .to_owned();
-        tab.document.set_title(title);
+        tab.document.set_title(title_from_path(&path));
         tab.path = Some(path);
         true
     }

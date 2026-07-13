@@ -743,29 +743,35 @@ fn confirm_discard_changes(window: &tao::window::Window, message: &str) -> bool 
         == rfd::MessageDialogResult::Yes
 }
 
-fn other_tabs_dirty(model: &AppModel, keep_id: u64) -> bool {
+fn confirm_if_dirty(window: &tao::window::Window, dirty: bool, message: &str) -> bool {
+    !dirty || confirm_discard_changes(window, message)
+}
+
+fn tab_dirty(model: &AppModel, id: u64) -> bool {
     model
         .tabs()
         .iter()
-        .any(|tab| tab.id() != keep_id && tab.is_dirty())
+        .find(|tab| tab.id() == id)
+        .is_some_and(markview::DocumentTab::is_dirty)
+}
+
+fn ids_dirty(model: &AppModel, ids: &[u64]) -> bool {
+    model
+        .tabs()
+        .iter()
+        .any(|tab| ids.contains(&tab.id()) && tab.is_dirty())
+}
+
+fn other_tabs_dirty(model: &AppModel, keep_id: u64) -> bool {
+    ids_dirty(model, &model.other_tab_ids(keep_id))
 }
 
 fn tabs_to_left_dirty(model: &AppModel, id: u64) -> bool {
-    let Some(index) = model.tabs().iter().position(|tab| tab.id() == id) else {
-        return false;
-    };
-    model.tabs()[..index]
-        .iter()
-        .any(markview::DocumentTab::is_dirty)
+    ids_dirty(model, &model.tab_ids_to_left(id))
 }
 
 fn tabs_to_right_dirty(model: &AppModel, id: u64) -> bool {
-    let Some(index) = model.tabs().iter().position(|tab| tab.id() == id) else {
-        return false;
-    };
-    model.tabs()[index + 1..]
-        .iter()
-        .any(markview::DocumentTab::is_dirty)
+    ids_dirty(model, &model.tab_ids_to_right(id))
 }
 
 fn any_tab_dirty(model: &AppModel) -> bool {
@@ -2399,7 +2405,9 @@ mod tests {
         ));
 
         assert!(html.contains("textarea.className = 'editor'"));
-        assert!(html.contains("existingEditor.dataset.tabId === String(next.activeTabId)"));
+        assert!(html.contains(
+            "!existingEditor || existingEditor.dataset.tabId !== String(next.activeTabId)"
+        ));
         assert!(
             html.contains("window.ipc.postMessage(`edit:${next.activeTabId}:${textarea.value}`)")
         );

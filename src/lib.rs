@@ -737,7 +737,7 @@ impl AppModel {
                     .as_deref()
                     .is_some_and(|path| changed_paths.contains(&path))
             })
-            .map(|tab| (tab.id, tab.editing || tab.dirty))
+            .map(|tab| (tab.id, tab.dirty))
             .collect::<Vec<_>>();
 
         let mut refreshed = Vec::new();
@@ -745,7 +745,7 @@ impl AppModel {
             if has_unsaved_edits {
                 self.mark_stale(id);
             } else {
-                self.refresh_tab(id, &mut load)?;
+                self.force_refresh_tab(id, &mut load)?;
                 refreshed.push(id);
             }
         }
@@ -2355,6 +2355,25 @@ mod tests {
         assert!(model.is_stale(dirty_id));
         assert_eq!(model.tabs()[0].document().source(), "# One edited");
         assert_eq!(model.tabs()[1].document().source(), "# Fresh /tmp/two.md");
+    }
+
+    #[test]
+    fn app_model_refresh_changed_paths_refreshes_clean_tabs_still_in_edit_mode() {
+        let mut model = AppModel::new();
+        let id = model.open_file(PathBuf::from("/tmp/notes.md"), "# One".to_owned());
+        model.toggle_editing(id);
+        model.update_source(id, "# Saved".to_owned());
+        model.mark_saved(id);
+
+        let refreshed = model
+            .refresh_changed_paths([Path::new("/tmp/notes.md")], |_| {
+                Ok::<_, std::convert::Infallible>("# Saved".to_owned())
+            })
+            .expect("refresh");
+
+        assert_eq!(refreshed, vec![id]);
+        assert!(!model.is_stale(id));
+        assert_eq!(model.tabs()[0].document().source(), "# Saved");
     }
 
     #[test]

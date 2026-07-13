@@ -87,9 +87,7 @@ fn serve_markdown(path: PathBuf, port: u16) -> Result<(), Box<dyn std::error::Er
                 let clients = clients.clone();
                 thread::spawn(move || {
                     if let Err(error) = handle_connection(stream, &path, clients) {
-                        if !is_client_disconnect(&error) {
-                            eprintln!("markview: serve error: {error}");
-                        }
+                        eprintln!("markview: serve error: {error}");
                     }
                 });
             }
@@ -171,7 +169,16 @@ fn handle_connection(
     let route = request.split_whitespace().nth(1).unwrap_or("/");
     match route {
         "/" => serve_document(&mut stream, path),
-        "/events" => serve_events(stream, clients),
+        "/events" => match serve_events(stream, clients) {
+            Ok(()) => Ok(()),
+            Err(error) if is_client_disconnect(&error) => {
+                if std::env::var_os("MARKVIEW_LOG_EVENT_DISCONNECTS").is_some() {
+                    eprintln!("markview: /events client disconnected");
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
+        },
         _ => write_response(
             &mut stream,
             "404 Not Found",

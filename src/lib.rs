@@ -957,8 +957,9 @@ pub fn app_view(model: &AppModel) -> AppView {
 }
 
 pub fn app_view_with_preferences(model: &AppModel, preferences: GuiPreferences) -> AppView {
-    let active_document = model
-        .active_tab()
+    let active_tab = model.active_tab();
+    let active_document = active_tab
+        .filter(|tab| !tab.is_editing())
         .map(DocumentTab::document)
         .map(RenderedDocument::from_markdown);
 
@@ -2471,7 +2472,7 @@ mod tests {
     }
 
     #[test]
-    fn app_view_reflects_editing_and_dirty_tab_state() {
+    fn app_view_reflects_editing_and_dirty_tab_state_without_rendering_markdown() {
         let mut model = AppModel::new();
         let id = model.open_file(PathBuf::from("/tmp/notes.md"), "# Notes".to_owned());
         model.toggle_editing(id);
@@ -2482,6 +2483,8 @@ mod tests {
         assert!(view.tabs[0].editing);
         assert!(view.tabs[0].dirty);
         assert_eq!(view.active_source, "# Edited notes");
+        assert!(view.headings.is_empty());
+        assert!(!view.active_html.contains("Edited notes"));
     }
 
     #[test]

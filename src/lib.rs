@@ -602,48 +602,63 @@ impl AppModel {
     }
 
     pub fn close_others(&mut self, id: u64) -> bool {
-        if !self.tabs.iter().any(|tab| tab.id == id) {
+        let others = self.other_tab_ids(id);
+        if others.is_empty() && !self.tabs.iter().any(|tab| tab.id == id) {
             return false;
         }
-        let others = self
-            .tabs
-            .iter()
-            .map(DocumentTab::id)
-            .filter(|tab_id| *tab_id != id)
-            .collect::<Vec<_>>();
-        for other_id in others {
-            self.close(other_id);
-        }
+        self.close_ids(others);
         self.active_tab = Some(id);
         true
     }
 
     pub fn close_to_left(&mut self, id: u64) -> bool {
-        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+        if !self.tabs.iter().any(|tab| tab.id == id) {
             return false;
-        };
-        let to_close = self.tabs[..index]
-            .iter()
-            .map(DocumentTab::id)
-            .collect::<Vec<_>>();
-        for other_id in to_close {
-            self.close(other_id);
         }
+        self.close_ids(self.tab_ids_to_left(id));
         true
     }
 
     pub fn close_to_right(&mut self, id: u64) -> bool {
-        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+        if !self.tabs.iter().any(|tab| tab.id == id) {
             return false;
-        };
-        let to_close = self.tabs[index + 1..]
+        }
+        self.close_ids(self.tab_ids_to_right(id));
+        true
+    }
+
+    pub fn other_tab_ids(&self, id: u64) -> Vec<u64> {
+        if !self.tabs.iter().any(|tab| tab.id == id) {
+            return Vec::new();
+        }
+        self.tabs
             .iter()
             .map(DocumentTab::id)
-            .collect::<Vec<_>>();
-        for other_id in to_close {
-            self.close(other_id);
+            .filter(|tab_id| *tab_id != id)
+            .collect()
+    }
+
+    pub fn tab_ids_to_left(&self, id: u64) -> Vec<u64> {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return Vec::new();
+        };
+        self.tabs[..index].iter().map(DocumentTab::id).collect()
+    }
+
+    pub fn tab_ids_to_right(&self, id: u64) -> Vec<u64> {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return Vec::new();
+        };
+        self.tabs[index + 1..].iter().map(DocumentTab::id).collect()
+    }
+
+    fn close_ids<I>(&mut self, ids: I)
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        for id in ids {
+            self.close(id);
         }
-        true
     }
 
     pub fn mark_changed_paths_stale<'a, I>(&mut self, changed_paths: I) -> Vec<u64>
@@ -2320,6 +2335,21 @@ mod tests {
             model.watched_directories(),
             vec![PathBuf::from("."), PathBuf::from("docs")]
         );
+    }
+
+    #[test]
+    fn app_model_reports_tab_ids_affected_by_bulk_close_actions() {
+        let mut model = AppModel::new();
+        let first = model.open_untitled("one", "# One".to_owned());
+        let second = model.open_untitled("two", "# Two".to_owned());
+        let third = model.open_untitled("three", "# Three".to_owned());
+
+        assert_eq!(model.other_tab_ids(second), vec![first, third]);
+        assert_eq!(model.tab_ids_to_left(second), vec![first]);
+        assert_eq!(model.tab_ids_to_right(second), vec![third]);
+        assert!(model.other_tab_ids(99).is_empty());
+        assert!(model.tab_ids_to_left(99).is_empty());
+        assert!(model.tab_ids_to_right(99).is_empty());
     }
 
     #[test]

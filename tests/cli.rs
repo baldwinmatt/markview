@@ -4,6 +4,7 @@ use predicates::prelude::*;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[test]
@@ -134,6 +135,48 @@ fn serve_mode_streams_reload_events_when_file_changes() {
 }
 
 #[test]
+fn serve_mode_does_not_log_noise_when_an_events_client_disconnects() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("README.md");
+    std::fs::write(&file, "# Before\n").expect("write sample");
+    let mut server = ServeProcess::start(&file);
+
+    // Connect to the reload stream, then drop it abruptly (like a closed
+    // browser tab or tunnel) so the server's next writes to it fail.
+    {
+        let mut stream = TcpStream::connect(("127.0.0.1", server.port)).expect("connect events");
+        stream
+            .write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("write request");
+        let mut reader = BufReader::new(&stream);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            reader.read_line(&mut line).expect("read header");
+            if line == "\r\n" {
+                break;
+            }
+        }
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // The first write after a disconnect can succeed at the TCP layer (the
+    // peer's FIN hasn't been noticed yet); the second is what actually
+    // surfaces the broken pipe, so trigger a couple of reloads.
+    std::fs::write(&file, "# After\n").expect("trigger reload broadcast");
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::write(&file, "# After again\n").expect("trigger reload broadcast");
+    std::thread::sleep(Duration::from_millis(300));
+
+    let stderr = server.stderr_so_far();
+    assert!(
+        !stderr.contains("serve error"),
+        "unexpected server error output: {stderr}"
+    );
+    server.stop();
+}
+
+#[test]
 fn serve_mode_returns_404_for_unknown_routes() {
     let dir = tempfile::tempdir().expect("temp dir");
     let file = dir.path().join("README.md");
@@ -168,19 +211,46 @@ fn serve_mode_reports_port_in_use() {
 struct ServeProcess {
     child: Child,
     port: u16,
+    stderr: Arc<Mutex<String>>,
 }
 
 impl ServeProcess {
     fn start(file: &std::path::Path) -> Self {
         let mut cmd = std::process::Command::new(cargo_bin("markview"));
-        cmd.args(["--serve", "0"]).arg(file).stdout(Stdio::piped());
+        cmd.args(["--serve", "0"])
+            .arg(file)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = cmd.spawn().expect("spawn server");
         let stdout = child.stdout.take().expect("stdout");
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
         reader.read_line(&mut line).expect("startup line");
         let port = parse_served_port(&line);
-        Self { child, port }
+
+        let stderr_pipe = child.stderr.take().expect("stderr");
+        let stderr = Arc::new(Mutex::new(String::new()));
+        let stderr_writer = stderr.clone();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stderr_pipe);
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                if let Ok(mut buffer) = stderr_writer.lock() {
+                    buffer.push_str(&line);
+                }
+                line.clear();
+            }
+        });
+
+        Self {
+            child,
+            port,
+            stderr,
+        }
+    }
+
+    fn stderr_so_far(&self) -> String {
+        self.stderr.lock().expect("stderr lock").clone()
     }
 
     fn stop(&mut self) {

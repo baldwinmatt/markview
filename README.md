@@ -34,9 +34,13 @@ markview README.md
 cat README.md | markview --no-color
 markview --width 72 notes.md
 markview --html README.md > README.html
+markview --serve notes.md            # http://localhost:7878, live-reloads on file changes
+markview --serve 8080 notes.md       # pick a specific port
 
 cargo run --features gui --bin markview-gui -- README.md docs/notes.md
 ```
+
+`--serve` renders the file as HTML over a local HTTP server and pushes a live-reload signal to any open browser tab whenever the file changes on disk (via a file watcher and a `/events` server-sent-events stream). The server only binds to `127.0.0.1`; to view it from another machine, forward the port over SSH first, e.g. `ssh -L 8080:localhost:8080 user@host`.
 
 The GUI renders Markdown through the system WebKit view and includes:
 

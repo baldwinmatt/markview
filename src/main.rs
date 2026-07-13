@@ -87,7 +87,9 @@ fn serve_markdown(path: PathBuf, port: u16) -> Result<(), Box<dyn std::error::Er
                 let clients = clients.clone();
                 thread::spawn(move || {
                     if let Err(error) = handle_connection(stream, &path, clients) {
-                        eprintln!("markview: serve error: {error}");
+                        if !is_client_disconnect(&error) {
+                            eprintln!("markview: serve error: {error}");
+                        }
                     }
                 });
             }
@@ -96,6 +98,19 @@ fn serve_markdown(path: PathBuf, port: u16) -> Result<(), Box<dyn std::error::Er
     }
 
     Ok(())
+}
+
+/// True for I/O errors that just mean the client went away (closed tab, page
+/// reload, dropped tunnel), which happen routinely on a long-lived `/events`
+/// stream and aren't worth logging as server errors.
+fn is_client_disconnect(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::UnexpectedEof
+    )
 }
 
 fn watch_file(

@@ -1903,10 +1903,7 @@ window.markview = {{
     if (isEditingActive) {{
       shell.classList.add('sidebar-hidden');
       toc.classList.add('hidden');
-      if (existingEditor && existingEditor.dataset.tabId === String(next.activeTabId)) {{
-        // Leave the mounted textarea untouched so in-progress typing and
-        // cursor position survive the state push triggered by this edit.
-      }} else {{
+      if (!existingEditor || existingEditor.dataset.tabId !== String(next.activeTabId)) {{
         pane.innerHTML = '';
         const textarea = document.createElement('textarea');
         textarea.className = 'editor';

@@ -2160,12 +2160,6 @@ window.addEventListener('keydown', event => {{
   }} else if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === 'e') {{
     event.preventDefault();
     window.ipc.postMessage('export-html');
-  }} else if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === 'e') {{
-    event.preventDefault();
-    window.ipc.postMessage('toggle-edit');
-  }} else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {{
-    event.preventDefault();
-    window.ipc.postMessage('save');
   }}
 }});
 function fileName(path) {{
@@ -2372,10 +2366,10 @@ mod tests {
         );
         assert!(html.contains("event.shiftKey && event.key.toLowerCase() === 'e'"));
         assert!(html.contains("window.ipc.postMessage('export-html')"));
-        assert!(html.contains("!event.shiftKey && event.key.toLowerCase() === 'e'"));
-        assert!(html.contains("window.ipc.postMessage('toggle-edit')"));
-        assert!(html.contains("event.key.toLowerCase() === 's'"));
-        assert!(html.contains("window.ipc.postMessage('save')"));
+        assert!(!html.contains("!event.shiftKey && event.key.toLowerCase() === 'e'"));
+        assert!(!html.contains("window.ipc.postMessage('toggle-edit')"));
+        assert!(!html.contains("event.key.toLowerCase() === 's'"));
+        assert!(!html.contains("window.ipc.postMessage('save')"));
     }
 
     #[test]

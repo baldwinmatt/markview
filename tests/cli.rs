@@ -139,7 +139,7 @@ fn serve_mode_does_not_log_noise_when_an_events_client_disconnects() {
     let dir = tempfile::tempdir().expect("temp dir");
     let file = dir.path().join("README.md");
     std::fs::write(&file, "# Before\n").expect("write sample");
-    let mut server = ServeProcess::start(&file);
+    let mut server = ServeProcess::start_with_disconnect_logging(&file);
 
     // Connect to the reload stream, then drop it abruptly (like a closed
     // browser tab or tunnel) so the server's next writes to it fail.
@@ -158,17 +158,25 @@ fn serve_mode_does_not_log_noise_when_an_events_client_disconnects() {
             }
         }
     }
-    std::thread::sleep(Duration::from_millis(200));
-
-    // The first write after a disconnect can succeed at the TCP layer (the
-    // peer's FIN hasn't been noticed yet); the second is what actually
-    // surfaces the broken pipe, so trigger a couple of reloads.
-    std::fs::write(&file, "# After\n").expect("trigger reload broadcast");
-    std::thread::sleep(Duration::from_millis(300));
-    std::fs::write(&file, "# After again\n").expect("trigger reload broadcast");
-    std::thread::sleep(Duration::from_millis(300));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut attempt = 0;
+    while Instant::now() < deadline {
+        attempt += 1;
+        std::fs::write(&file, format!("# After {attempt}\n")).expect("trigger reload broadcast");
+        std::thread::sleep(Duration::from_millis(100));
+        if server
+            .stderr_so_far()
+            .contains("markview: /events client disconnected")
+        {
+            break;
+        }
+    }
 
     let stderr = server.stderr_so_far();
+    assert!(
+        stderr.contains("markview: /events client disconnected"),
+        "disconnect path was not exercised; stderr: {stderr}"
+    );
     assert!(
         !stderr.contains("serve error"),
         "unexpected server error output: {stderr}"
@@ -216,11 +224,22 @@ struct ServeProcess {
 
 impl ServeProcess {
     fn start(file: &std::path::Path) -> Self {
+        Self::start_with_env(file, false)
+    }
+
+    fn start_with_disconnect_logging(file: &std::path::Path) -> Self {
+        Self::start_with_env(file, true)
+    }
+
+    fn start_with_env(file: &std::path::Path, log_disconnects: bool) -> Self {
         let mut cmd = std::process::Command::new(cargo_bin("markview"));
         cmd.args(["--serve", "0"])
             .arg(file)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if log_disconnects {
+            cmd.env("MARKVIEW_LOG_EVENT_DISCONNECTS", "1");
+        }
         let mut child = cmd.spawn().expect("spawn server");
         let stdout = child.stdout.take().expect("stdout");
         let mut reader = BufReader::new(stdout);

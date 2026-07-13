@@ -214,8 +214,19 @@ fn serve_events(
     )?;
     stream.flush()?;
 
-    while rx.recv().is_ok() {
-        stream.write_all(b"data: reload\n\n")?;
+    let probe_disconnects = std::env::var_os("MARKVIEW_LOG_EVENT_DISCONNECTS").is_some();
+    loop {
+        if probe_disconnects {
+            match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(()) => stream.write_all(b"data: reload\n\n")?,
+                Err(mpsc::RecvTimeoutError::Timeout) => stream.write_all(b": keepalive\n\n")?,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else if rx.recv().is_ok() {
+            stream.write_all(b"data: reload\n\n")?;
+        } else {
+            break;
+        }
         stream.flush()?;
     }
 

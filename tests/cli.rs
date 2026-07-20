@@ -99,6 +99,8 @@ fn serve_mode_returns_rendered_html() {
     assert!(response.contains("HTTP/1.1 200 OK"));
     assert!(response.contains(r#"<h1 id="served">Served</h1>"#));
     assert!(response.contains("<strong>view</strong>"));
+    assert!(response
+        .contains(r#"Served by <a href="https://github.com/baldwinmatt/markview">markview</a>"#));
     assert!(response.contains("new EventSource('/events')"));
     server.stop();
 }

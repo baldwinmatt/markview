@@ -242,6 +242,9 @@ fn render_file(path: &Path) -> io::Result<String> {
 }
 
 fn inject_serve_script(html: &str) -> String {
+    let footer = r#"<footer style="width: min(860px, calc(100vw - 48px)); margin: -36px auto 40px; padding-top: 1rem; border-top: 1px solid var(--rule); color: var(--muted); font-size: 0.9rem;">
+Served by <a href="https://github.com/baldwinmatt/markview">markview</a>
+</footer>"#;
     let script = r#"<script>
 (() => {
   const events = new EventSource('/events');
@@ -258,7 +261,7 @@ fn inject_serve_script(html: &str) -> String {
 })();
 </script>"#;
 
-    html.replace("</body>", &format!("{script}\n</body>"))
+    html.replace("</body>", &format!("{footer}\n{script}\n</body>"))
 }
 
 fn write_response(

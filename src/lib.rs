@@ -375,6 +375,7 @@ pub enum CliError {
     UnknownArgument(String),
     TooManyInputs,
     MissingServeInput,
+    LegacyServePortForm,
 }
 
 impl std::fmt::Display for CliError {
@@ -385,7 +386,11 @@ impl std::fmt::Display for CliError {
             Self::InvalidPort(value) => write!(f, "invalid port: {value}"),
             Self::UnknownArgument(arg) => write!(f, "unknown argument: {arg}"),
             Self::TooManyInputs => write!(f, "expected at most one input file"),
-            Self::MissingServeInput => write!(f, "--serve requires an input file"),
+            Self::MissingServeInput => write!(f, "--serve requires an input file or directory"),
+            Self::LegacyServePortForm => write!(
+                f,
+                "the `--serve PORT FILE` form has been replaced by `--serve FILE --port PORT`"
+            ),
         }
     }
 }
@@ -395,6 +400,7 @@ impl std::error::Error for CliError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cli {
     pub input: Option<String>,
+    pub inputs: Vec<String>,
     pub options: RenderOptions,
     pub output: OutputFormat,
     pub serve: Option<u16>,
@@ -415,8 +421,10 @@ impl Cli {
     {
         let mut options = RenderOptions::default();
         let mut output = OutputFormat::Terminal;
-        let mut input = None;
+        let mut inputs = Vec::new();
         let mut serve = None;
+        let mut serve_port = None;
+        let mut saw_serve = false;
         let mut help = false;
         let mut args = args.into_iter().map(Into::into);
 
@@ -425,16 +433,15 @@ impl Cli {
                 "-h" | "--help" => help = true,
                 "--html" => output = OutputFormat::Html,
                 "--serve" => {
-                    serve = Some(DEFAULT_SERVE_PORT);
-                    if let Some(next) = args.next() {
-                        if let Ok(port) = parse_port(&next) {
-                            serve = Some(port);
-                        } else {
-                            set_input(&mut input, next)?;
-                        }
-                    } else {
-                        return Err(CliError::MissingServeInput);
-                    }
+                    saw_serve = true;
+                }
+                "--port" => {
+                    let value = args.next().ok_or(CliError::MissingValue("--port"))?;
+                    serve_port = Some(parse_port(&value)?);
+                }
+                _ if arg.starts_with("--port=") => {
+                    let value = arg.trim_start_matches("--port=");
+                    serve_port = Some(parse_port(value)?);
                 }
                 "--no-color" => options.color = false,
                 "-w" | "--width" => {
@@ -446,20 +453,35 @@ impl Cli {
                     options.width = parse_width(value)?;
                 }
                 _ if arg.starts_with("--serve=") => {
-                    let value = arg.trim_start_matches("--serve=");
-                    serve = Some(parse_port(value)?);
+                    return Err(CliError::UnknownArgument(arg));
                 }
                 _ if arg.starts_with('-') => return Err(CliError::UnknownArgument(arg)),
-                _ => set_input(&mut input, arg)?,
+                _ => inputs.push(arg),
             }
         }
 
-        if serve.is_some() && input.is_none() && !help {
+        if saw_serve && inputs.first().is_some_and(|input| is_numeric(input)) {
+            return Err(CliError::LegacyServePortForm);
+        }
+
+        if saw_serve {
+            serve = Some(serve_port.unwrap_or(DEFAULT_SERVE_PORT));
+        } else if serve_port.is_some() {
+            return Err(CliError::UnknownArgument("--port".to_owned()));
+        }
+
+        if serve.is_some() && inputs.is_empty() && !help {
             return Err(CliError::MissingServeInput);
         }
+        if serve.is_none() && inputs.len() > 1 {
+            return Err(CliError::TooManyInputs);
+        }
+
+        let input = inputs.first().cloned();
 
         Ok(Self {
             input,
+            inputs,
             options,
             output,
             serve,
@@ -469,13 +491,6 @@ impl Cli {
 }
 
 pub const DEFAULT_SERVE_PORT: u16 = 7878;
-
-fn set_input(input: &mut Option<String>, value: String) -> Result<(), CliError> {
-    if input.replace(value).is_some() {
-        return Err(CliError::TooManyInputs);
-    }
-    Ok(())
-}
 
 fn parse_width(value: &str) -> Result<usize, CliError> {
     let width = value
@@ -490,13 +505,21 @@ fn parse_width(value: &str) -> Result<usize, CliError> {
 }
 
 fn parse_port(value: &str) -> Result<u16, CliError> {
-    value
+    let port = value
         .parse::<u16>()
-        .map_err(|_| CliError::InvalidPort(value.to_owned()))
+        .map_err(|_| CliError::InvalidPort(value.to_owned()))?;
+    if port == 0 {
+        return Err(CliError::InvalidPort(value.to_owned()));
+    }
+    Ok(port)
+}
+
+fn is_numeric(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
 }
 
 pub fn help() -> &'static str {
-    "Usage: markview [OPTIONS] [FILE]\n\nReads FILE or stdin and renders Markdown for the terminal or HTML.\n\nOptions:\n      --html             Render a complete HTML document\n      --serve [PORT]     Serve FILE as HTML on localhost (default port 7878)\n  -w, --width <COLUMNS>  Wrap terminal text to a target width (minimum 20, default 88)\n      --no-color         Disable ANSI colors while keeping bold text attributes\n  -h, --help             Show this help\n"
+    "Usage: markview [OPTIONS] [FILE]\n\nReads FILE or stdin and renders Markdown for the terminal or HTML.\n\nOptions:\n      --html             Render a complete HTML document\n      --serve            Serve Markdown files or a directory on localhost (default port 7878)\n      --port <PORT>      Select the serve port\n  -w, --width <COLUMNS>  Wrap terminal text to a target width (minimum 20, default 88)\n      --no-color         Disable ANSI colors while keeping bold text attributes\n  -h, --help             Show this help\n"
 }
 
 pub fn render(markdown: &str, options: RenderOptions) -> String {
@@ -1844,6 +1867,7 @@ mod tests {
         let cli = Cli::parse(["README.md"]).expect("valid args");
 
         assert_eq!(cli.input.as_deref(), Some("README.md"));
+        assert_eq!(cli.inputs, vec!["README.md"]);
         assert_eq!(cli.options, RenderOptions::default());
         assert_eq!(cli.output, OutputFormat::Terminal);
         assert_eq!(cli.serve, None);
@@ -1871,15 +1895,25 @@ mod tests {
         let cli = Cli::parse(["--serve", "README.md"]).expect("valid serve args");
 
         assert_eq!(cli.input.as_deref(), Some("README.md"));
+        assert_eq!(cli.inputs, vec!["README.md"]);
         assert_eq!(cli.serve, Some(DEFAULT_SERVE_PORT));
     }
 
     #[test]
     fn parses_cli_serve_with_explicit_port() {
-        let cli = Cli::parse(["--serve", "8080", "README.md"]).expect("valid serve args");
+        let cli = Cli::parse(["--serve", "README.md", "--port", "8080"]).expect("valid serve args");
 
         assert_eq!(cli.input.as_deref(), Some("README.md"));
+        assert_eq!(cli.inputs, vec!["README.md"]);
         assert_eq!(cli.serve, Some(8080));
+    }
+
+    #[test]
+    fn rejects_legacy_serve_port_form() {
+        assert_eq!(
+            Cli::parse(["--serve", "8080", "README.md"]).expect_err("legacy serve port form"),
+            CliError::LegacyServePortForm
+        );
     }
 
     #[test]

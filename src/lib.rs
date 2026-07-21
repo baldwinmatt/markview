@@ -1016,17 +1016,61 @@ pub fn app_view_with_preferences(model: &AppModel, preferences: GuiPreferences) 
 }
 
 fn render_document_model(document: &MarkdownDocument) -> RenderedDocument {
-    let events = Parser::new_ext(document.source(), markdown_options())
+    let source = repair_utf8_mojibake(document.source());
+    let title = repair_utf8_mojibake(document.title());
+    let events = Parser::new_ext(&source, markdown_options())
         .map(sanitize_html_event)
         .collect::<Vec<_>>();
     let headings = extract_headings(&events);
     let html = render_html_body(&events, &headings);
 
     RenderedDocument {
-        title: document.title().to_owned(),
+        title,
         html,
         headings,
     }
+}
+
+fn repair_utf8_mojibake(value: &str) -> String {
+    let mut repaired = value.to_owned();
+    for _ in 0..3 {
+        let mapped = replace_windows_1252_mojibake(&repaired);
+        let decoded = decode_latin1_mojibake(&mapped).unwrap_or_else(|| mapped.clone());
+        if decoded == repaired {
+            return decoded;
+        }
+        repaired = decoded;
+    }
+    repaired
+}
+
+fn replace_windows_1252_mojibake(value: &str) -> String {
+    let replacements = [
+        ("\u{00E2}\u{20AC}\u{201D}", "—"),
+        ("\u{00E2}\u{20AC}\u{201C}", "–"),
+        ("\u{00E2}\u{20AC}\u{02DC}", "‘"),
+        ("\u{00E2}\u{20AC}\u{2122}", "’"),
+        ("\u{00E2}\u{20AC}\u{0153}", "“"),
+        ("\u{00E2}\u{20AC}\u{009D}", "”"),
+        ("\u{00E2}\u{20AC}\u{00A6}", "…"),
+    ];
+    let mut repaired = value.to_owned();
+    for (bad, good) in replacements {
+        repaired = repaired.replace(bad, good);
+    }
+    repaired
+}
+
+fn decode_latin1_mojibake(value: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(value.len());
+    for ch in value.chars() {
+        let codepoint = ch as u32;
+        if codepoint > u8::MAX as u32 {
+            return None;
+        }
+        bytes.push(codepoint as u8);
+    }
+    String::from_utf8(bytes).ok()
 }
 
 fn render_html_body(events: &[Event<'_>], headings: &[HeadingView]) -> String {
@@ -1041,7 +1085,7 @@ fn render_html_body(events: &[Event<'_>], headings: &[HeadingView]) -> String {
     {
         body = highlight_code_blocks(&body);
     }
-    body
+    escape_non_ascii_html(&body)
 }
 
 fn add_heading_id<'a>(
@@ -1411,7 +1455,26 @@ fn escape_html(value: &str) -> String {
             '>' => escaped.push_str("&gt;"),
             '"' => escaped.push_str("&quot;"),
             '\'' => escaped.push_str("&#39;"),
+            _ if !ch.is_ascii() => {
+                escaped.push_str("&#");
+                escaped.push_str(&(ch as u32).to_string());
+                escaped.push(';');
+            }
             _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn escape_non_ascii_html(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii() {
+            escaped.push(ch);
+        } else {
+            escaped.push_str("&#");
+            escaped.push_str(&(ch as u32).to_string());
+            escaped.push(';');
         }
     }
     escaped
@@ -1976,6 +2039,32 @@ mod tests {
         assert!(html.contains(r#"<h1 id="hello">Hello</h1>"#));
         assert!(html.contains("<strong>rendered</strong>"));
         assert!(html.contains("<main>"));
+    }
+
+    #[test]
+    fn html_renderer_serializes_non_ascii_text_as_entities() {
+        let document = MarkdownDocument::with_title("# Title — Draft\n\nAlpha — beta", "Doc — One");
+        let html = HtmlRenderer.render_document(&document);
+
+        assert!(html.contains("<title>Doc &#8212; One</title>"));
+        assert!(html.contains(r#"<h1 id="title-draft">Title &#8212; Draft</h1>"#));
+        assert!(html.contains("<p>Alpha &#8212; beta</p>"));
+        assert!(!html.contains("Alpha — beta"));
+    }
+
+    #[test]
+    fn html_renderer_repairs_common_emdash_mojibake() {
+        let mojibake_dash = "\u{00E2}\u{0080}\u{0094}";
+        let document = MarkdownDocument::with_title(
+            format!("# Title {mojibake_dash} Draft\n\nAlpha {mojibake_dash} beta"),
+            format!("Doc {mojibake_dash} One"),
+        );
+        let html = HtmlRenderer.render_document(&document);
+
+        assert!(html.contains("<title>Doc &#8212; One</title>"));
+        assert!(html.contains(r#"<h1 id="title-draft">Title &#8212; Draft</h1>"#));
+        assert!(html.contains("<p>Alpha &#8212; beta</p>"));
+        assert!(!html.contains("&#226;&#128;&#148;"));
     }
 
     #[test]

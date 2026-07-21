@@ -91,14 +91,23 @@ fn reports_invalid_width() {
 fn serve_mode_returns_rendered_html() {
     let dir = tempfile::tempdir().expect("temp dir");
     let file = dir.path().join("README.md");
-    std::fs::write(&file, "# Served\n\nRemote **view**.\n").expect("write sample");
+    let mojibake_dash = "\u{00E2}\u{0080}\u{0094}";
+    std::fs::write(
+        &file,
+        format!("# Served\n\nRemote **view** {mojibake_dash} clean text.\n"),
+    )
+    .expect("write sample");
     let mut server = ServeProcess::start(&file);
 
     let response = http_get(server.port, "/");
 
     assert!(response.contains("HTTP/1.1 200 OK"));
+    assert!(response.contains("Content-Type: text/html; charset=utf-8"));
     assert!(response.contains(r#"<h1 id="served">Served</h1>"#));
     assert!(response.contains("<strong>view</strong>"));
+    assert!(response.contains("&#8212; clean text"));
+    assert!(!response.contains("&#226;&#128;&#148; clean text"));
+    assert!(!response.contains("— clean text"));
     assert!(!response.contains(r#"<div class="markview-shell">"#));
     assert!(response
         .contains(r#"Served by <a href="https://github.com/baldwinmatt/markview">markview</a>"#));

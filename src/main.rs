@@ -1209,11 +1209,24 @@ Served by <a href="https://github.com/baldwinmatt/markview">markview</a>
 }
 
 fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    let value = repair_utf8_mojibake(value);
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ if !ch.is_ascii() => {
+                escaped.push_str("&#");
+                escaped.push_str(&(ch as u32).to_string());
+                escaped.push(';');
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn current_document_title(document: &ServedDocument) -> String {
@@ -1223,12 +1236,55 @@ fn current_document_title(document: &ServedDocument) -> String {
 }
 
 fn title_for_source(path: &Path, source: &str) -> String {
-    first_heading_title(source).unwrap_or_else(|| {
+    let title = first_heading_title(source).unwrap_or_else(|| {
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("Markdown")
             .to_owned()
-    })
+    });
+    repair_utf8_mojibake(&title)
+}
+
+fn repair_utf8_mojibake(value: &str) -> String {
+    let mut repaired = value.to_owned();
+    for _ in 0..3 {
+        let mapped = replace_windows_1252_mojibake(&repaired);
+        let decoded = decode_latin1_mojibake(&mapped).unwrap_or_else(|| mapped.clone());
+        if decoded == repaired {
+            return decoded;
+        }
+        repaired = decoded;
+    }
+    repaired
+}
+
+fn replace_windows_1252_mojibake(value: &str) -> String {
+    let replacements = [
+        ("\u{00E2}\u{20AC}\u{201D}", "—"),
+        ("\u{00E2}\u{20AC}\u{201C}", "–"),
+        ("\u{00E2}\u{20AC}\u{02DC}", "‘"),
+        ("\u{00E2}\u{20AC}\u{2122}", "’"),
+        ("\u{00E2}\u{20AC}\u{0153}", "“"),
+        ("\u{00E2}\u{20AC}\u{009D}", "”"),
+        ("\u{00E2}\u{20AC}\u{00A6}", "…"),
+    ];
+    let mut repaired = value.to_owned();
+    for (bad, good) in replacements {
+        repaired = repaired.replace(bad, good);
+    }
+    repaired
+}
+
+fn decode_latin1_mojibake(value: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(value.len());
+    for ch in value.chars() {
+        let codepoint = ch as u32;
+        if codepoint > u8::MAX as u32 {
+            return None;
+        }
+        bytes.push(codepoint as u8);
+    }
+    String::from_utf8(bytes).ok()
 }
 
 fn write_response(

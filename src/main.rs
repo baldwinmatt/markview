@@ -99,6 +99,13 @@ enum ServeMode {
     Directory,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NavLayout {
+    Empty,
+    Tabs,
+    Sidebar,
+}
+
 fn serve_markdown(inputs: Vec<PathBuf>, port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = ServeConfig::from_inputs(inputs, port)?;
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|error| {
@@ -1006,13 +1013,14 @@ fn rewritten_reference(
 }
 
 fn render_nav(config: &ServeConfig, active_route: &str) -> String {
-    if config.documents.len() <= 1 {
+    let layout = nav_layout(config);
+    if layout == NavLayout::Empty {
         return r#"<nav data-markview-nav></nav>"#.to_owned();
     }
-    let class = if config.mode != ServeMode::Directory && config.documents.len() <= 6 {
-        "markview-tabs"
-    } else {
-        "markview-sidebar"
+    let class = match layout {
+        NavLayout::Empty => unreachable!("empty nav returned above"),
+        NavLayout::Tabs => "markview-tabs",
+        NavLayout::Sidebar => "markview-sidebar",
     };
     let links = config
         .documents
@@ -1035,6 +1043,16 @@ fn render_nav(config: &ServeConfig, active_route: &str) -> String {
         .collect::<Vec<_>>()
         .join("");
     format!(r#"<nav data-markview-nav class="{class}">{links}</nav>"#)
+}
+
+fn nav_layout(config: &ServeConfig) -> NavLayout {
+    if config.documents.len() <= 1 {
+        NavLayout::Empty
+    } else if config.mode != ServeMode::Directory && config.documents.len() <= 6 {
+        NavLayout::Tabs
+    } else {
+        NavLayout::Sidebar
+    }
 }
 
 fn inject_serve_shell(config: &ServeConfig, active_route: &str, html: &str) -> String {
@@ -1072,32 +1090,122 @@ Served by <a href="https://github.com/baldwinmatt/markview">markview</a>
   margin: 24px auto 0;
 }
 [data-markview-nav]:empty { display: none; }
+.markview-shell {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 860px);
+  gap: 32px;
+  width: min(1132px, calc(100vw - 48px));
+  margin: 0 auto;
+  align-items: start;
+}
+.markview-shell main {
+  width: auto;
+  margin: 0;
+}
+.markview-shell [data-markview-nav] {
+  width: auto;
+  margin: 40px 0 0;
+}
 .markview-tabs {
   display: flex;
-  gap: 0.5rem;
+  gap: 0.25rem;
   flex-wrap: wrap;
   border-bottom: 1px solid var(--rule);
-  padding-bottom: 0.5rem;
 }
-.markview-sidebar {
-  display: grid;
-  gap: 0.25rem;
-  border-left: 3px solid var(--rule);
-  padding-left: 0.75rem;
-}
-[data-markview-nav] a {
+.markview-tabs a {
+  padding: 0.55rem 1rem;
+  margin-bottom: -1px;
+  border: 1px solid transparent;
+  border-top-left-radius: 8px;
+  border-top-right-radius: 8px;
+  background: var(--code-bg);
   color: var(--muted);
   text-decoration: none;
-  padding: 0.2rem 0.45rem;
+  max-width: 12rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-[data-markview-nav] a[aria-current="page"] {
+.markview-tabs a:hover {
+  background: var(--quote-bg);
   color: var(--fg);
-  font-weight: 700;
+  border-color: var(--rule) var(--rule) transparent;
+}
+.markview-tabs a[aria-current="page"] {
+  background: var(--bg);
+  color: var(--fg);
+  font-weight: 600;
+  border-color: var(--rule) var(--rule) var(--bg);
+}
+.markview-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: var(--code-bg);
+  border-radius: 10px;
+  padding: 14px 10px;
+  position: sticky;
+  top: 24px;
+  align-self: start;
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+}
+.markview-sidebar a {
+  display: block;
+  padding: 0.5rem 0.7rem;
+  border-radius: 6px;
+  color: var(--muted);
+  text-decoration: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.markview-sidebar a:hover {
+  background: var(--quote-bg);
+  color: var(--fg);
+}
+.markview-sidebar a[aria-current="page"] {
+  background: var(--accent);
+  color: var(--bg);
+  font-weight: 600;
+}
+@media (max-width: 700px) {
+  .markview-shell {
+    display: block;
+    width: min(860px, calc(100vw - 48px));
+    margin: 0 auto;
+  }
+  .markview-shell main {
+    width: auto;
+    margin: 0;
+  }
+  .markview-sidebar {
+    position: static;
+    max-height: none;
+    overflow: visible;
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    margin-bottom: 1.25rem;
+  }
+  .markview-sidebar a {
+    max-width: 12rem;
+  }
 }
 </style>"#;
-    html.replace("</style>", &format!("</style>\n{style}"))
-        .replace("<main>", &format!("{nav}\n<main>"))
-        .replace("</body>", &format!("{footer}\n{script}\n</body>"))
+    let html = html.replace("</style>", &format!("</style>\n{style}"));
+    let html = match nav_layout(config) {
+        NavLayout::Sidebar => html
+            .replacen(
+                "<main>",
+                &format!(r#"<div class="markview-shell">{nav}<main>"#),
+                1,
+            )
+            .replacen("</main>", "</main></div>", 1),
+        NavLayout::Empty | NavLayout::Tabs => html.replacen("<main>", &format!("{nav}\n<main>"), 1),
+    };
+    html.replace("</body>", &format!("{footer}\n{script}\n</body>"))
 }
 
 fn html_escape(value: &str) -> String {

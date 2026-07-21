@@ -99,6 +99,7 @@ fn serve_mode_returns_rendered_html() {
     assert!(response.contains("HTTP/1.1 200 OK"));
     assert!(response.contains(r#"<h1 id="served">Served</h1>"#));
     assert!(response.contains("<strong>view</strong>"));
+    assert!(!response.contains(r#"<div class="markview-shell">"#));
     assert!(response
         .contains(r#"Served by <a href="https://github.com/baldwinmatt/markview">markview</a>"#));
     assert!(response.contains("new EventSource('/events')"));
@@ -360,6 +361,8 @@ fn explicit_multi_file_serve_renders_navigation_and_defaults_to_first_input() {
 
     assert!(root.contains(r#"<h1 id="first">First</h1>"#));
     assert!(root.contains("data-markview-nav"));
+    assert!(root.contains(r#"class="markview-tabs""#));
+    assert!(!root.contains(r#"<div class="markview-shell">"#));
     assert!(root.contains(r#"href="/second.md#part""#));
     assert!(second_response.contains(r#"<h1 id="second">Second</h1>"#));
     server.stop();
@@ -376,7 +379,10 @@ fn directory_serve_selects_default_documents_and_ignores_nested_markdown() {
     std::fs::write(dir.path().join("README.md"), "# Readme\n").expect("write readme");
     let mut server = ServeProcess::start_dir(dir.path());
 
-    assert!(http_get(server.port, "/").contains(r#"<h1 id="readme">Readme</h1>"#));
+    let readme = http_get(server.port, "/");
+    assert!(readme.contains(r#"<h1 id="readme">Readme</h1>"#));
+    assert!(readme.contains(r#"<div class="markview-shell">"#));
+    assert!(readme.contains(r#"class="markview-sidebar""#));
     assert!(http_get(server.port, "/nested/hidden.md").contains("HTTP/1.1 404 Not Found"));
     server.stop();
 

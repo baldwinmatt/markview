@@ -1057,11 +1057,20 @@ fn nav_layout(config: &ServeConfig) -> NavLayout {
 
 fn inject_serve_shell(config: &ServeConfig, active_route: &str, html: &str) -> String {
     let nav = render_nav(config, active_route);
-    let footer = r#"<footer style="width: min(860px, calc(100vw - 48px)); margin: -36px auto 40px; padding-top: 1rem; border-top: 1px solid var(--rule); color: var(--muted); font-size: 0.9rem;">
-Served by <a href="https://github.com/baldwinmatt/markview">markview</a>
+    let footer = r#"<footer class="markview-footer">
+<span>Served by <a href="https://github.com/baldwinmatt/markview">markview</a></span>
+<span class="markview-refreshed">Last refreshed <time data-markview-refreshed-at></time></span>
 </footer>"#;
     let script = r#"<script>
 (() => {
+  const updateRefreshTime = () => {
+    const now = new Date();
+    document.querySelectorAll('[data-markview-refreshed-at]').forEach((element) => {
+      element.dateTime = now.toISOString();
+      element.textContent = now.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+    });
+  };
+  updateRefreshTime();
   const events = new EventSource('/events');
   events.onmessage = async (event) => {
     if (event.data !== 'reload') return;
@@ -1079,6 +1088,7 @@ Served by <a href="https://github.com/baldwinmatt/markview">markview</a>
     const nextFooter = next.querySelector('footer');
     if (currentFooter && nextFooter) currentFooter.innerHTML = nextFooter.innerHTML;
     if (next.title) document.title = next.title;
+    updateRefreshTime();
     window.scrollTo(0, savedY);
   };
 })();
@@ -1105,6 +1115,22 @@ Served by <a href="https://github.com/baldwinmatt/markview">markview</a>
 .markview-shell [data-markview-nav] {
   width: auto;
   margin: 40px 0 0;
+}
+.markview-footer {
+  width: min(860px, calc(100vw - 48px));
+  margin: -36px auto 40px;
+  padding-top: 1rem;
+  border-top: 1px solid var(--rule);
+  color: var(--muted);
+  font-size: 0.9rem;
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: baseline;
+}
+.markview-refreshed {
+  text-align: right;
+  white-space: nowrap;
 }
 .markview-tabs {
   display: flex;
@@ -1191,6 +1217,15 @@ Served by <a href="https://github.com/baldwinmatt/markview">markview</a>
   }
   .markview-sidebar a {
     max-width: 12rem;
+  }
+  .markview-footer {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+  .markview-refreshed {
+    text-align: left;
+    white-space: normal;
   }
 }
 </style>"#;

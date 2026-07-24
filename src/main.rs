@@ -855,9 +855,11 @@ fn render_file(config: &ServeConfig, served: &ServedDocument) -> io::Result<Stri
     let title = title_for_source(&served.source_path, &markdown);
     let markdown = rewrite_markdown_links(config, served, &markdown);
     let document = MarkdownDocument::with_title(markdown, title);
+    let modified_at = modified_timestamp_millis(&served.source_path);
     Ok(inject_serve_shell(
         config,
         &served.route_path,
+        modified_at,
         &HtmlRenderer.render_document(&document),
     ))
 }
@@ -1055,21 +1057,48 @@ fn nav_layout(config: &ServeConfig) -> NavLayout {
     }
 }
 
-fn inject_serve_shell(config: &ServeConfig, active_route: &str, html: &str) -> String {
+fn inject_serve_shell(
+    config: &ServeConfig,
+    active_route: &str,
+    modified_at: Option<u128>,
+    html: &str,
+) -> String {
     let nav = render_nav(config, active_route);
-    let footer = r#"<footer class="markview-footer">
+    let modified_attr = modified_at
+        .map(|millis| format!(r#" data-timestamp-ms="{millis}""#))
+        .unwrap_or_default();
+    let footer = format!(
+        r#"<footer class="markview-footer">
 <span>Served by <a href="https://github.com/baldwinmatt/markview">markview</a></span>
+<span class="markview-footer-meta">
+<span class="markview-modified">Doc modified <time data-markview-modified-at{modified_attr}></time></span>
 <span class="markview-refreshed">Last refreshed <time data-markview-refreshed-at></time></span>
-</footer>"#;
+</span>
+</footer>"#
+    );
     let script = r#"<script>
 (() => {
+  const formatTime = (date) => date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+  const updateModifiedTimes = () => {
+    document.querySelectorAll('[data-markview-modified-at]').forEach((element) => {
+      const millis = Number(element.dataset.timestampMs);
+      if (!Number.isFinite(millis)) {
+        element.textContent = 'unknown';
+        return;
+      }
+      const modified = new Date(millis);
+      element.dateTime = modified.toISOString();
+      element.textContent = formatTime(modified);
+    });
+  };
   const updateRefreshTime = () => {
     const now = new Date();
     document.querySelectorAll('[data-markview-refreshed-at]').forEach((element) => {
       element.dateTime = now.toISOString();
-      element.textContent = now.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+      element.textContent = formatTime(now);
     });
   };
+  updateModifiedTimes();
   updateRefreshTime();
   const events = new EventSource('/events');
   events.onmessage = async (event) => {
@@ -1088,6 +1117,7 @@ fn inject_serve_shell(config: &ServeConfig, active_route: &str, html: &str) -> S
     const nextFooter = next.querySelector('footer');
     if (currentFooter && nextFooter) currentFooter.innerHTML = nextFooter.innerHTML;
     if (next.title) document.title = next.title;
+    updateModifiedTimes();
     updateRefreshTime();
     window.scrollTo(0, savedY);
   };
@@ -1130,6 +1160,16 @@ fn inject_serve_shell(config: &ServeConfig, active_route: &str, html: &str) -> S
 }
 .markview-refreshed {
   text-align: right;
+  white-space: nowrap;
+}
+.markview-footer-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  text-align: right;
+}
+.markview-modified,
+.markview-refreshed {
   white-space: nowrap;
 }
 .markview-tabs {
@@ -1227,6 +1267,13 @@ fn inject_serve_shell(config: &ServeConfig, active_route: &str, html: &str) -> S
     text-align: left;
     white-space: normal;
   }
+  .markview-footer-meta {
+    text-align: left;
+  }
+  .markview-modified,
+  .markview-refreshed {
+    white-space: normal;
+  }
 }
 </style>"#;
     let html = html.replace("</style>", &format!("</style>\n{style}"));
@@ -1241,6 +1288,16 @@ fn inject_serve_shell(config: &ServeConfig, active_route: &str, html: &str) -> S
         NavLayout::Empty | NavLayout::Tabs => html.replacen("<main>", &format!("{nav}\n<main>"), 1),
     };
     html.replace("</body>", &format!("{footer}\n{script}\n</body>"))
+}
+
+fn modified_timestamp_millis(path: &Path) -> Option<u128> {
+    path.metadata()
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis())
 }
 
 fn html_escape(value: &str) -> String {

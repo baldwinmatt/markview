@@ -112,9 +112,13 @@ fn serve_mode_returns_rendered_html() {
     assert!(response
         .contains(r#"Served by <a href="https://github.com/baldwinmatt/markview">markview</a>"#));
     assert!(response.contains(r#"<footer class="markview-footer">"#));
+    assert!(response.contains(r#"class="markview-footer-meta""#));
+    assert!(response.contains(r#"class="markview-modified""#));
+    assert!(response.contains("Doc modified <time data-markview-modified-at data-timestamp-ms="));
     assert!(response.contains(r#"class="markview-refreshed""#));
     assert!(response.contains("Last refreshed <time data-markview-refreshed-at>"));
     assert!(response.contains("new EventSource('/events')"));
+    assert!(response.contains("updateModifiedTimes();"));
     assert!(response.contains("updateRefreshTime();"));
     server.stop();
 }
@@ -164,6 +168,7 @@ fn serve_mode_reload_path_preserves_scroll_and_refreshes_shell_regions() {
     assert!(before.contains("window.scrollTo(0, savedY)"));
     assert!(before.contains("data-markview-nav"));
     assert!(before.contains("Served by"));
+    assert!(before.contains("Doc modified"));
     assert!(before.contains("Last refreshed"));
 
     std::fs::write(&first, "# After\n\nContent\n").expect("update first title");
@@ -171,6 +176,7 @@ fn serve_mode_reload_path_preserves_scroll_and_refreshes_shell_regions() {
     assert!(after.contains("<title>After</title>"));
     assert!(after.contains(">After</a>"));
     assert!(after.contains("Served by"));
+    assert!(after.contains("Doc modified"));
     assert!(after.contains("Last refreshed"));
     server.stop();
 }

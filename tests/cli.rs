@@ -550,6 +550,104 @@ fn serve_mode_recurse_expands_sidebar_nav_multiple_levels_deep() {
 }
 
 #[test]
+fn serve_mode_recurse_rescans_when_a_new_nested_file_is_created() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");
+    let mut server = ServeProcess::start_recursive_dir(dir.path());
+
+    // The new file's directory doesn't even exist at startup.
+    assert!(http_get(server.port, "/guides/setup.md").contains("HTTP/1.1 404 Not Found"));
+
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port)).expect("connect events");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set timeout");
+    stream
+        .write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("write request");
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        reader.read_line(&mut line).expect("read header");
+        if line == "\r\n" {
+            break;
+        }
+    }
+
+    let guides = dir.path().join("guides");
+    std::fs::create_dir(&guides).expect("create guides dir");
+    std::fs::write(guides.join("setup.md"), "# Setup\n").expect("write nested doc");
+    // A structural change (new document set) gets a distinct "rescan" event
+    // rather than "reload", since the client needs a full page reload to pick
+    // up any nav-layout shell change (e.g. single-file "no nav" -> sidebar)
+    // that a plain innerHTML patch can't apply.
+    let event = read_until(&mut reader, "data: rescan", Duration::from_secs(5));
+    assert!(event.contains("data: rescan"));
+
+    let setup = http_get(server.port, "/guides/setup.md");
+    assert!(setup.contains(r#"<h1 id="setup">Setup</h1>"#));
+    assert!(http_get(server.port, "/").contains(r#"href="/guides/setup.md""#));
+    server.stop();
+}
+
+#[test]
+fn serve_mode_directory_rescans_when_a_new_top_level_file_is_created() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");
+    let mut server = ServeProcess::start_dir(dir.path());
+
+    assert!(http_get(server.port, "/notes.md").contains("HTTP/1.1 404 Not Found"));
+
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port)).expect("connect events");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set timeout");
+    stream
+        .write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("write request");
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        reader.read_line(&mut line).expect("read header");
+        if line == "\r\n" {
+            break;
+        }
+    }
+
+    std::fs::write(dir.path().join("notes.md"), "# Notes\n").expect("write new top-level doc");
+    let event = read_until(&mut reader, "data: rescan", Duration::from_secs(5));
+    assert!(event.contains("data: rescan"));
+
+    assert!(http_get(server.port, "/notes.md").contains(r#"<h1 id="notes">Notes</h1>"#));
+    server.stop();
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_mode_recurse_ignores_invalid_rescan_and_keeps_serving() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let outside = tempfile::NamedTempFile::new().expect("outside file");
+    std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");
+    let mut server = ServeProcess::start_recursive_dir(dir.path());
+
+    assert!(http_get(server.port, "/").contains(r#"<h1 id="home">Home</h1>"#));
+
+    // A newly-created Markdown-named symlink whose target escapes the served
+    // root makes a rescan fail; the server should log it and keep serving the
+    // last-known-good document set rather than falling over.
+    symlink(outside.path(), dir.path().join("escape.md")).expect("symlink escape");
+    std::thread::sleep(Duration::from_millis(300));
+
+    assert!(http_get(server.port, "/").contains(r#"<h1 id="home">Home</h1>"#));
+    assert!(server.stderr_so_far().contains("failed to rescan"));
+    server.stop();
+}
+
+#[test]
 fn serve_mode_recurse_skips_hidden_directories() {
     let dir = tempfile::tempdir().expect("temp dir");
     let hidden = dir.path().join(".git");

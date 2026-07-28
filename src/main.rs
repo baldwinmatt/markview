@@ -111,12 +111,40 @@ enum NavLayout {
     Sidebar,
 }
 
+/// What kind of live-reload signal to push to connected browser tabs.
+/// `Content` covers a plain edit to an already-known document: the client
+/// can just patch `main`/nav/footer in place. `Structure` means a rescan
+/// changed the served document set, which can also change the nav's overall
+/// layout (e.g. single-file "no nav" becoming a real sidebar) — the
+/// surrounding page shell (the nav's own class, the two-column wrapper) was
+/// only ever set at full-page-load time, so an in-place patch can't apply
+/// that change and a full page reload is needed instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReloadKind {
+    Content,
+    Structure,
+}
+
+impl ReloadKind {
+    fn sse_event(self) -> &'static [u8] {
+        match self {
+            ReloadKind::Content => b"data: reload\n\n",
+            ReloadKind::Structure => b"data: rescan\n\n",
+        }
+    }
+}
+
+/// The active `ServeConfig`, swappable so the file watcher can replace it
+/// wholesale after a rescan (e.g. a Markdown file was added or removed under
+/// the served root) without connection threads ever seeing a torn read.
+type SharedConfig = Arc<Mutex<Arc<ServeConfig>>>;
+
 fn serve_markdown(
     inputs: Vec<PathBuf>,
     port: u16,
     recurse: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut config = ServeConfig::from_inputs(inputs, port, recurse)?;
+    let mut config = ServeConfig::from_inputs(inputs.clone(), port, recurse)?;
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|error| {
         if error.kind() == io::ErrorKind::AddrInUse {
             format!("port {port} is already in use")
@@ -126,16 +154,10 @@ fn serve_markdown(
     })?;
     let address = listener.local_addr()?;
     config.port = address.port();
+    let bound_port = config.port;
     let clients = Arc::new(Mutex::new(Vec::new()));
-    let _watcher = watch_files(
-        config
-            .documents
-            .iter()
-            .map(|document| document.source_path.clone())
-            .collect(),
-        clients.clone(),
-    )?;
-    let config = Arc::new(config);
+    let shared: SharedConfig = Arc::new(Mutex::new(Arc::new(config)));
+    let _watcher = watch_root(shared.clone(), inputs, bound_port, recurse, clients.clone())?;
 
     println!(
         "Serving on http://localhost:{} — press Ctrl+C to stop",
@@ -146,9 +168,10 @@ fn serve_markdown(
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                let config = config.clone();
+                let shared = shared.clone();
                 let clients = clients.clone();
                 thread::spawn(move || {
+                    let config = shared.lock().expect("config lock").clone();
                     if let Err(error) = handle_connection(stream, &config, clients) {
                         eprintln!("markview: serve error: {error}");
                     }
@@ -711,50 +734,100 @@ fn is_client_disconnect(error: &io::Error) -> bool {
     )
 }
 
-fn watch_files(
-    paths: Vec<PathBuf>,
-    clients: Arc<Mutex<Vec<mpsc::Sender<()>>>>,
+/// Watches the served root for changes. A plain edit to an already-known
+/// document just pushes a reload signal (cheap, matches today's behavior). A
+/// Markdown file being created or removed anywhere in scope — or any event on
+/// a Markdown path that isn't currently a known document, e.g. an atomic
+/// editor save that shows up as remove+create — triggers a full rescan
+/// (re-running the same discovery `serve_markdown` used at startup) before
+/// pushing the reload, so the served document set stays in sync with disk
+/// instead of only ever reflecting what existed when the server started.
+fn watch_root(
+    shared: SharedConfig,
+    inputs: Vec<PathBuf>,
+    port: u16,
+    recurse: bool,
+    clients: Arc<Mutex<Vec<mpsc::Sender<ReloadKind>>>>,
 ) -> notify::Result<RecommendedWatcher> {
-    let watch_paths = paths.clone();
+    let (root, mode) = {
+        let config = shared.lock().expect("config lock");
+        (config.root.clone(), config.mode)
+    };
+    let watch_mode = match mode {
+        ServeMode::Directory if recurse => RecursiveMode::Recursive,
+        ServeMode::Directory | ServeMode::SingleFile => RecursiveMode::NonRecursive,
+        // Explicit files can sit at any depth under their shared common root,
+        // so their parent directories aren't known/watchable individually.
+        ServeMode::Explicit => RecursiveMode::Recursive,
+    };
     let (changes_tx, changes_rx) = mpsc::channel();
     let mut watcher = RecommendedWatcher::new(
         move |result: notify::Result<notify::Event>| {
             if let Ok(event) = result {
-                if is_reload_event(&event.kind)
-                    && event.paths.iter().any(|event_path| {
-                        event_path
-                            .canonicalize()
-                            .map(|event_path| watch_paths.iter().any(|known| known == &event_path))
-                            .unwrap_or(false)
-                    })
-                {
-                    let _ = changes_tx.send(());
-                }
+                let _ = changes_tx.send(event);
             }
         },
         Config::default(),
     )?;
+    watcher.watch(&root, watch_mode)?;
 
-    let mut directories = Vec::new();
-    for path in paths {
-        let directory = path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
-        if !directories.iter().any(|known| known == &directory) {
-            watcher.watch(&directory, RecursiveMode::NonRecursive)?;
-            directories.push(directory);
-        }
-    }
     thread::spawn(move || {
-        while changes_rx.recv().is_ok() {
-            if let Ok(mut clients) = clients.lock() {
-                clients.retain(|client| client.send(()).is_ok());
-            }
+        while let Ok(event) = changes_rx.recv() {
+            handle_fs_event(event, &shared, &clients, &inputs, port, recurse);
         }
     });
 
     Ok(watcher)
+}
+
+fn handle_fs_event(
+    event: notify::Event,
+    shared: &SharedConfig,
+    clients: &Arc<Mutex<Vec<mpsc::Sender<ReloadKind>>>>,
+    inputs: &[PathBuf],
+    port: u16,
+    recurse: bool,
+) {
+    if !is_reload_event(&event.kind) {
+        return;
+    }
+    let is_structural = matches!(event.kind, EventKind::Create(_) | EventKind::Remove(_));
+    let current = shared.lock().expect("config lock").clone();
+    let mut relevant = false;
+    let mut needs_rescan = false;
+    for event_path in &event.paths {
+        if !is_markdown_path(event_path) {
+            continue;
+        }
+        relevant = true;
+        let known = current
+            .documents
+            .iter()
+            .any(|document| document.source_path == *event_path);
+        if !known || is_structural {
+            needs_rescan = true;
+        }
+    }
+    if !relevant {
+        return;
+    }
+    let reload_kind = if needs_rescan {
+        match ServeConfig::from_inputs(inputs.to_vec(), port, recurse) {
+            Ok(fresh) => {
+                *shared.lock().expect("config lock") = Arc::new(fresh);
+                ReloadKind::Structure
+            }
+            Err(error) => {
+                eprintln!("markview: failed to rescan served directory: {error}");
+                return;
+            }
+        }
+    } else {
+        ReloadKind::Content
+    };
+    if let Ok(mut clients) = clients.lock() {
+        clients.retain(|client| client.send(reload_kind).is_ok());
+    }
 }
 
 fn is_reload_event(kind: &EventKind) -> bool {
@@ -767,7 +840,7 @@ fn is_reload_event(kind: &EventKind) -> bool {
 fn handle_connection(
     mut stream: TcpStream,
     config: &ServeConfig,
-    clients: Arc<Mutex<Vec<mpsc::Sender<()>>>>,
+    clients: Arc<Mutex<Vec<mpsc::Sender<ReloadKind>>>>,
 ) -> io::Result<()> {
     let mut request = String::new();
     {
@@ -871,7 +944,7 @@ fn serve_asset(
 
 fn serve_events(
     mut stream: TcpStream,
-    clients: Arc<Mutex<Vec<mpsc::Sender<()>>>>,
+    clients: Arc<Mutex<Vec<mpsc::Sender<ReloadKind>>>>,
 ) -> io::Result<()> {
     let (tx, rx) = mpsc::channel();
     clients
@@ -887,12 +960,12 @@ fn serve_events(
     loop {
         if probe_disconnects {
             match rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(()) => stream.write_all(b"data: reload\n\n")?,
+                Ok(kind) => stream.write_all(kind.sse_event())?,
                 Err(mpsc::RecvTimeoutError::Timeout) => stream.write_all(b": keepalive\n\n")?,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-        } else if rx.recv().is_ok() {
-            stream.write_all(b"data: reload\n\n")?;
+        } else if let Ok(kind) = rx.recv() {
+            stream.write_all(kind.sse_event())?;
         } else {
             break;
         }
@@ -1355,6 +1428,10 @@ fn inject_serve_shell(
   updateRefreshTime();
   const events = new EventSource('/events');
   events.onmessage = async (event) => {
+    if (event.data === 'rescan') {
+      location.reload();
+      return;
+    }
     if (event.data !== 'reload') return;
     const savedY = window.scrollY;
     const response = await fetch(location.pathname, { cache: 'no-store' });

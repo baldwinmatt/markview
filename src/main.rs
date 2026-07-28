@@ -244,7 +244,10 @@ impl ServeConfig {
         })
     }
 
-    fn discover_directory(input: &Path, recurse: bool) -> Result<ServeBuild, Box<dyn std::error::Error>> {
+    fn discover_directory(
+        input: &Path,
+        recurse: bool,
+    ) -> Result<ServeBuild, Box<dyn std::error::Error>> {
         let root = input.canonicalize()?;
         if is_filesystem_root(&root) {
             return Err("served directory cannot be a filesystem root".into());
@@ -285,7 +288,11 @@ impl ServeConfig {
             documents.push(document_for_path(&root, canonical)?);
         }
         if documents.is_empty() {
-            let scope = if recurse { "recursively" } else { "at its top level" };
+            let scope = if recurse {
+                "recursively"
+            } else {
+                "at its top level"
+            };
             return Err(format!("served directory has no Markdown files {scope}").into());
         }
 
@@ -956,7 +963,10 @@ fn fence_marker(trimmed: &str) -> Option<(char, usize)> {
     if ch != '`' && ch != '~' {
         return None;
     }
-    let len = trimmed.chars().take_while(|&candidate| candidate == ch).count();
+    let len = trimmed
+        .chars()
+        .take_while(|&candidate| candidate == ch)
+        .count();
     (len >= 3).then_some((ch, len))
 }
 

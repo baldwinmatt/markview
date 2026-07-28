@@ -592,6 +592,30 @@ fn serve_mode_recurse_rescans_when_a_new_nested_file_is_created() {
 }
 
 #[test]
+fn serve_mode_recurse_rescans_when_a_served_file_is_renamed_away_from_markdown() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let old = dir.path().join("old.md");
+    let renamed = dir.path().join("old.txt");
+    std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");
+    std::fs::write(&old, "# Old\n").expect("write old doc");
+    let mut server = ServeProcess::start_recursive_dir(dir.path());
+
+    let before = http_get(server.port, "/");
+    assert!(before.contains(r#"href="/old.md""#));
+    assert!(http_get(server.port, "/old.md").contains(r#"<h1 id="old">Old</h1>"#));
+
+    let mut reader = open_reload_stream(server.port);
+    std::fs::rename(&old, &renamed).expect("rename old doc");
+    let event = read_until(&mut reader, "data: rescan", Duration::from_secs(5));
+    assert!(event.contains("data: rescan"), "unexpected event stream: {event}");
+
+    let after = http_get(server.port, "/");
+    assert!(!after.contains(r#"href="/old.md""#), "stale nav link remained:\n{after}");
+    assert!(http_get(server.port, "/old.md").contains("HTTP/1.1 404 Not Found"));
+    server.stop();
+}
+
+#[test]
 fn serve_mode_directory_rescans_when_a_new_top_level_file_is_created() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");
@@ -1195,6 +1219,26 @@ fn http_request(port: u16, method: &str, route: &str) -> String {
     let mut response = Vec::new();
     stream.read_to_end(&mut response).expect("read response");
     String::from_utf8_lossy(&response).to_string()
+}
+
+fn open_reload_stream(port: u16) -> BufReader<TcpStream> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect events");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set timeout");
+    stream
+        .write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("write request");
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        reader.read_line(&mut line).expect("read header");
+        if line == "\r\n" {
+            break;
+        }
+    }
+    reader
 }
 
 fn unused_port() -> u16 {

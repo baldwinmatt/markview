@@ -11,7 +11,7 @@ use markview::{
     help, render, repair_utf8_mojibake, Cli, FrontendRenderer, HtmlRenderer, MarkdownDocument,
     OutputFormat,
 };
-use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{event::ModifyKind, Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use pulldown_cmark::{Event, Options, Parser, Tag};
 
 fn main() -> ExitCode {
@@ -791,7 +791,10 @@ fn handle_fs_event(
     if !is_reload_event(&event.kind) {
         return;
     }
-    let is_structural = matches!(event.kind, EventKind::Create(_) | EventKind::Remove(_));
+    let is_structural = matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+    );
     let current = shared.lock().expect("config lock").clone();
     let mut relevant = false;
     let mut needs_rescan = false;

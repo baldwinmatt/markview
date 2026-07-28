@@ -182,6 +182,22 @@ fn serve_mode_reload_path_preserves_scroll_and_refreshes_shell_regions() {
 }
 
 #[test]
+fn serve_mode_reload_path_restores_collapsed_sidebar_dirs() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let guides = dir.path().join("guides");
+    std::fs::create_dir(&guides).expect("guides dir");
+    std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");
+    std::fs::write(guides.join("setup.md"), "# Setup\n").expect("write setup");
+    let mut server = ServeProcess::start_recursive_dir(dir.path());
+
+    let setup = http_get(server.port, "/guides/setup.md");
+
+    assert!(setup.contains(r#"data-markview-dir="/guides" open"#));
+    assert!(setup.contains("el.open = openDirs.has(el.dataset.markviewDir);"));
+    server.stop();
+}
+
+#[test]
 fn serve_mode_does_not_log_noise_when_an_events_client_disconnects() {
     let dir = tempfile::tempdir().expect("temp dir");
     let file = dir.path().join("README.md");

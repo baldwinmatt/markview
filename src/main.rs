@@ -1345,7 +1345,7 @@ fn inject_serve_shell(
       );
       currentNav.innerHTML = nextNav.innerHTML;
       currentNav.querySelectorAll('details').forEach((el) => {
-        if (openDirs.has(el.dataset.markviewDir)) el.open = true;
+        el.open = openDirs.has(el.dataset.markviewDir);
       });
     }
     const currentFooter = document.querySelector('footer');

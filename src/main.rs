@@ -1203,11 +1203,7 @@ impl NavDir {
     fn build(documents: &[ServedDocument]) -> Self {
         let mut root = Self::new(String::new(), String::new());
         for (index, document) in documents.iter().enumerate() {
-            let segments = document
-                .route_path
-                .trim_start_matches('/')
-                .split('/')
-                .collect::<Vec<_>>();
+            let segments = route_path_segments(&document.route_path);
             root.insert(&segments, index);
         }
         root.sort(documents);
@@ -1221,8 +1217,7 @@ impl NavDir {
                 let position = self.dirs.iter().position(|dir| dir.name == *first);
                 let index = position.unwrap_or_else(|| {
                     let child_prefix = format!("{}/{first}", self.prefix);
-                    let child_name =
-                        percent_decode(first).unwrap_or_else(|| (*first).to_owned());
+                    let child_name = percent_decode(first).unwrap_or_else(|| (*first).to_owned());
                     self.dirs.push(Self::new(child_name, child_prefix));
                     self.dirs.len() - 1
                 });
@@ -1245,11 +1240,7 @@ impl NavDir {
 /// path to `active_route`, so the sidebar auto-expands the active document's
 /// folder(s) by default while leaving unrelated folders collapsed.
 fn active_ancestor_prefixes(active_route: &str) -> Vec<String> {
-    let segments = active_route
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
+    let segments = route_path_segments(active_route);
     let mut prefixes = Vec::new();
     let mut prefix = String::new();
     for segment in segments.iter().take(segments.len().saturating_sub(1)) {
@@ -1258,6 +1249,14 @@ fn active_ancestor_prefixes(active_route: &str) -> Vec<String> {
         prefixes.push(prefix.clone());
     }
     prefixes
+}
+
+fn route_path_segments(route_path: &str) -> Vec<&str> {
+    route_path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect()
 }
 
 fn render_nav_dir(
@@ -1686,5 +1685,18 @@ mod serve_nav_tests {
             .expect("serve config");
 
         assert!(config.sidebar_nav.is_some());
+    }
+
+    #[test]
+    fn route_path_segments_trim_leading_and_empty_segments() {
+        assert_eq!(
+            route_path_segments("/sub/deep/readme.md"),
+            vec!["sub", "deep", "readme.md"]
+        );
+        assert_eq!(route_path_segments("/"), Vec::<&str>::new());
+        assert_eq!(
+            route_path_segments("//sub///readme.md"),
+            vec!["sub", "readme.md"]
+        );
     }
 }

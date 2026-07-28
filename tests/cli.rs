@@ -469,11 +469,17 @@ fn serve_mode_recurse_discovers_nested_markdown_files_and_prefers_top_level_defa
 fn serve_mode_recurse_groups_sidebar_nav_by_directory_and_auto_expands_active_path() {
     let dir = tempfile::tempdir().expect("temp dir");
     let guides = dir.path().join("guides");
+    let my_docs = dir.path().join("My Docs");
+    let cafe = dir.path().join("café");
     let other = dir.path().join("other");
     std::fs::create_dir(&guides).expect("guides dir");
+    std::fs::create_dir(&my_docs).expect("my docs dir");
+    std::fs::create_dir(&cafe).expect("cafe dir");
     std::fs::create_dir(&other).expect("other dir");
     std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");
     std::fs::write(guides.join("setup.md"), "# Setup\n").expect("write guides doc");
+    std::fs::write(my_docs.join("intro.md"), "# Intro\n").expect("write my docs doc");
+    std::fs::write(cafe.join("menu.md"), "# Menu\n").expect("write cafe doc");
     std::fs::write(other.join("misc.md"), "# Misc\n").expect("write other doc");
     let mut server = ServeProcess::start_recursive_dir(dir.path());
 
@@ -482,8 +488,12 @@ fn serve_mode_recurse_groups_sidebar_nav_by_directory_and_auto_expands_active_pa
 
     // Nested documents are grouped under a collapsible <details> per directory.
     assert!(home.contains(r#"<details class="markview-nav-dir" data-markview-dir="/guides">"#));
+    assert!(home.contains(r#"<details class="markview-nav-dir" data-markview-dir="/My%20Docs">"#));
+    assert!(home.contains(r#"<details class="markview-nav-dir" data-markview-dir="/caf%C3%A9">"#));
     assert!(home.contains(r#"<details class="markview-nav-dir" data-markview-dir="/other">"#));
     assert!(home.contains("<summary>guides</summary>"));
+    assert!(home.contains("<summary>My Docs</summary>"));
+    assert!(home.contains("<summary>caf&#233;</summary>"));
     assert!(home.contains("<summary>other</summary>"));
 
     // On the homepage neither directory is on the active path, so both start collapsed.

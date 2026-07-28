@@ -1213,7 +1213,9 @@ impl<'a> NavDir<'a> {
                 let position = self.dirs.iter().position(|dir| dir.name == *first);
                 let index = position.unwrap_or_else(|| {
                     let child_prefix = format!("{}/{first}", self.prefix);
-                    self.dirs.push(Self::new((*first).to_owned(), child_prefix));
+                    let child_name =
+                        percent_decode(first).unwrap_or_else(|| (*first).to_owned());
+                    self.dirs.push(Self::new(child_name, child_prefix));
                     self.dirs.len() - 1
                 });
                 self.dirs[index].insert(rest, document);

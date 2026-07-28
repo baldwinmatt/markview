@@ -810,10 +810,13 @@ fn handle_fs_events(
                 continue;
             }
             relevant = true;
+            let lookup_path = event_path
+                .canonicalize()
+                .unwrap_or_else(|_| event_path.clone());
             let known = current
                 .documents
                 .iter()
-                .any(|document| document.source_path == *event_path);
+                .any(|document| document.source_path == lookup_path);
             if !known || is_structural {
                 needs_rescan = true;
             }
@@ -1932,6 +1935,33 @@ mod serve_nav_tests {
             .expect("second read lock should not block another reader");
 
         assert_eq!(first.default_document, second.default_document);
+    }
+
+    #[test]
+    fn event_paths_are_canonicalized_before_known_document_lookup() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let dir = tempfile::tempdir_in(&cwd).expect("temp dir");
+        let file = dir.path().join("README.md");
+        std::fs::write(&file, "# Home\n").expect("write readme");
+        let config = ServeConfig::from_inputs(vec![file.clone()], 0, false).expect("config");
+        let shared: SharedConfig = Arc::new(RwLock::new(Arc::new(config)));
+        let (client_tx, client_rx) = mpsc::channel();
+        let clients = Arc::new(Mutex::new(vec![client_tx]));
+        let relative_file = file.strip_prefix(&cwd).expect("relative file").to_path_buf();
+        let event = notify::Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![relative_file],
+            attrs: notify::event::EventAttributes::new(),
+        };
+
+        handle_fs_events(vec![event], &shared, &clients, &[], 0, false);
+
+        assert_eq!(
+            client_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(ReloadKind::Content)
+        );
     }
 
     fn served_doc(route_path: &str) -> ServedDocument {

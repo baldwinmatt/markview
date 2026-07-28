@@ -714,6 +714,34 @@ fn serve_mode_rewrites_links_without_touching_code_samples_and_reference_definit
     server.stop();
 }
 
+#[test]
+fn serve_mode_preserves_multibyte_utf8_prose_when_rewriting_links() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let first = dir.path().join("README.md");
+    let second = dir.path().join("other.md");
+    std::fs::write(
+        &first,
+        "# Café Notes\n\nSee [café notes](other.md) for details.\n\n```\nEmoji: 😀\n```\n",
+    )
+    .expect("write readme");
+    std::fs::write(&second, "# Other\n").expect("write other");
+    let mut server = ServeProcess::start_with_files(&[first.as_path(), second.as_path()]);
+
+    let response = http_get(server.port, "/");
+
+    // Rendered HTML entity-escapes all non-ASCII output (see `escape_non_ascii_html`),
+    // so a correctly-preserved "é" (U+00E9) appears as `&#233;`, not a literal char.
+    assert!(
+        response.contains("caf&#233; notes"),
+        "multi-byte UTF-8 prose was corrupted:\n{response}"
+    );
+    assert!(
+        !response.contains("&#195;"),
+        "response contains a byte-as-char mojibake artifact (0xC3 lead byte of 'é'):\n{response}"
+    );
+    server.stop();
+}
+
 struct ServeProcess {
     child: Child,
     port: u16,

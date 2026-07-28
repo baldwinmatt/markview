@@ -943,27 +943,29 @@ fn rewrite_inline_markdown_links(
     line: &str,
 ) -> String {
     let mut output = String::new();
-    let bytes = line.as_bytes();
     let mut index = 0;
     let mut in_code = false;
 
-    while index < bytes.len() {
-        if bytes[index] == b'`' {
+    while index < line.len() {
+        let ch = line[index..].chars().next().expect("valid char boundary");
+        let ch_len = ch.len_utf8();
+
+        if ch == '`' {
             in_code = !in_code;
             output.push('`');
-            index += 1;
+            index += ch_len;
             continue;
         }
-        if in_code || bytes[index] != b']' || bytes.get(index + 1) != Some(&b'(') {
-            output.push(bytes[index] as char);
-            index += 1;
+        if in_code || ch != ']' || !line[index + ch_len..].starts_with('(') {
+            output.push(ch);
+            index += ch_len;
             continue;
         }
 
-        let destination_start = index + 2;
+        let destination_start = index + ch_len + 1;
         let Some(destination_end) = find_link_destination_end(line, destination_start) else {
-            output.push(bytes[index] as char);
-            index += 1;
+            output.push(ch);
+            index += ch_len;
             continue;
         };
         let destination = &line[destination_start..destination_end];

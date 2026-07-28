@@ -289,7 +289,7 @@ impl ServeConfig {
             return Err(format!("served directory has no Markdown files {scope}").into());
         }
 
-        let default_document = ["README.md", "index.md"]
+        let default_document = ["readme.md", "index.md"]
             .iter()
             .find_map(|name| {
                 documents
@@ -300,7 +300,7 @@ impl ServeConfig {
                                 .source_path
                                 .file_name()
                                 .and_then(|file| file.to_str())
-                                == Some(*name)
+                                .is_some_and(|file| file.eq_ignore_ascii_case(name))
                     })
                     .map(|document| document.source_path.clone())
             })

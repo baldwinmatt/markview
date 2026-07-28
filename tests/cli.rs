@@ -429,6 +429,21 @@ fn directory_serve_selects_default_documents_and_ignores_nested_markdown() {
 }
 
 #[test]
+fn directory_serve_selects_lowercase_readme_as_default_document() {
+    // Duplicate-detection above the default-document selection already treats
+    // filenames case-insensitively, so a lone lowercase "readme.md" (no
+    // differently-cased sibling, hence no collision) should be recognized as
+    // the index page too, not skipped in favor of the first alphabetical file.
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("aaa.md"), "# Aaa\n").expect("write aaa");
+    std::fs::write(dir.path().join("readme.md"), "# Readme\n").expect("write readme");
+    let mut server = ServeProcess::start_dir(dir.path());
+
+    assert!(http_get(server.port, "/").contains(r#"<h1 id="readme">Readme</h1>"#));
+    server.stop();
+}
+
+#[test]
 fn serve_mode_recurse_discovers_nested_markdown_files_and_prefers_top_level_default() {
     let dir = tempfile::tempdir().expect("temp dir");
     let nested = dir.path().join("nested");

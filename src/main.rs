@@ -1137,27 +1137,139 @@ fn render_nav(config: &ServeConfig, active_route: &str) -> String {
         NavLayout::Tabs => "markview-tabs",
         NavLayout::Sidebar => "markview-sidebar",
     };
-    let links = config
-        .documents
-        .iter()
-        .map(|document| {
-            let title = current_document_title(document);
-            let active = if document.route_path == active_route {
-                r#" aria-current="page""#
-            } else {
-                ""
-            };
-            format!(
-                r#"<a href="{}" title="{}"{}>{}</a>"#,
-                html_escape(&document.route_path),
-                html_escape(&document.route_path),
-                active,
-                html_escape(&title)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
+    let links = if layout == NavLayout::Sidebar {
+        let tree = NavDir::build(&config.documents);
+        let open_ancestors = active_ancestor_prefixes(active_route);
+        render_nav_dir(&tree, active_route, &open_ancestors)
+    } else {
+        render_nav_flat(&config.documents, active_route)
+    };
     format!(r#"<nav data-markview-nav class="{class}">{links}</nav>"#)
+}
+
+fn render_nav_flat(documents: &[ServedDocument], active_route: &str) -> String {
+    documents
+        .iter()
+        .map(|document| render_nav_link(document, active_route))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn render_nav_link(document: &ServedDocument, active_route: &str) -> String {
+    let title = current_document_title(document);
+    let active = if document.route_path == active_route {
+        r#" aria-current="page""#
+    } else {
+        ""
+    };
+    format!(
+        r#"<a href="{}" title="{}"{}>{}</a>"#,
+        html_escape(&document.route_path),
+        html_escape(&document.route_path),
+        active,
+        html_escape(&title)
+    )
+}
+
+/// A directory grouping for the sidebar's nav tree. `prefix` is the route
+/// path to this directory (e.g. `/sub/deep`), used both as a stable open/
+/// closed key (see the reload script in `inject_serve_shell`) and to decide
+/// which directories sit on the path to the active document.
+struct NavDir<'a> {
+    name: String,
+    prefix: String,
+    dirs: Vec<NavDir<'a>>,
+    docs: Vec<&'a ServedDocument>,
+}
+
+impl<'a> NavDir<'a> {
+    fn new(name: String, prefix: String) -> Self {
+        Self {
+            name,
+            prefix,
+            dirs: Vec::new(),
+            docs: Vec::new(),
+        }
+    }
+
+    fn build(documents: &'a [ServedDocument]) -> Self {
+        let mut root = Self::new(String::new(), String::new());
+        for document in documents {
+            let segments = document
+                .route_path
+                .trim_start_matches('/')
+                .split('/')
+                .collect::<Vec<_>>();
+            root.insert(&segments, document);
+        }
+        root.sort();
+        root
+    }
+
+    fn insert(&mut self, segments: &[&str], document: &'a ServedDocument) {
+        match segments {
+            [] | [_] => self.docs.push(document),
+            [first, rest @ ..] => {
+                let position = self.dirs.iter().position(|dir| dir.name == *first);
+                let index = position.unwrap_or_else(|| {
+                    let child_prefix = format!("{}/{first}", self.prefix);
+                    self.dirs.push(Self::new((*first).to_owned(), child_prefix));
+                    self.dirs.len() - 1
+                });
+                self.dirs[index].insert(rest, document);
+            }
+        }
+    }
+
+    fn sort(&mut self) {
+        self.dirs.sort_by(|a, b| a.name.cmp(&b.name));
+        self.docs.sort_by(|a, b| a.route_path.cmp(&b.route_path));
+        for dir in &mut self.dirs {
+            dir.sort();
+        }
+    }
+}
+
+/// Route prefixes (e.g. `["/sub", "/sub/deep"]`) of every directory on the
+/// path to `active_route`, so the sidebar auto-expands the active document's
+/// folder(s) by default while leaving unrelated folders collapsed.
+fn active_ancestor_prefixes(active_route: &str) -> Vec<String> {
+    let segments = active_route
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let mut prefixes = Vec::new();
+    let mut prefix = String::new();
+    for segment in segments.iter().take(segments.len().saturating_sub(1)) {
+        prefix.push('/');
+        prefix.push_str(segment);
+        prefixes.push(prefix.clone());
+    }
+    prefixes
+}
+
+fn render_nav_dir(dir: &NavDir, active_route: &str, open_ancestors: &[String]) -> String {
+    let mut html = String::new();
+    for child in &dir.dirs {
+        let open = if open_ancestors.iter().any(|prefix| prefix == &child.prefix) {
+            " open"
+        } else {
+            ""
+        };
+        html.push_str(&format!(
+            r#"<details class="markview-nav-dir" data-markview-dir="{}"{}><summary>{}</summary>"#,
+            html_escape(&child.prefix),
+            open,
+            html_escape(&child.name)
+        ));
+        html.push_str(&render_nav_dir(child, active_route, open_ancestors));
+        html.push_str("</details>");
+    }
+    for document in &dir.docs {
+        html.push_str(&render_nav_link(document, active_route));
+    }
+    html
 }
 
 fn nav_layout(config: &ServeConfig) -> NavLayout {
@@ -1225,7 +1337,15 @@ fn inject_serve_shell(
     if (currentMain && nextMain) currentMain.innerHTML = nextMain.innerHTML;
     const currentNav = document.querySelector('[data-markview-nav]');
     const nextNav = next.querySelector('[data-markview-nav]');
-    if (currentNav && nextNav) currentNav.innerHTML = nextNav.innerHTML;
+    if (currentNav && nextNav) {
+      const openDirs = new Set(
+        Array.from(currentNav.querySelectorAll('details[open]')).map((el) => el.dataset.markviewDir)
+      );
+      currentNav.innerHTML = nextNav.innerHTML;
+      currentNav.querySelectorAll('details').forEach((el) => {
+        if (openDirs.has(el.dataset.markviewDir)) el.open = true;
+      });
+    }
     const currentFooter = document.querySelector('footer');
     const nextFooter = next.querySelector('footer');
     if (currentFooter && nextFooter) currentFooter.innerHTML = nextFooter.innerHTML;
@@ -1348,6 +1468,43 @@ fn inject_serve_shell(
   background: var(--accent);
   color: var(--bg);
   font-weight: 600;
+}
+.markview-nav-dir {
+  margin: 0;
+}
+.markview-nav-dir > summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  padding: 0.5rem 0.7rem;
+  border-radius: 6px;
+  color: var(--muted);
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  user-select: none;
+}
+.markview-nav-dir > summary::-webkit-details-marker {
+  display: none;
+}
+.markview-nav-dir > summary::before {
+  content: "\25B8";
+  display: inline-block;
+  width: 1em;
+  margin-right: 0.3em;
+  transition: transform 0.15s ease;
+}
+.markview-nav-dir[open] > summary::before {
+  transform: rotate(90deg);
+}
+.markview-nav-dir > summary:hover {
+  background: var(--quote-bg);
+  color: var(--fg);
+}
+.markview-nav-dir > :not(summary) {
+  margin-left: 0.9rem;
 }
 @media (max-width: 700px) {
   .markview-shell {

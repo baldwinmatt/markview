@@ -466,6 +466,37 @@ fn serve_mode_recurse_discovers_nested_markdown_files_and_prefers_top_level_defa
 }
 
 #[test]
+fn serve_mode_recurse_groups_sidebar_nav_by_directory_and_auto_expands_active_path() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let guides = dir.path().join("guides");
+    let other = dir.path().join("other");
+    std::fs::create_dir(&guides).expect("guides dir");
+    std::fs::create_dir(&other).expect("other dir");
+    std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");
+    std::fs::write(guides.join("setup.md"), "# Setup\n").expect("write guides doc");
+    std::fs::write(other.join("misc.md"), "# Misc\n").expect("write other doc");
+    let mut server = ServeProcess::start_recursive_dir(dir.path());
+
+    let home = http_get(server.port, "/");
+    let setup = http_get(server.port, "/guides/setup.md");
+
+    // Nested documents are grouped under a collapsible <details> per directory.
+    assert!(home.contains(r#"<details class="markview-nav-dir" data-markview-dir="/guides">"#));
+    assert!(home.contains(r#"<details class="markview-nav-dir" data-markview-dir="/other">"#));
+    assert!(home.contains("<summary>guides</summary>"));
+    assert!(home.contains("<summary>other</summary>"));
+
+    // On the homepage neither directory is on the active path, so both start collapsed.
+    assert!(!home.contains(r#"data-markview-dir="/guides" open"#));
+    assert!(!home.contains(r#"data-markview-dir="/other" open"#));
+
+    // Viewing a document inside guides/ auto-expands just that directory.
+    assert!(setup.contains(r#"data-markview-dir="/guides" open"#));
+    assert!(!setup.contains(r#"data-markview-dir="/other" open"#));
+    server.stop();
+}
+
+#[test]
 fn serve_mode_recurse_skips_hidden_directories() {
     let dir = tempfile::tempdir().expect("temp dir");
     let hidden = dir.path().join(".git");

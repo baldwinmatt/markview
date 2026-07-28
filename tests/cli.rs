@@ -416,6 +416,27 @@ fn explicit_multi_file_serve_renders_navigation_and_defaults_to_first_input() {
 }
 
 #[test]
+fn explicit_multi_file_serve_does_not_force_rescan_reload_for_unserved_markdown() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let first = dir.path().join("first.md");
+    let second = dir.path().join("second.md");
+    let unserved = dir.path().join("unserved.md");
+    std::fs::write(&first, "# First\n").expect("write first");
+    std::fs::write(&second, "# Second\n").expect("write second");
+    let mut server = ServeProcess::start_with_files(&[first.as_path(), second.as_path()]);
+
+    assert!(http_get(server.port, "/unserved.md").contains("HTTP/1.1 404 Not Found"));
+    let mut reader = open_reload_stream(server.port);
+    std::fs::write(&unserved, "# Unserved\n").expect("write unserved");
+    let event = read_until(&mut reader, "data:", Duration::from_secs(5));
+
+    assert!(event.contains("data: reload"), "unexpected event stream: {event}");
+    assert!(!event.contains("data: rescan"), "unserved file forced a structural reload: {event}");
+    assert!(http_get(server.port, "/unserved.md").contains("HTTP/1.1 404 Not Found"));
+    server.stop();
+}
+
+#[test]
 fn directory_serve_selects_default_documents_and_ignores_nested_markdown() {
     let dir = tempfile::tempdir().expect("temp dir");
     let nested = dir.path().join("nested");

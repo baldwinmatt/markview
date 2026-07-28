@@ -76,7 +76,7 @@ struct ServeConfig {
     sidebar_nav: Option<NavDir>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ServedDocument {
     source_path: PathBuf,
     route_path: String,
@@ -817,8 +817,13 @@ fn handle_fs_event(
     let reload_kind = if needs_rescan {
         match ServeConfig::from_inputs(inputs.to_vec(), port, recurse) {
             Ok(fresh) => {
+                let reload_kind = if current.documents == fresh.documents {
+                    ReloadKind::Content
+                } else {
+                    ReloadKind::Structure
+                };
                 *shared.lock().expect("config lock") = Arc::new(fresh);
-                ReloadKind::Structure
+                reload_kind
             }
             Err(error) => {
                 eprintln!("markview: failed to rescan served directory: {error}");

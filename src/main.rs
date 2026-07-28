@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use markview::{
     help, render, repair_utf8_mojibake, Cli, FrontendRenderer, HtmlRenderer, MarkdownDocument,
@@ -138,6 +139,7 @@ impl ReloadKind {
 /// wholesale after a rescan (e.g. a Markdown file was added or removed under
 /// the served root) without connection threads ever seeing a torn read.
 type SharedConfig = Arc<Mutex<Arc<ServeConfig>>>;
+const WATCH_DEBOUNCE: Duration = Duration::from_millis(50);
 
 fn serve_markdown(
     inputs: Vec<PathBuf>,
@@ -773,42 +775,48 @@ fn watch_root(
 
     thread::spawn(move || {
         while let Ok(event) = changes_rx.recv() {
-            handle_fs_event(event, &shared, &clients, &inputs, port, recurse);
+            let mut events = vec![event];
+            while let Ok(event) = changes_rx.recv_timeout(WATCH_DEBOUNCE) {
+                events.push(event);
+            }
+            handle_fs_events(events, &shared, &clients, &inputs, port, recurse);
         }
     });
 
     Ok(watcher)
 }
 
-fn handle_fs_event(
-    event: notify::Event,
+fn handle_fs_events(
+    events: Vec<notify::Event>,
     shared: &SharedConfig,
     clients: &Arc<Mutex<Vec<mpsc::Sender<ReloadKind>>>>,
     inputs: &[PathBuf],
     port: u16,
     recurse: bool,
 ) {
-    if !is_reload_event(&event.kind) {
-        return;
-    }
-    let is_structural = matches!(
-        event.kind,
-        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
-    );
     let current = shared.lock().expect("config lock").clone();
     let mut relevant = false;
     let mut needs_rescan = false;
-    for event_path in &event.paths {
-        if !is_markdown_path(event_path) {
+    for event in events {
+        if !is_reload_event(&event.kind) {
             continue;
         }
-        relevant = true;
-        let known = current
-            .documents
-            .iter()
-            .any(|document| document.source_path == *event_path);
-        if !known || is_structural {
-            needs_rescan = true;
+        let is_structural = matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+        );
+        for event_path in &event.paths {
+            if !is_markdown_path(event_path) {
+                continue;
+            }
+            relevant = true;
+            let known = current
+                .documents
+                .iter()
+                .any(|document| document.source_path == *event_path);
+            if !known || is_structural {
+                needs_rescan = true;
+            }
         }
     }
     if !relevant {
@@ -836,7 +844,7 @@ fn rescan_and_reload(
 ) {
     let reload_kind = match ServeConfig::from_inputs(inputs, port, recurse) {
         Ok(fresh) => {
-            let reload_kind = if previous.documents == fresh.documents {
+            let reload_kind = if same_document_set(&previous.documents, &fresh.documents) {
                 ReloadKind::Content
             } else {
                 ReloadKind::Structure
@@ -859,6 +867,13 @@ fn broadcast_reload(
     if let Ok(mut clients) = clients.lock() {
         clients.retain(|client| client.send(reload_kind).is_ok());
     }
+}
+
+fn same_document_set(previous: &[ServedDocument], fresh: &[ServedDocument]) -> bool {
+    previous.len() == fresh.len()
+        && previous.iter().zip(fresh).all(|(previous, fresh)| {
+            previous.source_path == fresh.source_path && previous.route_path == fresh.route_path
+        })
 }
 
 fn is_reload_event(kind: &EventKind) -> bool {
@@ -1854,7 +1869,14 @@ mod serve_nav_tests {
         let input = dir.path().to_path_buf();
 
         std::thread::spawn(move || {
-            handle_fs_event(event, &shared_for_event, &clients_for_event, &[input], 0, true);
+            handle_fs_events(
+                vec![event],
+                &shared_for_event,
+                &clients_for_event,
+                &[input],
+                0,
+                true,
+            );
             done_tx.send(()).expect("send done");
         });
 
@@ -1863,6 +1885,44 @@ mod serve_nav_tests {
             "structural rescan blocked the watcher event handler"
         );
         std::fs::write(&fifo, "# Blocked\n").expect("unblock fifo reader");
+    }
+
+    #[test]
+    fn structural_event_bursts_share_one_rescan() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");
+        let config =
+            ServeConfig::from_inputs(vec![dir.path().to_path_buf()], 0, true).expect("config");
+        let shared = Arc::new(Mutex::new(Arc::new(config)));
+        let (client_tx, client_rx) = mpsc::channel();
+        let clients = Arc::new(Mutex::new(vec![client_tx]));
+        let one = dir.path().join("one.md");
+        let two = dir.path().join("two.md");
+        std::fs::write(&one, "# One\n").expect("write one");
+        std::fs::write(&two, "# Two\n").expect("write two");
+        let events = vec![
+            notify::Event {
+                kind: EventKind::Create(notify::event::CreateKind::File),
+                paths: vec![one],
+                attrs: notify::event::EventAttributes::new(),
+            },
+            notify::Event {
+                kind: EventKind::Create(notify::event::CreateKind::File),
+                paths: vec![two],
+                attrs: notify::event::EventAttributes::new(),
+            },
+        ];
+
+        handle_fs_events(events, &shared, &clients, &[dir.path().to_path_buf()], 0, true);
+
+        assert_eq!(
+            client_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(ReloadKind::Structure)
+        );
+        assert!(
+            client_rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            "burst emitted more than one reload notification"
+        );
     }
 
     fn served_doc(route_path: &str) -> ServedDocument {

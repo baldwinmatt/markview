@@ -669,6 +669,29 @@ fn serve_mode_directory_rescans_when_a_new_top_level_file_is_created() {
     server.stop();
 }
 
+#[test]
+fn serve_mode_directory_uses_content_reload_when_added_file_keeps_sidebar_layout() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");
+    std::fs::write(dir.path().join("notes.md"), "# Notes\n").expect("write notes");
+    let mut server = ServeProcess::start_dir(dir.path());
+
+    let before = http_get(server.port, "/");
+    assert!(before.contains(r#"class="markview-sidebar""#));
+    assert!(before.contains(r#"href="/notes.md""#));
+    assert!(http_get(server.port, "/extra.md").contains("HTTP/1.1 404 Not Found"));
+
+    let mut reader = open_reload_stream(server.port);
+    std::fs::write(dir.path().join("extra.md"), "# Extra\n").expect("write extra");
+    let event = read_until(&mut reader, "data:", Duration::from_secs(5));
+
+    assert!(event.contains("data: reload"), "unexpected event stream: {event}");
+    assert!(!event.contains("data: rescan"), "unchanged nav layout forced full reload: {event}");
+    let after = http_get(server.port, "/");
+    assert!(after.contains(r#"href="/extra.md""#));
+    server.stop();
+}
+
 #[cfg(unix)]
 #[test]
 fn serve_mode_recurse_ignores_invalid_rescan_and_keeps_serving() {

@@ -844,7 +844,7 @@ fn rescan_and_reload(
 ) {
     let reload_kind = match ServeConfig::from_inputs(inputs, port, recurse) {
         Ok(fresh) => {
-            let reload_kind = if same_document_set(&previous.documents, &fresh.documents) {
+            let reload_kind = if nav_layout(&previous) == nav_layout(&fresh) {
                 ReloadKind::Content
             } else {
                 ReloadKind::Structure
@@ -867,13 +867,6 @@ fn broadcast_reload(
     if let Ok(mut clients) = clients.lock() {
         clients.retain(|client| client.send(reload_kind).is_ok());
     }
-}
-
-fn same_document_set(previous: &[ServedDocument], fresh: &[ServedDocument]) -> bool {
-    previous.len() == fresh.len()
-        && previous.iter().zip(fresh).all(|(previous, fresh)| {
-            previous.source_path == fresh.source_path && previous.route_path == fresh.route_path
-        })
 }
 
 fn is_reload_event(kind: &EventKind) -> bool {

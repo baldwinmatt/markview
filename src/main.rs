@@ -72,6 +72,7 @@ struct ServeConfig {
     default_document: PathBuf,
     port: u16,
     mode: ServeMode,
+    sidebar_nav: Option<NavDir>,
 }
 
 #[derive(Debug, Clone)]
@@ -180,12 +181,15 @@ impl ServeConfig {
         } else {
             Self::explicit_files(&inputs)?
         };
+        let layout = nav_layout_for(build.mode, build.documents.len());
+        let sidebar_nav = (layout == NavLayout::Sidebar).then(|| NavDir::build(&build.documents));
         let config = Self {
             root: build.root,
             documents: build.documents,
             default_document: build.default_document,
             port,
             mode: build.mode,
+            sidebar_nav,
         };
         Ok(config)
     }
@@ -1138,9 +1142,12 @@ fn render_nav(config: &ServeConfig, active_route: &str) -> String {
         NavLayout::Sidebar => "markview-sidebar",
     };
     let links = if layout == NavLayout::Sidebar {
-        let tree = NavDir::build(&config.documents);
         let open_ancestors = active_ancestor_prefixes(active_route);
-        render_nav_dir(&tree, active_route, &open_ancestors)
+        config
+            .sidebar_nav
+            .as_ref()
+            .map(|tree| render_nav_dir(tree, &config.documents, active_route, &open_ancestors))
+            .unwrap_or_default()
     } else {
         render_nav_flat(&config.documents, active_route)
     };
@@ -1175,14 +1182,15 @@ fn render_nav_link(document: &ServedDocument, active_route: &str) -> String {
 /// path to this directory (e.g. `/sub/deep`), used both as a stable open/
 /// closed key (see the reload script in `inject_serve_shell`) and to decide
 /// which directories sit on the path to the active document.
-struct NavDir<'a> {
+#[derive(Debug, Clone)]
+struct NavDir {
     name: String,
     prefix: String,
-    dirs: Vec<NavDir<'a>>,
-    docs: Vec<&'a ServedDocument>,
+    dirs: Vec<NavDir>,
+    docs: Vec<usize>,
 }
 
-impl<'a> NavDir<'a> {
+impl NavDir {
     fn new(name: String, prefix: String) -> Self {
         Self {
             name,
@@ -1192,23 +1200,23 @@ impl<'a> NavDir<'a> {
         }
     }
 
-    fn build(documents: &'a [ServedDocument]) -> Self {
+    fn build(documents: &[ServedDocument]) -> Self {
         let mut root = Self::new(String::new(), String::new());
-        for document in documents {
+        for (index, document) in documents.iter().enumerate() {
             let segments = document
                 .route_path
                 .trim_start_matches('/')
                 .split('/')
                 .collect::<Vec<_>>();
-            root.insert(&segments, document);
+            root.insert(&segments, index);
         }
-        root.sort();
+        root.sort(documents);
         root
     }
 
-    fn insert(&mut self, segments: &[&str], document: &'a ServedDocument) {
+    fn insert(&mut self, segments: &[&str], document_index: usize) {
         match segments {
-            [] | [_] => self.docs.push(document),
+            [] | [_] => self.docs.push(document_index),
             [first, rest @ ..] => {
                 let position = self.dirs.iter().position(|dir| dir.name == *first);
                 let index = position.unwrap_or_else(|| {
@@ -1218,16 +1226,17 @@ impl<'a> NavDir<'a> {
                     self.dirs.push(Self::new(child_name, child_prefix));
                     self.dirs.len() - 1
                 });
-                self.dirs[index].insert(rest, document);
+                self.dirs[index].insert(rest, document_index);
             }
         }
     }
 
-    fn sort(&mut self) {
+    fn sort(&mut self, documents: &[ServedDocument]) {
         self.dirs.sort_by(|a, b| a.name.cmp(&b.name));
-        self.docs.sort_by(|a, b| a.route_path.cmp(&b.route_path));
+        self.docs
+            .sort_by(|a, b| documents[*a].route_path.cmp(&documents[*b].route_path));
         for dir in &mut self.dirs {
-            dir.sort();
+            dir.sort(documents);
         }
     }
 }
@@ -1251,7 +1260,12 @@ fn active_ancestor_prefixes(active_route: &str) -> Vec<String> {
     prefixes
 }
 
-fn render_nav_dir(dir: &NavDir, active_route: &str, open_ancestors: &[String]) -> String {
+fn render_nav_dir(
+    dir: &NavDir,
+    documents: &[ServedDocument],
+    active_route: &str,
+    open_ancestors: &[String],
+) -> String {
     let mut html = String::new();
     for child in &dir.dirs {
         let open = if open_ancestors.iter().any(|prefix| prefix == &child.prefix) {
@@ -1265,19 +1279,28 @@ fn render_nav_dir(dir: &NavDir, active_route: &str, open_ancestors: &[String]) -
             open,
             html_escape(&child.name)
         ));
-        html.push_str(&render_nav_dir(child, active_route, open_ancestors));
+        html.push_str(&render_nav_dir(
+            child,
+            documents,
+            active_route,
+            open_ancestors,
+        ));
         html.push_str("</details>");
     }
-    for document in &dir.docs {
-        html.push_str(&render_nav_link(document, active_route));
+    for document_index in &dir.docs {
+        html.push_str(&render_nav_link(&documents[*document_index], active_route));
     }
     html
 }
 
 fn nav_layout(config: &ServeConfig) -> NavLayout {
-    if config.documents.len() <= 1 {
+    nav_layout_for(config.mode, config.documents.len())
+}
+
+fn nav_layout_for(mode: ServeMode, document_count: usize) -> NavLayout {
+    if document_count <= 1 {
         NavLayout::Empty
-    } else if config.mode != ServeMode::Directory && config.documents.len() <= 6 {
+    } else if mode != ServeMode::Directory && document_count <= 6 {
         NavLayout::Tabs
     } else {
         NavLayout::Sidebar
@@ -1645,4 +1668,23 @@ fn write_404(stream: &mut TcpStream, head_only: bool) -> io::Result<()> {
         "Not found",
         head_only,
     )
+}
+
+#[cfg(test)]
+mod serve_nav_tests {
+    use super::*;
+
+    #[test]
+    fn directory_serve_config_precomputes_sidebar_nav_tree() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let guides = dir.path().join("guides");
+        std::fs::create_dir(&guides).expect("guides dir");
+        std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");
+        std::fs::write(guides.join("setup.md"), "# Setup\n").expect("write setup");
+
+        let config = ServeConfig::from_inputs(vec![dir.path().to_path_buf()], 0, true)
+            .expect("serve config");
+
+        assert!(config.sidebar_nav.is_some());
+    }
 }

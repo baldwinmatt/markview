@@ -458,7 +458,7 @@ impl Cli {
                     options.width = parse_width(value)?;
                 }
                 _ if arg.starts_with("--serve=") => {
-                    return Err(CliError::UnknownArgument(arg));
+                    return Err(CliError::LegacyServePortForm);
                 }
                 _ if arg.starts_with('-') => return Err(CliError::UnknownArgument(arg)),
                 _ => inputs.push(arg),
@@ -1983,6 +1983,14 @@ mod tests {
     fn rejects_legacy_serve_port_form() {
         assert_eq!(
             Cli::parse(["--serve", "8080", "README.md"]).expect_err("legacy serve port form"),
+            CliError::LegacyServePortForm
+        );
+    }
+
+    #[test]
+    fn rejects_legacy_serve_equals_port_form_with_migration_message() {
+        assert_eq!(
+            Cli::parse(["--serve=8080", "README.md"]).expect_err("legacy serve=port form"),
             CliError::LegacyServePortForm
         );
     }

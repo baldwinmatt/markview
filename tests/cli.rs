@@ -523,6 +523,33 @@ fn serve_mode_recurse_groups_sidebar_nav_by_directory_and_auto_expands_active_pa
 }
 
 #[test]
+fn serve_mode_recurse_expands_sidebar_nav_multiple_levels_deep() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let guides = dir.path().join("guides");
+    let deep = guides.join("deep");
+    let other = dir.path().join("other");
+    std::fs::create_dir_all(&deep).expect("deep guides dir");
+    std::fs::create_dir(&other).expect("other dir");
+    std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");
+    std::fs::write(deep.join("setup.md"), "# Setup\n").expect("write deep setup");
+    std::fs::write(other.join("misc.md"), "# Misc\n").expect("write other doc");
+    let mut server = ServeProcess::start_recursive_dir(dir.path());
+
+    let home = http_get(server.port, "/");
+    let setup = http_get(server.port, "/guides/deep/setup.md");
+
+    assert!(home.contains(r#"data-markview-dir="/guides""#));
+    assert!(home.contains(r#"data-markview-dir="/guides/deep""#));
+    assert!(!home.contains(r#"data-markview-dir="/guides" open"#));
+    assert!(!home.contains(r#"data-markview-dir="/guides/deep" open"#));
+
+    assert!(setup.contains(r#"data-markview-dir="/guides" open"#));
+    assert!(setup.contains(r#"data-markview-dir="/guides/deep" open"#));
+    assert!(!setup.contains(r#"data-markview-dir="/other" open"#));
+    server.stop();
+}
+
+#[test]
 fn serve_mode_recurse_skips_hidden_directories() {
     let dir = tempfile::tempdir().expect("temp dir");
     let hidden = dir.path().join(".git");

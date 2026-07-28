@@ -4,7 +4,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -138,7 +138,7 @@ impl ReloadKind {
 /// The active `ServeConfig`, swappable so the file watcher can replace it
 /// wholesale after a rescan (e.g. a Markdown file was added or removed under
 /// the served root) without connection threads ever seeing a torn read.
-type SharedConfig = Arc<Mutex<Arc<ServeConfig>>>;
+type SharedConfig = Arc<RwLock<Arc<ServeConfig>>>;
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(50);
 
 fn serve_markdown(
@@ -158,7 +158,7 @@ fn serve_markdown(
     config.port = address.port();
     let bound_port = config.port;
     let clients = Arc::new(Mutex::new(Vec::new()));
-    let shared: SharedConfig = Arc::new(Mutex::new(Arc::new(config)));
+    let shared: SharedConfig = Arc::new(RwLock::new(Arc::new(config)));
     let _watcher = watch_root(shared.clone(), inputs, bound_port, recurse, clients.clone())?;
 
     println!(
@@ -173,7 +173,7 @@ fn serve_markdown(
                 let shared = shared.clone();
                 let clients = clients.clone();
                 thread::spawn(move || {
-                    let config = shared.lock().expect("config lock").clone();
+                    let config = shared.read().expect("config lock").clone();
                     if let Err(error) = handle_connection(stream, &config, clients) {
                         eprintln!("markview: serve error: {error}");
                     }
@@ -752,7 +752,7 @@ fn watch_root(
     clients: Arc<Mutex<Vec<mpsc::Sender<ReloadKind>>>>,
 ) -> notify::Result<RecommendedWatcher> {
     let (root, mode) = {
-        let config = shared.lock().expect("config lock");
+        let config = shared.read().expect("config lock");
         (config.root.clone(), config.mode)
     };
     let watch_mode = match mode {
@@ -794,7 +794,7 @@ fn handle_fs_events(
     port: u16,
     recurse: bool,
 ) {
-    let current = shared.lock().expect("config lock").clone();
+    let current = shared.read().expect("config lock").clone();
     let mut relevant = false;
     let mut needs_rescan = false;
     for event in events {
@@ -849,7 +849,7 @@ fn rescan_and_reload(
             } else {
                 ReloadKind::Structure
             };
-            *shared.lock().expect("config lock") = Arc::new(fresh);
+            *shared.write().expect("config lock") = Arc::new(fresh);
             reload_kind
         }
         Err(error) => {
@@ -1843,7 +1843,7 @@ mod serve_nav_tests {
         std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");
         let config =
             ServeConfig::from_inputs(vec![dir.path().to_path_buf()], 0, true).expect("config");
-        let shared = Arc::new(Mutex::new(Arc::new(config)));
+        let shared: SharedConfig = Arc::new(RwLock::new(Arc::new(config)));
         let clients = Arc::new(Mutex::new(Vec::new()));
         let fifo = dir.path().join("blocked.md");
         let status = std::process::Command::new("mkfifo")
@@ -1886,7 +1886,7 @@ mod serve_nav_tests {
         std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");
         let config =
             ServeConfig::from_inputs(vec![dir.path().to_path_buf()], 0, true).expect("config");
-        let shared = Arc::new(Mutex::new(Arc::new(config)));
+        let shared: SharedConfig = Arc::new(RwLock::new(Arc::new(config)));
         let (client_tx, client_rx) = mpsc::channel();
         let clients = Arc::new(Mutex::new(vec![client_tx]));
         let one = dir.path().join("one.md");
@@ -1916,6 +1916,22 @@ mod serve_nav_tests {
             client_rx.recv_timeout(Duration::from_millis(250)).is_err(),
             "burst emitted more than one reload notification"
         );
+    }
+
+    #[test]
+    fn shared_config_allows_concurrent_snapshot_readers() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");
+        let config =
+            ServeConfig::from_inputs(vec![dir.path().to_path_buf()], 0, false).expect("config");
+        let shared: SharedConfig = Arc::new(RwLock::new(Arc::new(config)));
+
+        let first = shared.read().expect("first read lock");
+        let second = shared
+            .try_read()
+            .expect("second read lock should not block another reader");
+
+        assert_eq!(first.default_document, second.default_document);
     }
 
     fn served_doc(route_path: &str) -> ServedDocument {

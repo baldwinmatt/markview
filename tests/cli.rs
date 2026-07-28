@@ -753,6 +753,31 @@ fn serve_mode_preserves_multibyte_utf8_prose_when_rewriting_links() {
 }
 
 #[test]
+fn serve_mode_rewrites_links_with_parenthesized_titles() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let first = dir.path().join("README.md");
+    let second = dir.path().join("notes.md");
+    std::fs::write(
+        &first,
+        "# Doc\n\nSee [Details](notes.md \"See (details)\") for background.\n",
+    )
+    .expect("write readme");
+    std::fs::write(&second, "# Notes\n").expect("write notes");
+    let mut server = ServeProcess::start_with_files(&[first.as_path(), second.as_path()]);
+
+    let response = http_get(server.port, "/");
+
+    // Check the inline link specifically (by pairing it with its title attribute),
+    // not just for "/notes.md" anywhere in the page — the nav bar always links to
+    // every served document correctly regardless of this bug.
+    assert!(
+        response.contains(r#"href="/notes.md" title="See (details)""#),
+        "titled link destination was not rewritten to the served route:\n{response}"
+    );
+    server.stop();
+}
+
+#[test]
 fn serve_mode_does_not_rewrite_footnote_definitions_as_link_references() {
     let dir = tempfile::tempdir().expect("temp dir");
     let first = dir.path().join("README.md");

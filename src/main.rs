@@ -968,13 +968,15 @@ fn rewrite_inline_markdown_links(
             index += ch_len;
             continue;
         };
-        let destination = &line[destination_start..destination_end];
+        let content = &line[destination_start..destination_end];
+        let (destination, title) = split_destination_and_title(content);
         output.push_str("](");
         if let Some(target) = rewritten_reference(config, served, destination) {
             output.push_str(&target);
         } else {
             output.push_str(destination);
         }
+        output.push_str(title);
         output.push(')');
         index = destination_end + 1;
     }
@@ -1013,6 +1015,7 @@ fn rewrite_reference_definition(
 
 fn find_link_destination_end(line: &str, start: usize) -> Option<usize> {
     let mut escaped = false;
+    let mut quote: Option<char> = None;
     for (offset, ch) in line[start..].char_indices() {
         if escaped {
             escaped = false;
@@ -1022,11 +1025,43 @@ fn find_link_destination_end(line: &str, start: usize) -> Option<usize> {
             escaped = true;
             continue;
         }
+        if let Some(open) = quote {
+            if ch == open {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+            continue;
+        }
         if ch == ')' {
             return Some(start + offset);
         }
     }
     None
+}
+
+/// Splits a link's `(destination title)` content on the first unescaped
+/// whitespace, so a title (e.g. `"See (details)"`) — including any parens it
+/// contains — is kept intact and untouched rather than treated as part of the
+/// destination path.
+fn split_destination_and_title(content: &str) -> (&str, &str) {
+    let mut escaped = false;
+    for (offset, ch) in content.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch.is_whitespace() {
+            return (&content[..offset], &content[offset..]);
+        }
+    }
+    (content, "")
 }
 
 fn rewritten_reference(

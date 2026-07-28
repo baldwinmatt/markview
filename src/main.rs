@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -1187,6 +1188,7 @@ struct NavDir {
     name: String,
     prefix: String,
     dirs: Vec<NavDir>,
+    child_indexes: HashMap<String, usize>,
     docs: Vec<usize>,
 }
 
@@ -1196,6 +1198,7 @@ impl NavDir {
             name,
             prefix,
             dirs: Vec::new(),
+            child_indexes: HashMap::new(),
             docs: Vec::new(),
         }
     }
@@ -1214,12 +1217,13 @@ impl NavDir {
         match segments {
             [] | [_] => self.docs.push(document_index),
             [first, rest @ ..] => {
-                let position = self.dirs.iter().position(|dir| dir.name == *first);
-                let index = position.unwrap_or_else(|| {
+                let index = self.child_indexes.get(*first).copied().unwrap_or_else(|| {
                     let child_prefix = format!("{}/{first}", self.prefix);
                     let child_name = percent_decode(first).unwrap_or_else(|| (*first).to_owned());
+                    let index = self.dirs.len();
                     self.dirs.push(Self::new(child_name, child_prefix));
-                    self.dirs.len() - 1
+                    self.child_indexes.insert((*first).to_owned(), index);
+                    index
                 });
                 self.dirs[index].insert(rest, document_index);
             }
@@ -1698,5 +1702,28 @@ mod serve_nav_tests {
             route_path_segments("//sub///readme.md"),
             vec!["sub", "readme.md"]
         );
+    }
+
+    #[test]
+    fn nav_dir_tracks_child_dirs_by_segment_name() {
+        let documents = vec![
+            served_doc("/zeta/one.md"),
+            served_doc("/alpha/two.md"),
+            served_doc("/zeta/three.md"),
+        ];
+
+        let tree = NavDir::build(&documents);
+
+        assert!(tree.child_indexes.contains_key("zeta"));
+        assert!(tree.child_indexes.contains_key("alpha"));
+        assert_eq!(tree.dirs.len(), 2);
+    }
+
+    fn served_doc(route_path: &str) -> ServedDocument {
+        ServedDocument {
+            source_path: PathBuf::from(route_path.trim_start_matches('/')),
+            route_path: route_path.to_owned(),
+            title: route_path.to_owned(),
+        }
     }
 }

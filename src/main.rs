@@ -990,7 +990,7 @@ fn rewrite_reference_definition(
     let Some((label, rest)) = line.split_once("]:") else {
         return line.to_owned();
     };
-    if !label.starts_with('[') {
+    if !label.starts_with('[') || label.starts_with("[^") {
         return line.to_owned();
     }
     let leading = rest.len() - rest.trim_start().len();

@@ -752,6 +752,32 @@ fn serve_mode_preserves_multibyte_utf8_prose_when_rewriting_links() {
     server.stop();
 }
 
+#[test]
+fn serve_mode_does_not_rewrite_footnote_definitions_as_link_references() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let first = dir.path().join("README.md");
+    let second = dir.path().join("notes.md");
+    std::fs::write(
+        &first,
+        "# Doc\n\nSee the footnote[^1] for background.\n\n[^1]: notes.md has more information.\n",
+    )
+    .expect("write readme");
+    std::fs::write(&second, "# Notes\n").expect("write notes");
+    let mut server = ServeProcess::start_with_files(&[first.as_path(), second.as_path()]);
+
+    let response = http_get(server.port, "/");
+
+    assert!(
+        response.contains("notes.md has more information."),
+        "footnote body text is missing entirely:\n{response}"
+    );
+    assert!(
+        !response.contains("/notes.md has more information."),
+        "footnote body was rewritten as if it were a link reference definition:\n{response}"
+    );
+    server.stop();
+}
+
 struct ServeProcess {
     child: Child,
     port: u16,

@@ -6,7 +6,10 @@ use std::process::ExitCode;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
-use markview::{help, render, Cli, FrontendRenderer, HtmlRenderer, MarkdownDocument, OutputFormat};
+use markview::{
+    help, render, repair_utf8_mojibake, Cli, FrontendRenderer, HtmlRenderer, MarkdownDocument,
+    OutputFormat,
+};
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use pulldown_cmark::{Event, Options, Parser, Tag};
 
@@ -1435,48 +1438,6 @@ fn title_for_source(path: &Path, source: &str) -> String {
             .to_owned()
     });
     repair_utf8_mojibake(&title)
-}
-
-fn repair_utf8_mojibake(value: &str) -> String {
-    let mut repaired = value.to_owned();
-    for _ in 0..3 {
-        let mapped = replace_windows_1252_mojibake(&repaired);
-        let decoded = decode_latin1_mojibake(&mapped).unwrap_or_else(|| mapped.clone());
-        if decoded == repaired {
-            return decoded;
-        }
-        repaired = decoded;
-    }
-    repaired
-}
-
-fn replace_windows_1252_mojibake(value: &str) -> String {
-    let replacements = [
-        ("\u{00E2}\u{20AC}\u{201D}", "—"),
-        ("\u{00E2}\u{20AC}\u{201C}", "–"),
-        ("\u{00E2}\u{20AC}\u{02DC}", "‘"),
-        ("\u{00E2}\u{20AC}\u{2122}", "’"),
-        ("\u{00E2}\u{20AC}\u{0153}", "“"),
-        ("\u{00E2}\u{20AC}\u{009D}", "”"),
-        ("\u{00E2}\u{20AC}\u{00A6}", "…"),
-    ];
-    let mut repaired = value.to_owned();
-    for (bad, good) in replacements {
-        repaired = repaired.replace(bad, good);
-    }
-    repaired
-}
-
-fn decode_latin1_mojibake(value: &str) -> Option<String> {
-    let mut bytes = Vec::with_capacity(value.len());
-    for ch in value.chars() {
-        let codepoint = ch as u32;
-        if codepoint > u8::MAX as u32 {
-            return None;
-        }
-        bytes.push(codepoint as u8);
-    }
-    String::from_utf8(bytes).ok()
 }
 
 fn write_response(

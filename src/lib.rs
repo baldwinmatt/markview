@@ -1039,7 +1039,7 @@ fn render_document_model(document: &MarkdownDocument) -> RenderedDocument {
     }
 }
 
-fn repair_utf8_mojibake(value: &str) -> String {
+pub fn repair_utf8_mojibake(value: &str) -> String {
     let mut repaired = value.to_owned();
     for _ in 0..3 {
         let mapped = replace_windows_1252_mojibake(&repaired);

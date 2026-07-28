@@ -465,7 +465,7 @@ impl Cli {
             }
         }
 
-        if saw_serve && inputs.first().is_some_and(|input| is_numeric(input)) {
+        if saw_serve && inputs.len() > 1 && inputs.first().is_some_and(|input| is_numeric(input)) {
             return Err(CliError::LegacyServePortForm);
         }
 
@@ -1985,6 +1985,17 @@ mod tests {
             Cli::parse(["--serve", "8080", "README.md"]).expect_err("legacy serve port form"),
             CliError::LegacyServePortForm
         );
+    }
+
+    #[test]
+    fn accepts_single_numeric_named_serve_input() {
+        // "2024" is a single positional argument (e.g. a directory named "2024"),
+        // not the legacy `--serve PORT FILE` two-argument form, and must not be
+        // misdetected as one just because it happens to be all-digits.
+        let cli = Cli::parse(["--serve", "2024"]).expect("valid serve args");
+
+        assert_eq!(cli.inputs, vec!["2024"]);
+        assert_eq!(cli.serve, Some(DEFAULT_SERVE_PORT));
     }
 
     #[test]

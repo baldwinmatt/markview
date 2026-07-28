@@ -283,14 +283,24 @@ fn serve_mode_accepts_port_flag_and_rejects_legacy_port_form() {
         .stderr(predicate::str::contains(
             "replaced by `--serve FILE --port PORT`",
         ));
+}
 
-    let mut cmd = Command::cargo_bin("markview").expect("binary");
-    cmd.args(["--serve", "8080"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "replaced by `--serve FILE --port PORT`",
-        ));
+#[test]
+fn serve_mode_accepts_single_numeric_named_input_without_legacy_rejection() {
+    // A single all-digits *argument string* after --serve (no second positional
+    // arg) is ambiguous with a real file/directory that happens to be named e.g.
+    // "2024" — unlike the two-argument `--serve PORT FILE` legacy form, it must
+    // not be rejected with the legacy-form migration message. The argument has to
+    // be passed as a bare relative name (not an absolute temp-dir path) so the
+    // literal CLI argument string is actually all-digits.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let numbered_dir = dir.path().join("2024");
+    std::fs::create_dir(&numbered_dir).expect("create numbered dir");
+    std::fs::write(numbered_dir.join("README.md"), "# 2024 Notes\n").expect("write readme");
+
+    let mut server = ServeProcess::start_relative(dir.path(), "2024");
+    assert!(http_get(server.port, "/").contains(r#"<h1 id="2024-notes">2024 Notes</h1>"#));
+    server.stop();
 }
 
 #[test]
@@ -762,15 +772,25 @@ impl ServeProcess {
     }
 
     fn start_recursive_dir(directory: &std::path::Path) -> Self {
-        Self::start_with_env(&[directory], unused_port(), false, true)
+        Self::start_with_env(&[directory], unused_port(), false, true, None)
     }
 
     fn start_with_args(inputs: &[&std::path::Path], port: u16) -> Self {
-        Self::start_with_env(inputs, port, false, false)
+        Self::start_with_env(inputs, port, false, false, None)
     }
 
     fn start_with_disconnect_logging(file: &std::path::Path) -> Self {
-        Self::start_with_env(&[file], unused_port(), true, false)
+        Self::start_with_env(&[file], unused_port(), true, false, None)
+    }
+
+    fn start_relative(cwd: &std::path::Path, relative_input: &str) -> Self {
+        Self::start_with_env(
+            &[std::path::Path::new(relative_input)],
+            unused_port(),
+            false,
+            false,
+            Some(cwd),
+        )
     }
 
     fn start_with_env(
@@ -778,10 +798,11 @@ impl ServeProcess {
         port: u16,
         log_disconnects: bool,
         recurse: bool,
+        cwd: Option<&std::path::Path>,
     ) -> Self {
         for attempt in 0..5 {
             let port = if attempt == 0 { port } else { unused_port() };
-            match Self::try_start_with_env(inputs, port, log_disconnects, recurse) {
+            match Self::try_start_with_env(inputs, port, log_disconnects, recurse, cwd) {
                 Ok(server) => return server,
                 Err(message) if attempt < 4 && message.contains("already in use") => continue,
                 Err(message) => panic!("{message}"),
@@ -795,6 +816,7 @@ impl ServeProcess {
         port: u16,
         log_disconnects: bool,
         recurse: bool,
+        cwd: Option<&std::path::Path>,
     ) -> Result<Self, String> {
         let mut cmd = std::process::Command::new(cargo_bin("markview"));
         cmd.arg("--serve");
@@ -803,6 +825,9 @@ impl ServeProcess {
         }
         if recurse {
             cmd.arg("--recurse");
+        }
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
         }
         cmd.args(["--port", &port.to_string()])
             .stdout(Stdio::piped())

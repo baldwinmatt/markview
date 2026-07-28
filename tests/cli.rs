@@ -637,6 +637,30 @@ fn serve_mode_recurse_rescans_when_a_served_file_is_renamed_away_from_markdown()
 }
 
 #[test]
+fn serve_mode_recurse_rescans_when_a_served_file_is_deleted() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let stale = dir.path().join("stale.md");
+    std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");
+    std::fs::write(dir.path().join("other.md"), "# Other\n").expect("write other doc");
+    std::fs::write(&stale, "# Stale\n").expect("write stale doc");
+    let mut server = ServeProcess::start_recursive_dir(dir.path());
+
+    assert!(http_get(server.port, "/").contains(r#"href="/stale.md""#));
+    assert!(http_get(server.port, "/stale.md").contains(r#"<h1 id="stale">Stale</h1>"#));
+
+    let mut reader = open_reload_stream(server.port);
+    std::fs::remove_file(&stale).expect("delete stale doc");
+    let event = read_until(&mut reader, "data:", Duration::from_secs(5));
+
+    assert!(event.contains("data: reload"), "unexpected event stream: {event}");
+    assert!(!event.contains("data: rescan"), "unchanged nav layout forced full reload: {event}");
+    let after = http_get(server.port, "/");
+    assert!(!after.contains(r#"href="/stale.md""#), "stale nav link remained:\n{after}");
+    assert!(http_get(server.port, "/stale.md").contains("HTTP/1.1 404 Not Found"));
+    server.stop();
+}
+
+#[test]
 fn serve_mode_directory_rescans_when_a_new_top_level_file_is_created() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");

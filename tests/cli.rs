@@ -419,6 +419,98 @@ fn directory_serve_selects_default_documents_and_ignores_nested_markdown() {
 }
 
 #[test]
+fn serve_mode_recurse_discovers_nested_markdown_files_and_prefers_top_level_default() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let nested = dir.path().join("nested");
+    std::fs::create_dir(&nested).expect("nested dir");
+    std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");
+    std::fs::write(nested.join("README.md"), "# Guides Home\n").expect("write nested readme");
+    std::fs::write(nested.join("setup.md"), "# Setup\n").expect("write nested doc");
+    let mut server = ServeProcess::start_recursive_dir(dir.path());
+
+    let home = http_get(server.port, "/");
+    let nested_readme = http_get(server.port, "/nested/README.md");
+    let nested_setup = http_get(server.port, "/nested/setup.md");
+
+    assert!(home.contains(r#"<h1 id="home">Home</h1>"#));
+    assert!(home.contains(r#"href="/nested/README.md""#));
+    assert!(home.contains(r#"href="/nested/setup.md""#));
+    assert!(nested_readme.contains(r#"<h1 id="guides-home">Guides Home</h1>"#));
+    assert!(nested_setup.contains(r#"<h1 id="setup">Setup</h1>"#));
+    server.stop();
+}
+
+#[test]
+fn serve_mode_recurse_skips_hidden_directories() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let hidden = dir.path().join(".git");
+    std::fs::create_dir(&hidden).expect("hidden dir");
+    std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");
+    std::fs::write(hidden.join("notes.md"), "# Should Not Serve\n").expect("write hidden doc");
+    let mut server = ServeProcess::start_recursive_dir(dir.path());
+
+    assert!(http_get(server.port, "/").contains(r#"<h1 id="home">Home</h1>"#));
+    assert!(http_get(server.port, "/.git/notes.md").contains("HTTP/1.1 404 Not Found"));
+    server.stop();
+}
+
+#[test]
+fn serve_mode_rejects_recurse_without_serve() {
+    let mut cmd = Command::cargo_bin("markview").expect("binary");
+    cmd.args(["--recurse", "README.md"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown argument: --recurse"));
+}
+
+#[test]
+fn serve_mode_rejects_recurse_with_non_directory_input() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let one = dir.path().join("one.md");
+    let two = dir.path().join("two.md");
+    std::fs::write(&one, "# One\n").expect("write one");
+    std::fs::write(&two, "# Two\n").expect("write two");
+
+    let mut cmd = Command::cargo_bin("markview").expect("binary");
+    cmd.args(["--serve", "--recurse"])
+        .arg(&one)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--recurse requires a single served directory",
+        ));
+
+    let mut cmd = Command::cargo_bin("markview").expect("binary");
+    cmd.args(["--serve", "--recurse"])
+        .arg(&one)
+        .arg(&two)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--recurse requires a single served directory",
+        ));
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_mode_recurse_does_not_follow_symlinked_directories() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let nested = dir.path().join("nested");
+    std::fs::create_dir(&nested).expect("nested dir");
+    std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");
+    std::fs::write(nested.join("inner.md"), "# Inner\n").expect("write nested doc");
+    symlink(dir.path(), nested.join("loop")).expect("symlink cycle back to root");
+
+    let mut server = ServeProcess::start_recursive_dir(dir.path());
+
+    assert!(http_get(server.port, "/").contains(r#"<h1 id="home">Home</h1>"#));
+    assert!(http_get(server.port, "/nested/inner.md").contains(r#"<h1 id="inner">Inner</h1>"#));
+    server.stop();
+}
+
+#[test]
 fn directory_serve_loads_referenced_assets_but_not_unreferenced_files() {
     let dir = tempfile::tempdir().expect("temp dir");
     let assets = dir.path().join("assets");
@@ -641,18 +733,27 @@ impl ServeProcess {
         Self::start_with_args(&[directory], unused_port())
     }
 
+    fn start_recursive_dir(directory: &std::path::Path) -> Self {
+        Self::start_with_env(&[directory], unused_port(), false, true)
+    }
+
     fn start_with_args(inputs: &[&std::path::Path], port: u16) -> Self {
-        Self::start_with_env(inputs, port, false)
+        Self::start_with_env(inputs, port, false, false)
     }
 
     fn start_with_disconnect_logging(file: &std::path::Path) -> Self {
-        Self::start_with_env(&[file], unused_port(), true)
+        Self::start_with_env(&[file], unused_port(), true, false)
     }
 
-    fn start_with_env(inputs: &[&std::path::Path], port: u16, log_disconnects: bool) -> Self {
+    fn start_with_env(
+        inputs: &[&std::path::Path],
+        port: u16,
+        log_disconnects: bool,
+        recurse: bool,
+    ) -> Self {
         for attempt in 0..5 {
             let port = if attempt == 0 { port } else { unused_port() };
-            match Self::try_start_with_env(inputs, port, log_disconnects) {
+            match Self::try_start_with_env(inputs, port, log_disconnects, recurse) {
                 Ok(server) => return server,
                 Err(message) if attempt < 4 && message.contains("already in use") => continue,
                 Err(message) => panic!("{message}"),
@@ -665,11 +766,15 @@ impl ServeProcess {
         inputs: &[&std::path::Path],
         port: u16,
         log_disconnects: bool,
+        recurse: bool,
     ) -> Result<Self, String> {
         let mut cmd = std::process::Command::new(cargo_bin("markview"));
         cmd.arg("--serve");
         for input in inputs {
             cmd.arg(input);
+        }
+        if recurse {
+            cmd.arg("--recurse");
         }
         cmd.args(["--port", &port.to_string()])
             .stdout(Stdio::piped())

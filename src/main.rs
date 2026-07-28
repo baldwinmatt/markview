@@ -36,7 +36,7 @@ fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
             return Err(markview::CliError::MissingServeInput.into());
         }
         let inputs = cli.inputs.iter().map(PathBuf::from).collect::<Vec<_>>();
-        serve_markdown(inputs, port)?;
+        serve_markdown(inputs, port, cli.recurse)?;
         return Ok(None);
     }
 
@@ -106,8 +106,12 @@ enum NavLayout {
     Sidebar,
 }
 
-fn serve_markdown(inputs: Vec<PathBuf>, port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let mut config = ServeConfig::from_inputs(inputs, port)?;
+fn serve_markdown(
+    inputs: Vec<PathBuf>,
+    port: u16,
+    recurse: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut config = ServeConfig::from_inputs(inputs, port, recurse)?;
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|error| {
         if error.kind() == io::ErrorKind::AddrInUse {
             format!("port {port} is already in use")
@@ -153,7 +157,11 @@ fn serve_markdown(inputs: Vec<PathBuf>, port: u16) -> Result<(), Box<dyn std::er
 }
 
 impl ServeConfig {
-    fn from_inputs(inputs: Vec<PathBuf>, port: u16) -> Result<Self, Box<dyn std::error::Error>> {
+    fn from_inputs(
+        inputs: Vec<PathBuf>,
+        port: u16,
+        recurse: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         if inputs.is_empty() {
             return Err("serve requires an input file or directory".into());
         }
@@ -161,8 +169,11 @@ impl ServeConfig {
         if directory_inputs > 0 && inputs.len() > 1 {
             return Err("cannot mix a served directory with explicit files".into());
         }
+        if recurse && directory_inputs != 1 {
+            return Err("--recurse requires a single served directory".into());
+        }
         let build = if directory_inputs == 1 {
-            Self::discover_directory(&inputs[0])?
+            Self::discover_directory(&inputs[0], recurse)?
         } else {
             Self::explicit_files(&inputs)?
         };
@@ -230,51 +241,49 @@ impl ServeConfig {
         })
     }
 
-    fn discover_directory(input: &Path) -> Result<ServeBuild, Box<dyn std::error::Error>> {
+    fn discover_directory(input: &Path, recurse: bool) -> Result<ServeBuild, Box<dyn std::error::Error>> {
         let root = input.canonicalize()?;
         if is_filesystem_root(&root) {
             return Err("served directory cannot be a filesystem root".into());
         }
-        let mut entries = fs::read_dir(input)?
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| !name.starts_with('.'))
-            })
-            .filter(|entry| is_markdown_path(&entry.path()))
-            .collect::<Vec<_>>();
-        entries.sort_by_key(|entry| entry.file_name());
+        let candidates = collect_markdown_paths(input, recurse)?;
 
-        let mut lower_names = Vec::new();
+        let mut collision_keys = Vec::new();
         let mut documents = Vec::new();
-        for entry in entries {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let lower = name.to_lowercase();
-            if lower_names.iter().any(|known| known == &lower) {
-                return Err(
-                    format!("directory contains colliding Markdown filenames: {name}").into(),
-                );
+        for candidate in candidates {
+            let relative = candidate.strip_prefix(input).unwrap_or(&candidate);
+            let collision_key = relative.to_string_lossy().to_lowercase();
+            if collision_keys.iter().any(|known| known == &collision_key) {
+                return Err(format!(
+                    "directory contains colliding Markdown filenames: {}",
+                    relative.display()
+                )
+                .into());
             }
-            lower_names.push(lower);
-            let canonical = entry.path().canonicalize()?;
+            collision_keys.push(collision_key);
+            let canonical = candidate.canonicalize()?;
             if !canonical.starts_with(&root) {
-                return Err(format!("served document resolves outside root: {name}").into());
+                return Err(format!(
+                    "served document resolves outside root: {}",
+                    relative.display()
+                )
+                .into());
             }
             if documents
                 .iter()
                 .any(|document: &ServedDocument| document.source_path == canonical)
             {
                 return Err(format!(
-                    "directory contains duplicate or aliased Markdown file: {name}"
+                    "directory contains duplicate or aliased Markdown file: {}",
+                    relative.display()
                 )
                 .into());
             }
             documents.push(document_for_path(&root, canonical)?);
         }
         if documents.is_empty() {
-            return Err("served directory has no top-level Markdown files".into());
+            let scope = if recurse { "recursively" } else { "at its top level" };
+            return Err(format!("served directory has no Markdown files {scope}").into());
         }
 
         let default_document = ["README.md", "index.md"]
@@ -283,11 +292,12 @@ impl ServeConfig {
                 documents
                     .iter()
                     .find(|document| {
-                        document
-                            .source_path
-                            .file_name()
-                            .and_then(|file| file.to_str())
-                            == Some(*name)
+                        document.source_path.parent() == Some(root.as_path())
+                            && document
+                                .source_path
+                                .file_name()
+                                .and_then(|file| file.to_str())
+                                == Some(*name)
                     })
                     .map(|document| document.source_path.clone())
             })
@@ -475,6 +485,39 @@ fn is_markdown_path(path: &Path) -> bool {
 
 fn is_markdown_link(path: &str) -> bool {
     is_markdown_path(Path::new(path))
+}
+
+fn collect_markdown_paths(start: &Path, recurse: bool) -> io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut pending = vec![start.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)?.filter_map(Result::ok) {
+            let hidden = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with('.'));
+            if hidden {
+                continue;
+            }
+            let path = entry.path();
+            if recurse && entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+                pending.push(path);
+                continue;
+            }
+            if is_markdown_path(&path) {
+                files.push(path);
+            }
+        }
+    }
+    files.sort_by_key(|path| relative_sort_key(start, path));
+    Ok(files)
+}
+
+fn relative_sort_key(start: &Path, path: &Path) -> String {
+    path.strip_prefix(start)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn route_from_root(root: &Path, path: &Path) -> Option<String> {

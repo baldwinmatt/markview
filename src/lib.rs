@@ -404,6 +404,7 @@ pub struct Cli {
     pub options: RenderOptions,
     pub output: OutputFormat,
     pub serve: Option<u16>,
+    pub recurse: bool,
     pub help: bool,
 }
 
@@ -425,6 +426,7 @@ impl Cli {
         let mut serve = None;
         let mut serve_port = None;
         let mut saw_serve = false;
+        let mut recurse = false;
         let mut help = false;
         let mut args = args.into_iter().map(Into::into);
 
@@ -434,6 +436,9 @@ impl Cli {
                 "--html" => output = OutputFormat::Html,
                 "--serve" => {
                     saw_serve = true;
+                }
+                "--recurse" => {
+                    recurse = true;
                 }
                 "--port" => {
                     let value = args.next().ok_or(CliError::MissingValue("--port"))?;
@@ -468,6 +473,8 @@ impl Cli {
             serve = Some(serve_port.unwrap_or(DEFAULT_SERVE_PORT));
         } else if serve_port.is_some() {
             return Err(CliError::UnknownArgument("--port".to_owned()));
+        } else if recurse {
+            return Err(CliError::UnknownArgument("--recurse".to_owned()));
         }
 
         if serve.is_some() && inputs.is_empty() && !help {
@@ -485,6 +492,7 @@ impl Cli {
             options,
             output,
             serve,
+            recurse,
             help,
         })
     }
@@ -519,7 +527,7 @@ fn is_numeric(value: &str) -> bool {
 }
 
 pub fn help() -> &'static str {
-    "Usage: markview [OPTIONS] [FILE]\n\nReads FILE or stdin and renders Markdown for the terminal or HTML.\n\nOptions:\n      --html             Render a complete HTML document\n      --serve            Serve Markdown files or a directory on localhost (default port 7878)\n      --port <PORT>      Select the serve port\n  -w, --width <COLUMNS>  Wrap terminal text to a target width (minimum 20, default 88)\n      --no-color         Disable ANSI colors while keeping bold text attributes\n  -h, --help             Show this help\n"
+    "Usage: markview [OPTIONS] [FILE]\n\nReads FILE or stdin and renders Markdown for the terminal or HTML.\n\nOptions:\n      --html             Render a complete HTML document\n      --serve            Serve Markdown files or a directory on localhost (default port 7878)\n      --recurse          With --serve and a single directory, discover Markdown files recursively\n      --port <PORT>      Select the serve port\n  -w, --width <COLUMNS>  Wrap terminal text to a target width (minimum 20, default 88)\n      --no-color         Disable ANSI colors while keeping bold text attributes\n  -h, --help             Show this help\n"
 }
 
 pub fn render(markdown: &str, options: RenderOptions) -> String {

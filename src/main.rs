@@ -909,19 +909,25 @@ fn render_file(config: &ServeConfig, served: &ServedDocument) -> io::Result<Stri
 
 fn rewrite_markdown_links(config: &ServeConfig, served: &ServedDocument, markdown: &str) -> String {
     let mut rewritten = String::new();
-    let mut in_fenced_code = false;
+    let mut fence: Option<(char, usize)> = None;
 
     for line in markdown.split_inclusive('\n') {
         let line_without_newline = line.trim_end_matches(['\r', '\n']);
         let newline = &line[line_without_newline.len()..];
         let trimmed = line_without_newline.trim_start();
 
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fenced_code = !in_fenced_code;
+        if let Some(marker) = fence_marker(trimmed) {
+            match fence {
+                Some((open_ch, open_len)) if marker.0 == open_ch && marker.1 >= open_len => {
+                    fence = None;
+                }
+                None => fence = Some(marker),
+                _ => {}
+            }
             rewritten.push_str(line);
             continue;
         }
-        if in_fenced_code || line_without_newline.starts_with("    ") {
+        if fence.is_some() || line_without_newline.starts_with("    ") {
             rewritten.push_str(line);
             continue;
         }
@@ -935,6 +941,20 @@ fn rewrite_markdown_links(config: &ServeConfig, served: &ServedDocument, markdow
     }
 
     rewritten
+}
+
+/// Returns the fence character and run length for a code-fence marker line
+/// (e.g. `(` `` ` ``, 4)` for ` ```` `). Per CommonMark, a fence is only closed
+/// by a line using the *same* character with a run at least as long as the
+/// opening fence, so callers must compare against the currently open fence
+/// rather than treating every fence-looking line as a toggle.
+fn fence_marker(trimmed: &str) -> Option<(char, usize)> {
+    let ch = trimmed.chars().next()?;
+    if ch != '`' && ch != '~' {
+        return None;
+    }
+    let len = trimmed.chars().take_while(|&candidate| candidate == ch).count();
+    (len >= 3).then_some((ch, len))
 }
 
 fn rewrite_inline_markdown_links(

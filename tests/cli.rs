@@ -725,6 +725,36 @@ fn serve_mode_rewrites_links_without_touching_code_samples_and_reference_definit
 }
 
 #[test]
+fn serve_mode_does_not_close_a_fence_on_a_shorter_nested_fence_marker() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let readme = dir.path().join("README.md");
+    std::fs::write(
+        &readme,
+        "# Doc\n\n````\nHow to show a fenced example:\n```\n![Chart](chart.png)\n```\n````\n\n![Chart](chart.png)\n",
+    )
+    .expect("write readme");
+    std::fs::write(dir.path().join("chart.png"), b"\x89PNG\r\n\x1a\n").expect("write chart");
+    let mut server = ServeProcess::start(&readme);
+
+    let response = http_get(server.port, "/");
+
+    // The inner ``` is shorter than the outer ```` fence that opened the block, so
+    // per CommonMark it doesn't close it — the example inside must stay literal.
+    assert!(
+        response.contains("![Chart](chart.png)"),
+        "nested fence example was not preserved literally:\n{response}"
+    );
+    // Only the real, unfenced image reference below the code block should have
+    // been rewritten to a served route.
+    assert_eq!(
+        response.matches(r#"src="/chart.png""#).count(),
+        1,
+        "expected exactly one rewritten image reference:\n{response}"
+    );
+    server.stop();
+}
+
+#[test]
 fn serve_mode_preserves_multibyte_utf8_prose_when_rewriting_links() {
     let dir = tempfile::tempdir().expect("temp dir");
     let first = dir.path().join("README.md");

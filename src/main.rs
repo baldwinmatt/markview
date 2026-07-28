@@ -814,25 +814,48 @@ fn handle_fs_event(
     if !relevant {
         return;
     }
-    let reload_kind = if needs_rescan {
-        match ServeConfig::from_inputs(inputs.to_vec(), port, recurse) {
-            Ok(fresh) => {
-                let reload_kind = if current.documents == fresh.documents {
-                    ReloadKind::Content
-                } else {
-                    ReloadKind::Structure
-                };
-                *shared.lock().expect("config lock") = Arc::new(fresh);
-                reload_kind
-            }
-            Err(error) => {
-                eprintln!("markview: failed to rescan served directory: {error}");
-                return;
-            }
-        }
+    if needs_rescan {
+        let shared = shared.clone();
+        let clients = clients.clone();
+        let inputs = inputs.to_vec();
+        thread::spawn(move || {
+            rescan_and_reload(shared, clients, inputs, port, recurse, current);
+        });
     } else {
-        ReloadKind::Content
+        broadcast_reload(clients, ReloadKind::Content);
+    }
+}
+
+fn rescan_and_reload(
+    shared: SharedConfig,
+    clients: Arc<Mutex<Vec<mpsc::Sender<ReloadKind>>>>,
+    inputs: Vec<PathBuf>,
+    port: u16,
+    recurse: bool,
+    previous: Arc<ServeConfig>,
+) {
+    let reload_kind = match ServeConfig::from_inputs(inputs, port, recurse) {
+        Ok(fresh) => {
+            let reload_kind = if previous.documents == fresh.documents {
+                ReloadKind::Content
+            } else {
+                ReloadKind::Structure
+            };
+            *shared.lock().expect("config lock") = Arc::new(fresh);
+            reload_kind
+        }
+        Err(error) => {
+            eprintln!("markview: failed to rescan served directory: {error}");
+            return;
+        }
     };
+    broadcast_reload(&clients, reload_kind);
+}
+
+fn broadcast_reload(
+    clients: &Arc<Mutex<Vec<mpsc::Sender<ReloadKind>>>>,
+    reload_kind: ReloadKind,
+) {
     if let Ok(mut clients) = clients.lock() {
         clients.retain(|client| client.send(reload_kind).is_ok());
     }
@@ -1761,6 +1784,7 @@ fn write_404(stream: &mut TcpStream, head_only: bool) -> io::Result<()> {
 #[cfg(test)]
 mod serve_nav_tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn directory_serve_config_precomputes_sidebar_nav_tree() {
@@ -1802,6 +1826,43 @@ mod serve_nav_tests {
         assert!(tree.child_indexes.contains_key("zeta"));
         assert!(tree.child_indexes.contains_key("alpha"));
         assert_eq!(tree.dirs.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn structural_rescan_does_not_block_event_handler() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");
+        let config =
+            ServeConfig::from_inputs(vec![dir.path().to_path_buf()], 0, true).expect("config");
+        let shared = Arc::new(Mutex::new(Arc::new(config)));
+        let clients = Arc::new(Mutex::new(Vec::new()));
+        let fifo = dir.path().join("blocked.md");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed");
+        let event = notify::Event {
+            kind: EventKind::Create(notify::event::CreateKind::File),
+            paths: vec![fifo.clone()],
+            attrs: notify::event::EventAttributes::new(),
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        let shared_for_event = shared.clone();
+        let clients_for_event = clients.clone();
+        let input = dir.path().to_path_buf();
+
+        std::thread::spawn(move || {
+            handle_fs_event(event, &shared_for_event, &clients_for_event, &[input], 0, true);
+            done_tx.send(()).expect("send done");
+        });
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(250)).is_ok(),
+            "structural rescan blocked the watcher event handler"
+        );
+        std::fs::write(&fifo, "# Blocked\n").expect("unblock fifo reader");
     }
 
     fn served_doc(route_path: &str) -> ServedDocument {

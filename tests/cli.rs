@@ -525,6 +525,30 @@ fn serve_mode_recurse_allows_same_markdown_filename_in_different_directories() {
     server.stop();
 }
 
+#[cfg(unix)]
+#[test]
+fn serve_mode_recurse_drops_symlink_alias_to_markdown_file() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let docs = dir.path().join("BaldwinDocs");
+    std::fs::create_dir(&docs).expect("docs dir");
+    std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");
+    std::fs::write(docs.join("AGENTS.md"), "# Agents\n").expect("write agents");
+    symlink("AGENTS.md", docs.join("CLAUDE.md")).expect("symlink claude");
+    let mut server = ServeProcess::start_recursive_dir(dir.path());
+
+    let home = http_get(server.port, "/");
+    let agents = http_get(server.port, "/BaldwinDocs/AGENTS.md");
+    let claude = http_get(server.port, "/BaldwinDocs/CLAUDE.md");
+
+    assert!(home.contains(r#"href="/BaldwinDocs/AGENTS.md""#));
+    assert!(!home.contains(r#"href="/BaldwinDocs/CLAUDE.md""#));
+    assert!(agents.contains(r#"<h1 id="agents">Agents</h1>"#));
+    assert!(claude.contains("HTTP/1.1 404 Not Found"));
+    server.stop();
+}
+
 #[test]
 fn serve_mode_recurse_groups_sidebar_nav_by_directory_and_auto_expands_active_path() {
     let dir = tempfile::tempdir().expect("temp dir");

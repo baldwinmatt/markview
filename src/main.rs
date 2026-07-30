@@ -298,6 +298,12 @@ impl ServeConfig {
             }
             let relative = canonical.strip_prefix(&root).unwrap_or(&canonical);
             let route_path = relative_to_route(relative);
+            if documents
+                .iter()
+                .any(|document: &ServedDocument| document.source_path == canonical)
+            {
+                continue;
+            }
             let collision_key = route_path.to_lowercase();
             if collision_keys.iter().any(|known| known == &collision_key) {
                 return Err(format!(
@@ -306,16 +312,6 @@ impl ServeConfig {
                 .into());
             }
             collision_keys.push(collision_key);
-            if let Some(document) = documents
-                .iter()
-                .find(|document: &&ServedDocument| document.source_path == canonical)
-            {
-                return Err(format!(
-                    "directory contains duplicate or aliased Markdown files: {} and {}",
-                    document.route_path, route_path
-                )
-                .into());
-            }
             documents.push(document_for_path(&root, canonical)?);
         }
         if documents.is_empty() {
@@ -412,7 +408,7 @@ impl ServeConfig {
         if !canonical.starts_with(&self.root) {
             return None;
         }
-        route_from_root(&self.root, &canonical)
+        route_from_root(&self.root, &candidate)
     }
 
     fn scan_assets(&self) -> Vec<ServedAsset> {

@@ -503,6 +503,29 @@ fn serve_mode_recurse_discovers_nested_markdown_files_and_prefers_top_level_defa
 }
 
 #[test]
+fn serve_mode_recurse_allows_same_markdown_filename_in_different_directories() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let first = dir.path().join("first");
+    let second = dir.path().join("second");
+    std::fs::create_dir(&first).expect("first dir");
+    std::fs::create_dir(&second).expect("second dir");
+    std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");
+    std::fs::write(first.join("CLAUDE.md"), "# First Claude\n").expect("write first claude");
+    std::fs::write(second.join("CLAUDE.md"), "# Second Claude\n").expect("write second claude");
+    let mut server = ServeProcess::start_recursive_dir(dir.path());
+
+    let home = http_get(server.port, "/");
+    let first_response = http_get(server.port, "/first/CLAUDE.md");
+    let second_response = http_get(server.port, "/second/CLAUDE.md");
+
+    assert!(home.contains(r#"href="/first/CLAUDE.md""#));
+    assert!(home.contains(r#"href="/second/CLAUDE.md""#));
+    assert!(first_response.contains(r#"<h1 id="first-claude">First Claude</h1>"#));
+    assert!(second_response.contains(r#"<h1 id="second-claude">Second Claude</h1>"#));
+    server.stop();
+}
+
+#[test]
 fn serve_mode_recurse_groups_sidebar_nav_by_directory_and_auto_expands_active_path() {
     let dir = tempfile::tempdir().expect("temp dir");
     let guides = dir.path().join("guides");

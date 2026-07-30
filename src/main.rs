@@ -284,34 +284,35 @@ impl ServeConfig {
         }
         let candidates = collect_markdown_paths(input, recurse)?;
 
-        let mut collision_keys = Vec::new();
+        let mut collision_keys: Vec<String> = Vec::new();
         let mut documents = Vec::new();
         for candidate in candidates {
-            let relative = candidate.strip_prefix(input).unwrap_or(&candidate);
-            let collision_key = relative.to_string_lossy().to_lowercase();
-            if collision_keys.iter().any(|known| known == &collision_key) {
-                return Err(format!(
-                    "directory contains colliding Markdown filenames: {}",
-                    relative.display()
-                )
-                .into());
-            }
-            collision_keys.push(collision_key);
             let canonical = candidate.canonicalize()?;
             if !canonical.starts_with(&root) {
+                let relative = candidate.strip_prefix(input).unwrap_or(&candidate);
                 return Err(format!(
                     "served document resolves outside root: {}",
                     relative.display()
                 )
                 .into());
             }
-            if documents
+            let relative = canonical.strip_prefix(&root).unwrap_or(&canonical);
+            let route_path = relative_to_route(relative);
+            let collision_key = route_path.to_lowercase();
+            if collision_keys.iter().any(|known| known == &collision_key) {
+                return Err(format!(
+                    "directory contains colliding Markdown routes: {route_path}"
+                )
+                .into());
+            }
+            collision_keys.push(collision_key);
+            if let Some(document) = documents
                 .iter()
-                .any(|document: &ServedDocument| document.source_path == canonical)
+                .find(|document: &&ServedDocument| document.source_path == canonical)
             {
                 return Err(format!(
-                    "directory contains duplicate or aliased Markdown file: {}",
-                    relative.display()
+                    "directory contains duplicate or aliased Markdown files: {} and {}",
+                    document.route_path, route_path
                 )
                 .into());
             }

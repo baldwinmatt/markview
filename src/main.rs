@@ -86,7 +86,7 @@ struct ServeConfig {
 
 #[derive(Debug)]
 struct AssetCache {
-    signature: Vec<(PathBuf, SystemTime)>,
+    signature: Vec<SystemTime>,
     assets: Arc<[ServedAsset]>,
 }
 
@@ -450,17 +450,17 @@ impl ServeConfig {
     }
 
     /// Document mtimes, in `self.documents` order — the signature the asset
-    /// cache is keyed on. A document that fails to `stat` (e.g. it was just
-    /// deleted out from under us) maps to `UNIX_EPOCH`, which is fine as a
-    /// cache key: it's still a stable, comparable value, so the cache stays
+    /// cache is keyed on. `self.documents` itself is fixed for a `ServeConfig`
+    /// generation (see `asset_cache`'s doc comment), so identity/order never
+    /// changes between calls and only the mtimes themselves carry
+    /// invalidation information; a document that fails to `stat` (e.g. it was
+    /// just deleted out from under us) maps to `UNIX_EPOCH`, which is fine as
+    /// a cache key: it's still a stable, comparable value, so the cache stays
     /// coherent even while the file is momentarily unreadable.
-    fn document_mtimes(&self) -> Vec<(PathBuf, SystemTime)> {
+    fn document_mtimes(&self) -> Vec<SystemTime> {
         self.documents
             .iter()
-            .map(|document| {
-                let mtime = file_mtime(&document.source_path).unwrap_or(SystemTime::UNIX_EPOCH);
-                (document.source_path.clone(), mtime)
-            })
+            .map(|document| file_mtime(&document.source_path).unwrap_or(SystemTime::UNIX_EPOCH))
             .collect()
     }
 

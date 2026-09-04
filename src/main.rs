@@ -140,6 +140,12 @@ impl ReloadKind {
 /// the served root) without connection threads ever seeing a torn read.
 type SharedConfig = Arc<RwLock<Arc<ServeConfig>>>;
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(50);
+/// How often an idle `/events` connection wakes up to send an SSE comment
+/// keepalive. This is also the bound on how quickly a browser navigating away
+/// (closing its `EventSource`) is noticed and pruned from `clients` — without
+/// it the handler thread would block on `rx.recv()` forever, since a broken
+/// pipe is only ever discovered on the next write.
+const EVENTS_KEEPALIVE: Duration = Duration::from_secs(15);
 
 fn serve_markdown(
     inputs: Vec<PathBuf>,
@@ -995,18 +1001,17 @@ fn serve_events(
     )?;
     stream.flush()?;
 
-    let probe_disconnects = std::env::var_os("MARKVIEW_LOG_EVENT_DISCONNECTS").is_some();
+    // Poll on a timeout rather than blocking on `rx.recv()` forever: this is a
+    // long-lived connection with no read side, so a periodic keepalive write is
+    // the only way to notice the browser navigated away and closed its end. A
+    // bare `recv()` would leave this thread (and its `tx` in `clients`) parked
+    // forever, since a broken pipe is only ever discovered on the next *write*,
+    // which otherwise only happens when a served file changes on disk.
     loop {
-        if probe_disconnects {
-            match rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(kind) => stream.write_all(kind.sse_event())?,
-                Err(mpsc::RecvTimeoutError::Timeout) => stream.write_all(b": keepalive\n\n")?,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        } else if let Ok(kind) = rx.recv() {
-            stream.write_all(kind.sse_event())?;
-        } else {
-            break;
+        match rx.recv_timeout(EVENTS_KEEPALIVE) {
+            Ok(kind) => stream.write_all(kind.sse_event())?,
+            Err(mpsc::RecvTimeoutError::Timeout) => stream.write_all(b": keepalive\n\n")?,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
         stream.flush()?;
     }

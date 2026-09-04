@@ -473,7 +473,13 @@ impl ServeConfig {
 
     fn scan_assets(&self) -> Vec<ServedAsset> {
         let signature = self.document_mtimes();
-        let mut cache = self.asset_cache.lock().expect("asset cache lock");
+        // A poisoned lock (some other thread panicked while holding it)
+        // degrades to a forced cache miss rather than taking this thread
+        // down too, matching how `clients` handling elsewhere tolerates
+        // poisoning instead of propagating it.
+        let Ok(mut cache) = self.asset_cache.lock() else {
+            return self.scan_assets_uncached();
+        };
         if let Some(cached) = cache.as_ref() {
             if cached.signature == signature {
                 return cached.assets.clone();

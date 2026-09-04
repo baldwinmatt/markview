@@ -810,6 +810,29 @@ fn serve_mode_rejects_recurse_without_serve() {
 }
 
 #[test]
+fn serve_mode_rejects_open_without_serve() {
+    let mut cmd = Command::cargo_bin("markview").expect("binary");
+    cmd.args(["--open", "README.md"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown argument: --open"));
+}
+
+#[test]
+fn serve_mode_accepts_open_and_keeps_serving() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("doc.md");
+    std::fs::write(&file, "# Doc\n").expect("write doc");
+    let mut server = ServeProcess::start_with_open(&file);
+
+    // The server must stay up and answer requests regardless of whether the
+    // best-effort browser launch actually succeeded (it typically can't in a
+    // headless test environment).
+    assert!(http_get(server.port, "/").contains(r#"<h1 id="doc">Doc</h1>"#));
+    server.stop();
+}
+
+#[test]
 fn serve_mode_rejects_recurse_with_non_directory_input() {
     let dir = tempfile::tempdir().expect("temp dir");
     let one = dir.path().join("one.md");
@@ -1230,21 +1253,26 @@ impl ServeProcess {
     }
 
     fn start_recursive_dir(directory: &std::path::Path) -> Self {
-        Self::start_with_env(&[directory], unused_port(), false, true, None)
+        Self::start_with_env(&[directory], unused_port(), false, true, false, None)
+    }
+
+    fn start_with_open(file: &std::path::Path) -> Self {
+        Self::start_with_env(&[file], unused_port(), false, false, true, None)
     }
 
     fn start_with_args(inputs: &[&std::path::Path], port: u16) -> Self {
-        Self::start_with_env(inputs, port, false, false, None)
+        Self::start_with_env(inputs, port, false, false, false, None)
     }
 
     fn start_with_disconnect_logging(file: &std::path::Path) -> Self {
-        Self::start_with_env(&[file], unused_port(), true, false, None)
+        Self::start_with_env(&[file], unused_port(), true, false, false, None)
     }
 
     fn start_relative(cwd: &std::path::Path, relative_input: &str) -> Self {
         Self::start_with_env(
             &[std::path::Path::new(relative_input)],
             unused_port(),
+            false,
             false,
             false,
             Some(cwd),
@@ -1256,11 +1284,12 @@ impl ServeProcess {
         port: u16,
         log_disconnects: bool,
         recurse: bool,
+        open: bool,
         cwd: Option<&std::path::Path>,
     ) -> Self {
         for attempt in 0..5 {
             let port = if attempt == 0 { port } else { unused_port() };
-            match Self::try_start_with_env(inputs, port, log_disconnects, recurse, cwd) {
+            match Self::try_start_with_env(inputs, port, log_disconnects, recurse, open, cwd) {
                 Ok(server) => return server,
                 Err(message) if attempt < 4 && message.contains("already in use") => continue,
                 Err(message) => panic!("{message}"),
@@ -1274,6 +1303,7 @@ impl ServeProcess {
         port: u16,
         log_disconnects: bool,
         recurse: bool,
+        open: bool,
         cwd: Option<&std::path::Path>,
     ) -> Result<Self, String> {
         let mut cmd = std::process::Command::new(cargo_bin("markview"));
@@ -1283,6 +1313,9 @@ impl ServeProcess {
         }
         if recurse {
             cmd.arg("--recurse");
+        }
+        if open {
+            cmd.arg("--open");
         }
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);

@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use markview::{
     help, render, repair_utf8_mojibake, Cli, FrontendRenderer, HtmlRenderer, MarkdownDocument,
@@ -68,7 +68,7 @@ fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
     }))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ServeConfig {
     root: PathBuf,
     documents: Vec<ServedDocument>,
@@ -76,6 +76,18 @@ struct ServeConfig {
     port: u16,
     mode: ServeMode,
     sidebar_nav: Option<NavDir>,
+    /// Memoized `scan_assets()` result, invalidated by comparing each served
+    /// document's mtime against the snapshot taken when the cache was built.
+    /// `ServeConfig` itself is swapped out wholesale on a rescan (see
+    /// `SharedConfig`), so this only needs to survive edits to already-known
+    /// documents within one config generation, not additions/removals.
+    asset_cache: Mutex<Option<AssetCache>>,
+}
+
+#[derive(Debug)]
+struct AssetCache {
+    signature: Vec<(PathBuf, SystemTime)>,
+    assets: Vec<ServedAsset>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,6 +258,7 @@ impl ServeConfig {
             port,
             mode: build.mode,
             sidebar_nav,
+            asset_cache: Mutex::new(None),
         };
         Ok(config)
     }
@@ -441,7 +454,40 @@ impl ServeConfig {
         route_from_root(&self.root, &candidate)
     }
 
+    /// Document mtimes, in `self.documents` order — the signature the asset
+    /// cache is keyed on. A document that fails to `stat` (e.g. it was just
+    /// deleted out from under us) maps to `UNIX_EPOCH`, which is fine as a
+    /// cache key: it's still a stable, comparable value, so the cache stays
+    /// coherent even while the file is momentarily unreadable.
+    fn document_mtimes(&self) -> Vec<(PathBuf, SystemTime)> {
+        self.documents
+            .iter()
+            .map(|document| {
+                let mtime = fs::metadata(&document.source_path)
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                (document.source_path.clone(), mtime)
+            })
+            .collect()
+    }
+
     fn scan_assets(&self) -> Vec<ServedAsset> {
+        let signature = self.document_mtimes();
+        let mut cache = self.asset_cache.lock().expect("asset cache lock");
+        if let Some(cached) = cache.as_ref() {
+            if cached.signature == signature {
+                return cached.assets.clone();
+            }
+        }
+        let assets = self.scan_assets_uncached();
+        *cache = Some(AssetCache {
+            signature,
+            assets: assets.clone(),
+        });
+        assets
+    }
+
+    fn scan_assets_uncached(&self) -> Vec<ServedAsset> {
         let mut assets = Vec::new();
         for document in &self.documents {
             if validated_served_path(&self.root, &document.source_path).is_none() {

@@ -477,19 +477,23 @@ impl ServeConfig {
         // degrades to a forced cache miss rather than taking this thread
         // down too, matching how `clients` handling elsewhere tolerates
         // poisoning instead of propagating it.
-        let Ok(mut cache) = self.asset_cache.lock() else {
-            return self.scan_assets_uncached();
-        };
-        if let Some(cached) = cache.as_ref() {
-            if cached.signature == signature {
-                return cached.assets.clone();
+        if let Ok(cache) = self.asset_cache.lock() {
+            if let Some(cached) = cache.as_ref() {
+                if cached.signature == signature {
+                    return cached.assets.clone();
+                }
             }
         }
+        // The disk scan itself runs with the lock released, so it doesn't
+        // serialize every other thread's `scan_assets()` call (one thread
+        // per connection) behind a single miss's I/O.
         let assets = self.scan_assets_uncached();
-        *cache = Some(AssetCache {
-            signature,
-            assets: assets.clone(),
-        });
+        if let Ok(mut cache) = self.asset_cache.lock() {
+            *cache = Some(AssetCache {
+                signature,
+                assets: assets.clone(),
+            });
+        }
         assets
     }
 

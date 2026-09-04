@@ -177,9 +177,18 @@ struct ClientGuard {
 
 impl Drop for ClientGuard {
     fn drop(&mut self) {
-        if let Ok(mut clients) = self.clients.lock() {
-            clients.retain(|(id, _)| *id != self.id);
-        }
+        retain_clients(&self.clients, |(id, _)| *id != self.id);
+    }
+}
+
+/// Locks `clients` and applies `keep` via `retain`, doing nothing on a
+/// poisoned lock. The shared shape behind both `ClientGuard::drop` (removing
+/// exactly one id) and `broadcast_reload` (dropping every id whose send
+/// failed), so a future third call site doesn't reimplement lock-and-retain
+/// a third time with possibly-different poisoning behavior.
+fn retain_clients(clients: &Clients, keep: impl FnMut(&(u64, mpsc::Sender<ReloadKind>)) -> bool) {
+    if let Ok(mut clients) = clients.lock() {
+        clients.retain(keep);
     }
 }
 
@@ -969,9 +978,7 @@ fn broadcast_reload(
     clients: &Clients,
     reload_kind: ReloadKind,
 ) {
-    if let Ok(mut clients) = clients.lock() {
-        clients.retain(|(_, client)| client.send(reload_kind).is_ok());
-    }
+    retain_clients(clients, |(_, client)| client.send(reload_kind).is_ok());
 }
 
 fn is_reload_event(kind: &EventKind) -> bool {

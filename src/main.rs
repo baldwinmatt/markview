@@ -416,12 +416,6 @@ impl ServeConfig {
             .find(|asset| asset.route_path == route)
     }
 
-    fn asset_for_path(&self, path: &Path) -> Option<ServedAsset> {
-        self.scan_assets()
-            .into_iter()
-            .find(|asset| asset.source_path == path)
-    }
-
     fn route_for_request(&self, request_path: &str) -> Option<String> {
         let path = request_path
             .split(['?', '#'])
@@ -1144,7 +1138,11 @@ fn render_file(config: &ServeConfig, served: &ServedDocument) -> io::Result<Stri
     }
     let markdown = fs::read_to_string(&served.source_path)?;
     let title = title_for_source(&served.source_path, &markdown);
-    let markdown = rewrite_markdown_links(config, served, &markdown);
+    // Scanned once per render rather than once per link/image reference —
+    // `scan_assets()` is otherwise a full document-mtime signature check
+    // (and, on a miss, a directory walk) for every single reference.
+    let assets = config.scan_assets();
+    let markdown = rewrite_markdown_links(config, served, &markdown, &assets);
     let document = MarkdownDocument::with_title(markdown, title);
     let modified_at = modified_timestamp_millis(&served.source_path);
     Ok(inject_serve_shell(
@@ -1155,7 +1153,12 @@ fn render_file(config: &ServeConfig, served: &ServedDocument) -> io::Result<Stri
     ))
 }
 
-fn rewrite_markdown_links(config: &ServeConfig, served: &ServedDocument, markdown: &str) -> String {
+fn rewrite_markdown_links(
+    config: &ServeConfig,
+    served: &ServedDocument,
+    markdown: &str,
+    assets: &[ServedAsset],
+) -> String {
     let mut rewritten = String::new();
     let mut fence: Option<(char, usize)> = None;
 
@@ -1183,7 +1186,8 @@ fn rewrite_markdown_links(config: &ServeConfig, served: &ServedDocument, markdow
         rewritten.push_str(&rewrite_reference_definition(
             config,
             served,
-            &rewrite_inline_markdown_links(config, served, line_without_newline),
+            &rewrite_inline_markdown_links(config, served, line_without_newline, assets),
+            assets,
         ));
         rewritten.push_str(newline);
     }
@@ -1212,6 +1216,7 @@ fn rewrite_inline_markdown_links(
     config: &ServeConfig,
     served: &ServedDocument,
     line: &str,
+    assets: &[ServedAsset],
 ) -> String {
     let mut output = String::new();
     let mut index = 0;
@@ -1242,7 +1247,7 @@ fn rewrite_inline_markdown_links(
         let content = &line[destination_start..destination_end];
         let (destination, title) = split_destination_and_title(content);
         output.push_str("](");
-        if let Some(target) = rewritten_reference(config, served, destination) {
+        if let Some(target) = rewritten_reference(config, served, destination, assets) {
             output.push_str(&target);
         } else {
             output.push_str(destination);
@@ -1259,6 +1264,7 @@ fn rewrite_reference_definition(
     config: &ServeConfig,
     served: &ServedDocument,
     line: &str,
+    assets: &[ServedAsset],
 ) -> String {
     let Some((label, rest)) = line.split_once("]:") else {
         return line.to_owned();
@@ -1272,7 +1278,7 @@ fn rewrite_reference_definition(
         .find(char::is_whitespace)
         .unwrap_or(rest_trimmed.len());
     let destination = &rest_trimmed[..destination_end];
-    let Some(target) = rewritten_reference(config, served, destination) else {
+    let Some(target) = rewritten_reference(config, served, destination, assets) else {
         return line.to_owned();
     };
     format!(
@@ -1339,6 +1345,7 @@ fn rewritten_reference(
     config: &ServeConfig,
     served: &ServedDocument,
     reference: &str,
+    assets: &[ServedAsset],
 ) -> Option<String> {
     if is_external_or_absolute(reference) || reference.starts_with('#') || reference.contains('?') {
         return None;
@@ -1360,8 +1367,9 @@ fn rewritten_reference(
             .document_route_for_path(&canonical)
             .map(|route| format!("{route}{fragment}"));
     }
-    config
-        .asset_for_path(&canonical)
+    assets
+        .iter()
+        .find(|asset| asset.source_path == canonical)
         .map(|asset| format!("{}{}", asset.route_path, fragment))
 }
 

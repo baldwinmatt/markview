@@ -4,6 +4,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -146,6 +147,29 @@ const WATCH_DEBOUNCE: Duration = Duration::from_millis(50);
 /// it the handler thread would block on `rx.recv()` forever, since a broken
 /// pipe is only ever discovered on the next write.
 const EVENTS_KEEPALIVE: Duration = Duration::from_secs(15);
+
+/// Live `/events` subscribers, each tagged with a unique id so a connection
+/// can remove exactly its own entry when its handler thread exits — without
+/// this, a client's `Sender` would only ever be pruned by `broadcast_reload`,
+/// which doesn't run at all while no served file changes on disk.
+type Clients = Arc<Mutex<Vec<(u64, mpsc::Sender<ReloadKind>)>>>;
+static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Removes this connection's entry from `clients` when dropped, so it happens
+/// on every exit path out of `serve_events` (clean disconnect, write error,
+/// or the `?` operator) rather than only on the next broadcast.
+struct ClientGuard {
+    clients: Clients,
+    id: u64,
+}
+
+impl Drop for ClientGuard {
+    fn drop(&mut self) {
+        if let Ok(mut clients) = self.clients.lock() {
+            clients.retain(|(id, _)| *id != self.id);
+        }
+    }
+}
 
 fn serve_markdown(
     inputs: Vec<PathBuf>,
@@ -752,7 +776,7 @@ fn watch_root(
     inputs: Vec<PathBuf>,
     port: u16,
     recurse: bool,
-    clients: Arc<Mutex<Vec<mpsc::Sender<ReloadKind>>>>,
+    clients: Clients,
 ) -> notify::Result<RecommendedWatcher> {
     let (root, mode) = {
         let config = shared.read().expect("config lock");
@@ -792,7 +816,7 @@ fn watch_root(
 fn handle_fs_events(
     events: Vec<notify::Event>,
     shared: &SharedConfig,
-    clients: &Arc<Mutex<Vec<mpsc::Sender<ReloadKind>>>>,
+    clients: &Clients,
     inputs: &[PathBuf],
     port: u16,
     recurse: bool,
@@ -842,7 +866,7 @@ fn handle_fs_events(
 
 fn rescan_and_reload(
     shared: SharedConfig,
-    clients: Arc<Mutex<Vec<mpsc::Sender<ReloadKind>>>>,
+    clients: Clients,
     inputs: Vec<PathBuf>,
     port: u16,
     recurse: bool,
@@ -867,11 +891,11 @@ fn rescan_and_reload(
 }
 
 fn broadcast_reload(
-    clients: &Arc<Mutex<Vec<mpsc::Sender<ReloadKind>>>>,
+    clients: &Clients,
     reload_kind: ReloadKind,
 ) {
     if let Ok(mut clients) = clients.lock() {
-        clients.retain(|client| client.send(reload_kind).is_ok());
+        clients.retain(|(_, client)| client.send(reload_kind).is_ok());
     }
 }
 
@@ -885,7 +909,7 @@ fn is_reload_event(kind: &EventKind) -> bool {
 fn handle_connection(
     mut stream: TcpStream,
     config: &ServeConfig,
-    clients: Arc<Mutex<Vec<mpsc::Sender<ReloadKind>>>>,
+    clients: Clients,
 ) -> io::Result<()> {
     let mut request = String::new();
     {
@@ -989,13 +1013,21 @@ fn serve_asset(
 
 fn serve_events(
     mut stream: TcpStream,
-    clients: Arc<Mutex<Vec<mpsc::Sender<ReloadKind>>>>,
+    clients: Clients,
 ) -> io::Result<()> {
     let (tx, rx) = mpsc::channel();
+    let id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     clients
         .lock()
         .map_err(|_| io::Error::other("clients lock poisoned"))?
-        .push(tx);
+        .push((id, tx));
+    // Ensures this entry is removed from `clients` as soon as this function
+    // returns by any path, instead of leaving it for the next real
+    // `broadcast_reload` (a file change) to notice via a failed send.
+    let _guard = ClientGuard {
+        clients: clients.clone(),
+        id,
+    };
     stream.write_all(
         b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n",
     )?;
@@ -1004,9 +1036,8 @@ fn serve_events(
     // Poll on a timeout rather than blocking on `rx.recv()` forever: this is a
     // long-lived connection with no read side, so a periodic keepalive write is
     // the only way to notice the browser navigated away and closed its end. A
-    // bare `recv()` would leave this thread (and its `tx` in `clients`) parked
-    // forever, since a broken pipe is only ever discovered on the next *write*,
-    // which otherwise only happens when a served file changes on disk.
+    // bare `recv()` would leave this thread parked forever, since a broken pipe
+    // is only ever discovered on the next *write*.
     loop {
         match rx.recv_timeout(EVENTS_KEEPALIVE) {
             Ok(kind) => stream.write_all(kind.sse_event())?,
@@ -1893,7 +1924,7 @@ mod serve_nav_tests {
             ServeConfig::from_inputs(vec![dir.path().to_path_buf()], 0, true).expect("config");
         let shared: SharedConfig = Arc::new(RwLock::new(Arc::new(config)));
         let (client_tx, client_rx) = mpsc::channel();
-        let clients = Arc::new(Mutex::new(vec![client_tx]));
+        let clients = Arc::new(Mutex::new(vec![(0, client_tx)]));
         let one = dir.path().join("one.md");
         let two = dir.path().join("two.md");
         std::fs::write(&one, "# One\n").expect("write one");
@@ -1948,7 +1979,7 @@ mod serve_nav_tests {
         let config = ServeConfig::from_inputs(vec![file.clone()], 0, false).expect("config");
         let shared: SharedConfig = Arc::new(RwLock::new(Arc::new(config)));
         let (client_tx, client_rx) = mpsc::channel();
-        let clients = Arc::new(Mutex::new(vec![client_tx]));
+        let clients = Arc::new(Mutex::new(vec![(0, client_tx)]));
         let relative_file = file.strip_prefix(&cwd).expect("relative file").to_path_buf();
         let event = notify::Event {
             kind: EventKind::Modify(notify::event::ModifyKind::Data(

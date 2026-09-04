@@ -42,7 +42,7 @@ fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
             return Err(markview::CliError::MissingServeInput.into());
         }
         let inputs = cli.inputs.iter().map(PathBuf::from).collect::<Vec<_>>();
-        serve_markdown(inputs, port, cli.recurse)?;
+        serve_markdown(inputs, port, cli.recurse, cli.open)?;
         return Ok(None);
     }
 
@@ -196,6 +196,7 @@ fn serve_markdown(
     inputs: Vec<PathBuf>,
     port: u16,
     recurse: bool,
+    open: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = ServeConfig::from_inputs(inputs.clone(), port, recurse)?;
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|error| {
@@ -218,6 +219,13 @@ fn serve_markdown(
     );
     io::stdout().flush()?;
 
+    if open {
+        let url = serve_open_url(address.port());
+        if let Err(error) = open::that(&url) {
+            eprintln!("markview: failed to open browser: {error}");
+        }
+    }
+
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -235,6 +243,13 @@ fn serve_markdown(
     }
 
     Ok(())
+}
+
+/// The URL `--open` should launch once the server is bound. The root route
+/// always resolves to the default document (see `route_for_request`), so the
+/// bare root URL is correct regardless of `ServeMode`.
+fn serve_open_url(port: u16) -> String {
+    format!("http://localhost:{port}/")
 }
 
 impl ServeConfig {
@@ -1946,6 +1961,12 @@ mod serve_nav_tests {
             .expect("serve config");
 
         assert!(config.sidebar_nav.is_some());
+    }
+
+    #[test]
+    fn serve_open_url_points_at_localhost_root() {
+        assert_eq!(serve_open_url(7878), "http://localhost:7878/");
+        assert_eq!(serve_open_url(3000), "http://localhost:3000/");
     }
 
     #[test]

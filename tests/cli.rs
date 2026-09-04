@@ -856,6 +856,52 @@ fn serve_mode_daemon_detaches_and_prints_pid_and_address() {
     kill_pid(pid);
 }
 
+#[test]
+fn serve_mode_daemon_reports_failure_when_child_fails_to_start() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("not-markdown.txt");
+    std::fs::write(&file, "plain text, not Markdown\n").expect("write sample");
+    let port = unused_port();
+
+    let start = Instant::now();
+    let output = std::process::Command::new(cargo_bin("markview"))
+        .current_dir(dir.path())
+        .args(["--serve", "--daemon", "--port"])
+        .arg(port.to_string())
+        .arg(&file)
+        .output()
+        .expect("run daemon");
+    let elapsed = start.elapsed();
+
+    assert!(
+        !output.status.success(),
+        "expected failure, but the parent reported success: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the child fails immediately, so the parent shouldn't wait out the full readiness \
+         timeout before reporting failure, took {elapsed:?}"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        !stdout.contains("serving in background"),
+        "parent printed the success message despite the child failing: {stdout}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(stderr.contains("exited before it started serving"));
+    assert!(
+        stderr.contains(".markview-serve"),
+        "stderr should point at the log file: {stderr}"
+    );
+
+    // Nothing should actually be listening on the port.
+    assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+}
+
 fn parse_daemon_pid(stdout: &str) -> u32 {
     let after = stdout.split("pid ").nth(1).expect("stdout should mention a pid");
     let digits: String = after.chars().take_while(|ch| ch.is_ascii_digit()).collect();

@@ -245,23 +245,35 @@ fn bind_serve_listener(port: u16) -> Result<TcpListener, String> {
     })
 }
 
+/// How long `serve_markdown_daemon` waits for the detached child to actually
+/// start accepting connections before giving up and reporting failure.
+const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Initial delay between readiness polls, doubled on each retry (100ms,
+/// 200ms, 400ms, ...) until `DAEMON_READY_TIMEOUT` is exhausted.
+const DAEMON_READY_INITIAL_DELAY: Duration = Duration::from_millis(100);
+
 /// Runs the server in a detached background process instead of blocking this
-/// one, so `--serve --daemon` returns as soon as the server is confirmed to
-/// be listening.
+/// one. `--serve --daemon` only returns successfully once the child has been
+/// confirmed to actually be listening — a spawned child that fails on
+/// startup (a bad `--serve` input, the port having been stolen out from
+/// under it, ...) is reported as a failure here rather than silently
+/// reported as success while the real error sits in the child's log file.
 ///
-/// The port is probed (bound, then immediately released) here in the parent
-/// so a bad `--port` is reported synchronously, before anything is spawned,
-/// rather than only showing up later in the child's log file. There is a
-/// small window between releasing that probe and the child re-binding the
-/// same port where another process could steal it; for a single-user
-/// localhost dev tool that race isn't worth the complexity of inheriting a
-/// pre-bound socket fd across the re-exec.
+/// The port is also probed (bound, then immediately released) here in the
+/// parent so a bad `--port` is reported synchronously with a clear message
+/// before anything is even spawned, rather than only discovered via the
+/// readiness poll below. There is a small window between releasing that
+/// probe and the child re-binding the same port where another process could
+/// steal it; unlike before, that race is no longer silent — if it happens,
+/// the child fails to bind and the readiness poll below reports the timeout
+/// as a failure instead of the parent reporting success regardless.
 ///
 /// The child is a fresh, argument-identical invocation of this same binary
 /// (with `--daemon` stripped so it doesn't try to detach again) via
 /// `std::env::current_exe()`, with its stdio redirected to a log file and its
 /// stdin closed. `Command::spawn` is never `wait`ed on, which is what lets
-/// this process exit immediately while the child keeps running.
+/// this process exit as soon as the child is confirmed ready, rather than
+/// blocking for the child's whole lifetime.
 ///
 /// Note: the child stays in this process's session/process group rather than
 /// starting its own via `setsid(2)` — that would need a `libc` dependency
@@ -296,7 +308,11 @@ fn serve_markdown_daemon(
         .stdout(Stdio::from(log_file.try_clone()?))
         .stderr(Stdio::from(log_file));
 
-    let child = command.spawn()?;
+    let mut child = command.spawn()?;
+
+    if let Err(error) = wait_for_daemon_ready(&mut child, port) {
+        return Err(format!("{error} — see the log for details: {}", log_path.display()).into());
+    }
 
     println!(
         "markview: serving in background (pid {}) at http://localhost:{port} — logs: {}",
@@ -306,6 +322,43 @@ fn serve_markdown_daemon(
     io::stdout().flush()?;
 
     Ok(())
+}
+
+/// Polls `port` with exponential backoff until something is actually
+/// accepting TCP connections on it — the real confirmation that the child
+/// came up, since a plain connect is enough and there's no need to inspect
+/// any response. Also watches the child directly via `try_wait` so an early
+/// exit (e.g. a bad `--serve` input failing `ServeConfig::from_inputs`, or
+/// losing a race for the port) is reported immediately instead of only after
+/// the full `DAEMON_READY_TIMEOUT` budget elapses.
+fn wait_for_daemon_ready(child: &mut std::process::Child, port: u16) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + DAEMON_READY_TIMEOUT;
+    let mut delay = DAEMON_READY_INITIAL_DELAY;
+
+    loop {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return Ok(());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(format!(
+                    "background server for port {port} exited before it started serving ({status})"
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => return Err(format!("failed to check background server: {error}")),
+        }
+
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "background server for port {port} did not become ready within {:.0}s",
+                DAEMON_READY_TIMEOUT.as_secs_f64()
+            ));
+        }
+        thread::sleep(delay.min(deadline - now));
+        delay *= 2;
+    }
 }
 
 fn daemon_log_path(port: u16) -> PathBuf {

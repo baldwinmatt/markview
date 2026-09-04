@@ -810,6 +810,86 @@ fn serve_mode_rejects_recurse_without_serve() {
 }
 
 #[test]
+fn serve_mode_rejects_daemon_without_serve() {
+    let mut cmd = Command::cargo_bin("markview").expect("binary");
+    cmd.args(["--daemon", "README.md"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown argument: --daemon"));
+}
+
+#[test]
+fn serve_mode_daemon_detaches_and_prints_pid_and_address() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("README.md");
+    std::fs::write(&file, "# Daemonized\n").expect("write sample");
+    let port = unused_port();
+
+    let start = Instant::now();
+    let output = std::process::Command::new(cargo_bin("markview"))
+        .current_dir(dir.path())
+        .args(["--serve", "--daemon", "--port"])
+        .arg(port.to_string())
+        .arg(&file)
+        .output()
+        .expect("run daemon");
+    let startup_elapsed = start.elapsed();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        startup_elapsed < Duration::from_secs(5),
+        "the foreground parent should exit quickly instead of blocking, took {startup_elapsed:?}"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(stdout.contains(&format!("http://localhost:{port}")));
+    assert!(stdout.contains("pid "));
+    let pid = parse_daemon_pid(&stdout);
+
+    let body = poll_http_until_ready(port, Duration::from_secs(5));
+    assert!(body.contains(r#"<h1 id="daemonized">Daemonized</h1>"#));
+
+    kill_pid(pid);
+}
+
+fn parse_daemon_pid(stdout: &str) -> u32 {
+    let after = stdout.split("pid ").nth(1).expect("stdout should mention a pid");
+    let digits: String = after.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    digits.parse().expect("pid should be numeric")
+}
+
+fn poll_http_until_ready(port: u16, timeout: Duration) -> String {
+    let start = Instant::now();
+    loop {
+        if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
+            let request = write!(
+                stream,
+                "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            );
+            let mut response = Vec::new();
+            if request.is_ok() && stream.read_to_end(&mut response).is_ok() {
+                return String::from_utf8_lossy(&response).to_string();
+            }
+        }
+        if start.elapsed() > timeout {
+            panic!("daemonized server on port {port} did not become ready in time");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn kill_pid(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .arg("-9")
+        .arg(pid.to_string())
+        .status();
+}
+
+#[test]
 fn serve_mode_rejects_recurse_with_non_directory_input() {
     let dir = tempfile::tempdir().expect("temp dir");
     let one = dir.path().join("one.md");

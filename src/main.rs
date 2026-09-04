@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
@@ -42,7 +42,11 @@ fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
             return Err(markview::CliError::MissingServeInput.into());
         }
         let inputs = cli.inputs.iter().map(PathBuf::from).collect::<Vec<_>>();
-        serve_markdown(inputs, port, cli.recurse)?;
+        if cli.daemon {
+            serve_markdown_daemon(inputs, port, cli.recurse)?;
+        } else {
+            serve_markdown(inputs, port, cli.recurse)?;
+        }
         return Ok(None);
     }
 
@@ -198,13 +202,7 @@ fn serve_markdown(
     recurse: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = ServeConfig::from_inputs(inputs.clone(), port, recurse)?;
-    let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|error| {
-        if error.kind() == io::ErrorKind::AddrInUse {
-            format!("port {port} is already in use")
-        } else {
-            format!("failed to bind localhost:{port}: {error}")
-        }
-    })?;
+    let listener = bind_serve_listener(port)?;
     let address = listener.local_addr()?;
     config.port = address.port();
     let bound_port = config.port;
@@ -235,6 +233,85 @@ fn serve_markdown(
     }
 
     Ok(())
+}
+
+fn bind_serve_listener(port: u16) -> Result<TcpListener, String> {
+    TcpListener::bind(("127.0.0.1", port)).map_err(|error| {
+        if error.kind() == io::ErrorKind::AddrInUse {
+            format!("port {port} is already in use")
+        } else {
+            format!("failed to bind localhost:{port}: {error}")
+        }
+    })
+}
+
+/// Runs the server in a detached background process instead of blocking this
+/// one, so `--serve --daemon` returns as soon as the server is confirmed to
+/// be listening.
+///
+/// The port is probed (bound, then immediately released) here in the parent
+/// so a bad `--port` is reported synchronously, before anything is spawned,
+/// rather than only showing up later in the child's log file. There is a
+/// small window between releasing that probe and the child re-binding the
+/// same port where another process could steal it; for a single-user
+/// localhost dev tool that race isn't worth the complexity of inheriting a
+/// pre-bound socket fd across the re-exec.
+///
+/// The child is a fresh, argument-identical invocation of this same binary
+/// (with `--daemon` stripped so it doesn't try to detach again) via
+/// `std::env::current_exe()`, with its stdio redirected to a log file and its
+/// stdin closed. `Command::spawn` is never `wait`ed on, which is what lets
+/// this process exit immediately while the child keeps running.
+///
+/// Note: the child stays in this process's session/process group rather than
+/// starting its own via `setsid(2)` — that would need a `libc` dependency
+/// that isn't otherwise pulled in for a non-GUI build. In practice the child
+/// is reparented to init as soon as this process exits, same as an ordinary
+/// shell `&` background job, which is enough for a well-behaved CLI daemon;
+/// the one edge case this doesn't cover is the child receiving a `SIGHUP` if
+/// the controlling terminal's session ends abnormally before this process
+/// has had a chance to exit.
+fn serve_markdown_daemon(
+    inputs: Vec<PathBuf>,
+    port: u16,
+    recurse: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    drop(bind_serve_listener(port)?);
+
+    let current_exe = std::env::current_exe()?;
+    let log_path = daemon_log_path(port);
+    let log_file = fs::File::create(&log_path)?;
+
+    let mut command = Command::new(current_exe);
+    command.arg("--serve");
+    for input in &inputs {
+        command.arg(input);
+    }
+    command.args(["--port", &port.to_string()]);
+    if recurse {
+        command.arg("--recurse");
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file.try_clone()?))
+        .stderr(Stdio::from(log_file));
+
+    let child = command.spawn()?;
+
+    println!(
+        "markview: serving in background (pid {}) at http://localhost:{port} — logs: {}",
+        child.id(),
+        log_path.display()
+    );
+    io::stdout().flush()?;
+
+    Ok(())
+}
+
+fn daemon_log_path(port: u16) -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(format!(".markview-serve-{port}.log"))
 }
 
 impl ServeConfig {

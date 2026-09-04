@@ -911,6 +911,47 @@ fn serve_mode_discovers_assets_added_after_startup() {
 }
 
 #[test]
+fn serve_mode_discovers_an_asset_created_after_its_reference_without_touching_the_document() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        dir.path().join("README.md"),
+        "# Doc\n\n![Chart](chart.png)\n",
+    )
+    .expect("write readme");
+    let mut server = ServeProcess::start_dir(dir.path());
+
+    // The asset doesn't exist yet, so it 404s and gets cached as missing.
+    assert!(http_get(server.port, "/chart.png").contains("HTTP/1.1 404 Not Found"));
+
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port)).expect("connect events");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set timeout");
+    stream
+        .write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("write request");
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        reader.read_line(&mut line).expect("read header");
+        if line == "\r\n" {
+            break;
+        }
+    }
+
+    // Create the asset without touching the Markdown document at all.
+    std::fs::write(dir.path().join("chart.png"), b"\x89PNG\r\n\x1a\n").expect("write chart");
+    let event = read_until(&mut reader, "data: reload", Duration::from_secs(5));
+    assert!(event.contains("data: reload"));
+
+    let asset = http_get(server.port, "/chart.png");
+    assert!(asset.contains("HTTP/1.1 200 OK"));
+    assert!(asset.contains("Content-Type: image/png"));
+    server.stop();
+}
+
+#[test]
 fn serve_mode_supports_percent_encoded_asset_references() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(

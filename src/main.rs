@@ -816,7 +816,10 @@ fn is_client_disconnect(error: &io::Error) -> bool {
 /// editor save that shows up as remove+create — triggers a full rescan
 /// (re-running the same discovery `serve_markdown` used at startup) before
 /// pushing the reload, so the served document set stays in sync with disk
-/// instead of only ever reflecting what existed when the server started.
+/// instead of only ever reflecting what existed when the server started. Any
+/// other (non-Markdown) change under the root — an asset being added,
+/// edited, or removed — invalidates the active config's `asset_cache` so the
+/// next request re-scans instead of serving a stale (e.g. missing) result.
 fn watch_root(
     shared: SharedConfig,
     inputs: Vec<PathBuf>,
@@ -870,6 +873,13 @@ fn handle_fs_events(
     let current = shared.read().expect("config lock").clone();
     let mut relevant = false;
     let mut needs_rescan = false;
+    // Any non-Markdown change under the watched root — an asset being
+    // created, edited, or removed — can't add/remove a served *document*, but
+    // it can change what `scan_assets()` should return (e.g. an image a
+    // document already references shows up on disk). `scan_assets()`'s cache
+    // is only keyed on document mtimes, so it has no way to notice this on
+    // its own; the cache must be invalidated here instead.
+    let mut asset_changed = false;
     for event in events {
         if !is_reload_event(&event.kind) {
             continue;
@@ -880,6 +890,8 @@ fn handle_fs_events(
         );
         for event_path in &event.paths {
             if !is_markdown_path(event_path) {
+                relevant = true;
+                asset_changed = true;
                 continue;
             }
             relevant = true;
@@ -899,6 +911,8 @@ fn handle_fs_events(
         return;
     }
     if needs_rescan {
+        // A fresh `ServeConfig` carries its own empty `asset_cache`, so
+        // there's nothing to invalidate here even if `asset_changed` too.
         let shared = shared.clone();
         let clients = clients.clone();
         let inputs = inputs.to_vec();
@@ -906,6 +920,11 @@ fn handle_fs_events(
             rescan_and_reload(shared, clients, inputs, port, recurse, current);
         });
     } else {
+        if asset_changed {
+            if let Ok(mut cache) = current.asset_cache.lock() {
+                *cache = None;
+            }
+        }
         broadcast_reload(clients, ReloadKind::Content);
     }
 }

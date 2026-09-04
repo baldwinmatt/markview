@@ -816,6 +816,11 @@ fn is_client_disconnect(error: &io::Error) -> bool {
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::ConnectionAborted
             | io::ErrorKind::UnexpectedEof
+            // A `/events` write timing out (see `set_write_timeout`) means a
+            // peer went silently unreachable rather than disconnecting
+            // cleanly — routine in the same way, so it's quieted the same way.
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::WouldBlock
     )
 }
 
@@ -1103,6 +1108,11 @@ fn serve_events(
         clients: clients.clone(),
         id,
     };
+    // Without this, a peer that vanishes without a clean FIN/RST (network
+    // death, laptop sleep) may never make a write fail at all, and this
+    // thread — along with its `clients` entry — would leak forever instead
+    // of being noticed and cleaned up like an ordinary disconnect.
+    stream.set_write_timeout(Some(EVENTS_KEEPALIVE))?;
     stream.write_all(
         b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n",
     )?;

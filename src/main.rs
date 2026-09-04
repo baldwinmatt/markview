@@ -458,9 +458,7 @@ impl ServeConfig {
         self.documents
             .iter()
             .map(|document| {
-                let mtime = fs::metadata(&document.source_path)
-                    .and_then(|metadata| metadata.modified())
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                let mtime = file_mtime(&document.source_path).unwrap_or(SystemTime::UNIX_EPOCH);
                 (document.source_path.clone(), mtime)
             })
             .collect()
@@ -1836,11 +1834,14 @@ fn inject_serve_shell(
     html.replace("</body>", &format!("{footer}\n{script}\n</body>"))
 }
 
+/// Low-level "what's this file's mtime" primitive shared by every caller
+/// that needs one, each applying its own fallback for a failed/missing stat.
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    path.metadata().ok()?.modified().ok()
+}
+
 fn modified_timestamp_millis(path: &Path) -> Option<u128> {
-    path.metadata()
-        .ok()?
-        .modified()
-        .ok()?
+    file_mtime(path)?
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_millis())

@@ -87,7 +87,7 @@ struct ServeConfig {
 #[derive(Debug)]
 struct AssetCache {
     signature: Vec<(PathBuf, SystemTime)>,
-    assets: Vec<ServedAsset>,
+    assets: Arc<[ServedAsset]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -412,8 +412,9 @@ impl ServeConfig {
 
     fn asset_by_route(&self, route: &str) -> Option<ServedAsset> {
         self.scan_assets()
-            .into_iter()
+            .iter()
             .find(|asset| asset.route_path == route)
+            .cloned()
     }
 
     fn route_for_request(&self, request_path: &str) -> Option<String> {
@@ -465,7 +466,7 @@ impl ServeConfig {
             .collect()
     }
 
-    fn scan_assets(&self) -> Vec<ServedAsset> {
+    fn scan_assets(&self) -> Arc<[ServedAsset]> {
         let signature = self.document_mtimes();
         // A poisoned lock (some other thread panicked while holding it)
         // degrades to a forced cache miss rather than taking this thread
@@ -474,6 +475,8 @@ impl ServeConfig {
         if let Ok(cache) = self.asset_cache.lock() {
             if let Some(cached) = cache.as_ref() {
                 if cached.signature == signature {
+                    // Cheap: bumps a refcount instead of deep-cloning every
+                    // asset just so the caller can `.find()` one of them.
                     return cached.assets.clone();
                 }
             }
@@ -481,7 +484,7 @@ impl ServeConfig {
         // The disk scan itself runs with the lock released, so it doesn't
         // serialize every other thread's `scan_assets()` call (one thread
         // per connection) behind a single miss's I/O.
-        let assets = self.scan_assets_uncached();
+        let assets: Arc<[ServedAsset]> = self.scan_assets_uncached().into();
         if let Ok(mut cache) = self.asset_cache.lock() {
             *cache = Some(AssetCache {
                 signature,

@@ -1193,7 +1193,7 @@ fn handle_connection(
             } else if let Some(asset) = config.asset_by_route(route) {
                 serve_asset(&mut stream, config, &asset, head_only)
             } else if is_favicon_request(request_path) {
-                serve_favicon(&mut stream, head_only)
+                serve_favicon(&mut stream, config, head_only)
             } else {
                 write_404(&mut stream, head_only)
             }
@@ -1201,9 +1201,14 @@ fn handle_connection(
     }
 }
 
-/// The favicon a browser requests automatically; served from the app icon
-/// only when nothing on disk already claims the `/favicon.ico` route, so a
-/// user's own favicon still takes precedence.
+/// The favicon a browser requests automatically. Browsers fetch
+/// `/favicon.ico` unprompted, with no Markdown reference required, so
+/// whether a served directory has its own is answered by checking the
+/// filesystem directly (the same way `serve_asset` validates any other
+/// on-disk file) rather than by the reference-scanned asset allowlist that
+/// `document_by_route`/`asset_by_route` are built from. A real
+/// `favicon.ico` under the served root always wins; this app icon is only
+/// the fallback when there is none.
 static FAVICON: &[u8] = include_bytes!("../assets/favicon.png");
 
 fn is_favicon_request(request_path: &str) -> bool {
@@ -1214,7 +1219,19 @@ fn is_favicon_request(request_path: &str) -> bool {
     path == "/favicon.ico"
 }
 
-fn serve_favicon(stream: &mut TcpStream, head_only: bool) -> io::Result<()> {
+fn serve_favicon(stream: &mut TcpStream, config: &ServeConfig, head_only: bool) -> io::Result<()> {
+    let candidate = config.root.join("favicon.ico");
+    if let Some(canonical) = validated_served_path(&config.root, &candidate) {
+        if let Ok(bytes) = fs::read(&canonical) {
+            return write_bytes_response(
+                stream,
+                "200 OK",
+                safe_content_type("favicon.ico"),
+                &bytes,
+                head_only,
+            );
+        }
+    }
     write_bytes_response(stream, "200 OK", "image/png", FAVICON, head_only)
 }
 

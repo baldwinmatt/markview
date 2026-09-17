@@ -276,6 +276,49 @@ fn serve_mode_serves_a_built_in_favicon_when_none_is_referenced() {
 }
 
 #[test]
+fn serve_mode_serves_an_unreferenced_favicon_from_the_served_directory() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("README.md"), "# Served\n").expect("write sample");
+    std::fs::write(dir.path().join("favicon.ico"), "REAL-FAVICON-ON-DISK").expect("write favicon");
+    let mut server = ServeProcess::start_dir(dir.path());
+
+    let response = http_get(server.port, "/favicon.ico");
+
+    assert!(response.contains("HTTP/1.1 200 OK"));
+    assert!(
+        response.contains("REAL-FAVICON-ON-DISK"),
+        "expected the real on-disk favicon to be served, got: {response}"
+    );
+    assert!(
+        !response.contains("Content-Length: 5980"),
+        "expected the real favicon's length, not the built-in fallback's: {response}"
+    );
+    server.stop();
+}
+
+#[test]
+fn serve_mode_serves_a_root_relative_referenced_favicon_from_the_served_directory() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        dir.path().join("README.md"),
+        "# Served\n\n![icon](/favicon.ico)\n",
+    )
+    .expect("write sample");
+    std::fs::write(dir.path().join("favicon.ico"), "REFERENCED-FAVICON-BYTES")
+        .expect("write favicon");
+    let mut server = ServeProcess::start_dir(dir.path());
+
+    let response = http_get(server.port, "/favicon.ico");
+
+    assert!(response.contains("HTTP/1.1 200 OK"));
+    assert!(
+        response.contains("REFERENCED-FAVICON-BYTES"),
+        "expected the real on-disk favicon to be served, got: {response}"
+    );
+    server.stop();
+}
+
+#[test]
 fn serve_mode_reports_port_in_use() {
     let dir = tempfile::tempdir().expect("temp dir");
     let file = dir.path().join("README.md");

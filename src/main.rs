@@ -587,6 +587,9 @@ impl ServeConfig {
         if decoded.chars().any(|ch| ch == '\0' || ch.is_control()) {
             return None;
         }
+        if decoded == "/favicon.ico" {
+            return Some("/favicon.ico".to_owned());
+        }
         let repeated = decode_repeated(path)?;
         if repeated.chars().any(|ch| ch == '\0' || ch.is_control()) {
             return None;
@@ -1187,13 +1190,12 @@ fn handle_connection(
                 }
             }
         }
+        "/favicon.ico" => serve_favicon(&mut stream, config, head_only),
         _ => {
             if let Some(document) = config.document_by_route(route) {
                 serve_document(&mut stream, config, document, head_only)
             } else if let Some(asset) = config.asset_by_route(route) {
                 serve_asset(&mut stream, config, &asset, head_only)
-            } else if is_favicon_request(request_path) {
-                serve_favicon(&mut stream, config, head_only)
             } else {
                 write_404(&mut stream, head_only)
             }
@@ -1203,21 +1205,13 @@ fn handle_connection(
 
 /// The favicon a browser requests automatically. Browsers fetch
 /// `/favicon.ico` unprompted, with no Markdown reference required, so
-/// whether a served directory has its own is answered by checking the
-/// filesystem directly (the same way `serve_asset` validates any other
-/// on-disk file) rather than by the reference-scanned asset allowlist that
-/// `document_by_route`/`asset_by_route` are built from. A real
-/// `favicon.ico` under the served root always wins; this app icon is only
-/// the fallback when there is none.
+/// `route_for_request` treats it as a virtual route (like `/events`) and
+/// dispatch here checks the filesystem directly (the same way `serve_asset`
+/// validates any other on-disk file) rather than the reference-scanned
+/// asset allowlist that `document_by_route`/`asset_by_route` are built
+/// from. A real `favicon.ico` under the served root always wins; this app
+/// icon is only the fallback when there is none.
 static FAVICON: &[u8] = include_bytes!("../assets/favicon.png");
-
-fn is_favicon_request(request_path: &str) -> bool {
-    let path = request_path
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(request_path);
-    path == "/favicon.ico"
-}
 
 fn serve_favicon(stream: &mut TcpStream, config: &ServeConfig, head_only: bool) -> io::Result<()> {
     let candidate = config.root.join("favicon.ico");

@@ -319,6 +319,25 @@ fn serve_mode_serves_a_root_relative_referenced_favicon_from_the_served_director
 }
 
 #[test]
+fn serve_mode_serves_the_built_in_favicon_for_a_percent_encoded_request() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("README.md");
+    std::fs::write(&file, "# Served\n").expect("write sample");
+    let mut server = ServeProcess::start(&file);
+
+    // "%66" decodes to "f", so this is the same logical request as
+    // /favicon.ico, just percent-encoded like any other route already
+    // tolerates.
+    let response = http_get(server.port, "/%66avicon.ico");
+
+    assert!(
+        response.contains("HTTP/1.1 200 OK"),
+        "expected the built-in favicon fallback, got: {response}"
+    );
+    server.stop();
+}
+
+#[test]
 fn serve_mode_reports_port_in_use() {
     let dir = tempfile::tempdir().expect("temp dir");
     let file = dir.path().join("README.md");

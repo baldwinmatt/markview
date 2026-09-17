@@ -262,6 +262,20 @@ fn serve_mode_returns_404_for_unknown_routes() {
 }
 
 #[test]
+fn serve_mode_serves_a_built_in_favicon_when_none_is_referenced() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("README.md");
+    std::fs::write(&file, "# Served\n").expect("write sample");
+    let mut server = ServeProcess::start(&file);
+
+    let response = http_get(server.port, "/favicon.ico");
+
+    assert!(response.contains("HTTP/1.1 200 OK"));
+    assert!(response.contains("Content-Type: image/png"));
+    server.stop();
+}
+
+#[test]
 fn serve_mode_reports_port_in_use() {
     let dir = tempfile::tempdir().expect("temp dir");
     let file = dir.path().join("README.md");

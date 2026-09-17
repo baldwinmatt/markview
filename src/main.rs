@@ -1192,11 +1192,30 @@ fn handle_connection(
                 serve_document(&mut stream, config, document, head_only)
             } else if let Some(asset) = config.asset_by_route(route) {
                 serve_asset(&mut stream, config, &asset, head_only)
+            } else if is_favicon_request(request_path) {
+                serve_favicon(&mut stream, head_only)
             } else {
                 write_404(&mut stream, head_only)
             }
         }
     }
+}
+
+/// The favicon a browser requests automatically; served from the app icon
+/// only when nothing on disk already claims the `/favicon.ico` route, so a
+/// user's own favicon still takes precedence.
+static FAVICON: &[u8] = include_bytes!("../assets/favicon.png");
+
+fn is_favicon_request(request_path: &str) -> bool {
+    let path = request_path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(request_path);
+    path == "/favicon.ico"
+}
+
+fn serve_favicon(stream: &mut TcpStream, head_only: bool) -> io::Result<()> {
+    write_bytes_response(stream, "200 OK", "image/png", FAVICON, head_only)
 }
 
 fn serve_document(

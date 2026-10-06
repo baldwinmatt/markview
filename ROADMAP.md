@@ -54,13 +54,30 @@ Markview is a small, fast, local-first Markdown viewer written in Rust. The proj
 
 ## Issue Tracker
 
-### BUG-001: GUI tabs and menu stop responding after returning to the foreground
+### BUG-001: GUI controls stop responding after backgrounding or minimizing; Reload produces a blank screen
 
-- **Status:** Open; reported 2026-10-06, not yet investigated.
-- **Reported behavior:** After Markview's GUI has been backgrounded and is brought back to the foreground, tabs cannot be switched and the menu does not appear.
-- **Reproduction steps:** Open multiple documents in the GUI, send the app to the background, bring it back to the foreground, then try switching tabs and opening the menu.
-- **Expected behavior:** Tab switching and menu display continue to work after the app returns to the foreground.
-- **Details to establish during investigation:** Which menu is affected, how long the app must be backgrounded, and whether the failure occurs consistently.
+- **Status:** Open; reported 2026-10-06, scope and acceptance criteria confirmed 2026-10-06. Runtime diagnosis and cause remain unverified.
+- **Reported behavior:** Consistently after roughly one minute backgrounded or minimized, returning to the GUI leaves the tab bar and toolbar unresponsive. Keyboard actions and the app's context menus also stop working.
+- **Controls that still work:** Scrolling and the native macOS menu bar remain functional. The native menu can open a new document, but doing so does not restore the rest of the UI.
+- **Related failure:** Selecting Reload from the right-click menu produces a blank screen.
+- **Reproduction steps:** Open multiple documents, background or minimize the app for longer than one minute, return to it, and try tabs, toolbar actions, keyboard actions, and context menus. Repeat both background and minimize cycles. Check the Reload failure separately, using disposable content until unsaved-edit preservation is verified.
+- **Expected behavior:** All GUI controls continue working after returning to the foreground, with the active document/tab, scroll position, editor state, and unsaved edits preserved.
+
+**Investigation scope**
+
+- Diagnose the cause before choosing a repair; an automatic UI reload that loses document state or unsaved edits is not an acceptable workaround.
+- Investigate the unresponsive controls and Reload's blank screen together unless evidence establishes separate causes.
+- Start with the confirmed background and minimize sequences. Expand to related transitions such as switching Spaces or waking from sleep only if evidence points to a shared cause.
+- Establish the affected build and launch route, macOS version, and the failing interaction path through runtime reproduction; keep observations separate from hypotheses.
+
+**Acceptance criteria**
+
+- [ ] Repeated background and minimize cycles longer than one minute succeed in the running macOS app, in both Preview and Edit modes.
+- [ ] After each return, tabs, toolbar actions, typing in Edit mode, keyboard shortcuts, and app context menus work; scrolling and native macOS menus remain functional.
+- [ ] The active document/tab, scroll position, editor state, and unsaved edits survive every cycle and any recovery.
+- [ ] Reload displays a usable document instead of a blank screen and does not silently discard unsaved edits.
+- [ ] Verification includes a document with unsaved edits and records the build, launch route, macOS version, cycle duration/count, and results.
+- [ ] Relevant automated checks pass alongside repeated runtime verification; existing generated-HTML tests alone do not establish that the lifecycle failure is fixed.
 
 ### FEAT-001: Edit from a tab's right-click context menu
 

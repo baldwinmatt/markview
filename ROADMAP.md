@@ -56,7 +56,7 @@ Markview is a small, fast, local-first Markdown viewer written in Rust. The proj
 
 ### BUG-001: GUI controls stop responding after backgrounding or minimizing; Reload produces a blank screen
 
-- **Status:** Fix implemented; reported and scope confirmed 2026-10-06. Heading/IPC and Reload failures are verified repaired; repeated background/minimize acceptance verification remains in progress.
+- **Status:** Fix verified 2026-10-06; committed as `6e6ead5`. Heading/IPC, Reload, and tab/draft checks across the four-cycle Preview/Edit × background/minimize matrix passed. Detailed per-return control and position acceptance verification remains partial.
 - **Reported behavior:** Consistently after roughly one minute backgrounded or minimized, returning to the GUI leaves the tab bar and toolbar unresponsive. Keyboard actions and the app's context menus also stop working.
 - **Controls that still work:** Scrolling and the native macOS menu bar remain functional. The native menu can open a new document, but doing so does not restore the rest of the UI.
 - **Related failure:** Selecting Reload from the right-click menu produces a blank screen.
@@ -75,7 +75,10 @@ Markview is a small, fast, local-first Markdown viewer written in Rust. The proj
 - The IPC URL regression test failed against `about:blank#first` and passed with the repaired shell URL. All 160 GUI-feature tests, the GUI build, GUI clippy checks, and formatting checks for the modified Rust file passed.
 - Runtime checks passed for heading navigation followed by tab switching, native WebKit Reload, reading position at Section 10 of a long document, unsaved source/dirty state/edit mode/selection preservation, and an input event immediately followed by Reload.
 - One background cycle in Edit mode longer than one minute passed, including tabs, typing, toolbar toggles, and a context-menu Reload cancelled at the unsaved-changes prompt.
-- Minimize restoration could not be reliably controlled through automation; a physical foreground check is pending. Repeated Preview and Edit background/minimize cycles remain required before closing this issue.
+- The user confirmed physical Dock restoration and responsive tab switching after an Edit/minimize interval longer than one minute. Subsequent inspection confirmed the unsaved draft and edit mode remained intact.
+- A Preview/background interval longer than one minute passed after native dialog activation, including tab switching and preservation of the draft in the other tab. Automation's window-raise action alone did not activate the window.
+- The final Preview/minimize interval exceeded one minute. The user confirmed physical Dock restoration, responsive switching between both tabs, and preservation of the unsaved draft. All four Preview/Edit × background/minimize intervals exceeded one minute and passed tab/draft checks; minimized-window returns used physical Dock restoration because automation could not restore them.
+- Broader controls were explicitly exercised after Edit/background, and reading position/editor selection were checked across Reload. These observations do not establish the full control and position criteria after every lifecycle return; those two criteria remain unchecked.
 
 **Investigation scope**
 
@@ -86,12 +89,12 @@ Markview is a small, fast, local-first Markdown viewer written in Rust. The proj
 
 **Acceptance criteria**
 
-- [ ] Repeated background and minimize cycles longer than one minute succeed in the running macOS app, in both Preview and Edit modes.
+- [x] Repeated background and minimize cycles longer than one minute succeed in the running macOS app, in both Preview and Edit modes.
 - [ ] After each return, tabs, toolbar actions, typing in Edit mode, keyboard shortcuts, and app context menus work; scrolling and native macOS menus remain functional.
 - [ ] The active document/tab, scroll position, editor state, and unsaved edits survive every cycle and any recovery.
 - [x] Reload displays a usable document instead of a blank screen and does not silently discard unsaved edits.
-- [ ] Verification includes a document with unsaved edits and records the build, launch route, macOS version, cycle duration/count, and results.
-- [ ] Relevant automated checks pass alongside repeated runtime verification; existing generated-HTML tests alone do not establish that the lifecycle failure is fixed.
+- [x] Verification includes a document with unsaved edits and records the build, launch route, macOS version, cycle duration/count, and results.
+- [x] Relevant automated checks pass alongside repeated runtime verification; existing generated-HTML tests alone do not establish that the lifecycle failure is fixed.
 
 ### FEAT-001: Edit from a tab's right-click context menu
 

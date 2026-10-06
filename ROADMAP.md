@@ -52,6 +52,25 @@ Markview is a small, fast, local-first Markdown viewer written in Rust. The proj
 - [x] Keep auto-refresh and manual refresh from clobbering unsaved or in-progress edits.
 - [x] Add toolbar buttons, menu items, and keyboard shortcuts (Cmd+E, Cmd+S) for editing and saving.
 
+## Issue Tracker
+
+### BUG-001: GUI tabs and menu stop responding after returning to the foreground
+
+- **Status:** Open; reported 2026-10-06, not yet investigated.
+- **Reported behavior:** After Markview's GUI has been backgrounded and is brought back to the foreground, tabs cannot be switched and the menu does not appear.
+- **Reproduction steps:** Open multiple documents in the GUI, send the app to the background, bring it back to the foreground, then try switching tabs and opening the menu.
+- **Expected behavior:** Tab switching and menu display continue to work after the app returns to the foreground.
+- **Details to establish during investigation:** Which menu is affected, how long the app must be backgrounded, and whether the failure occurs consistently.
+
+### FEAT-001: Edit from a tab's right-click context menu
+
+- **Status:** Open; requested 2026-10-06.
+- **Requested behavior:** Add an **Edit** option to each tab's right-click context menu that opens a Markdown editor for that tab's document.
+- **Editor:** A plain-text editing panel with Markdown syntax highlighting and squiggles only.
+- **Optional reference pane:** Show Markdown syntax guidance beside the editor.
+- **Existing foundation:** The v1.1 editing work above records a per-tab plain-text editor and Edit/Preview toggle; this request adds the context-menu entry, highlighting, squiggles, and optional syntax reference.
+- **Detail to establish before implementation:** What the squiggles should flag.
+
 ## Review Workflow
 
 Every commit should be reviewed before starting the next task:

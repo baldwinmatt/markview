@@ -1,9 +1,12 @@
-use std::collections::HashSet;
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::ExitCode;
+use std::rc::Rc;
 
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
@@ -15,7 +18,10 @@ use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::window::WindowBuilder;
-use wry::{http::Request, WebView, WebViewBuilder};
+use wry::{
+    http::{Request, Response},
+    RequestAsyncResponder, WebView, WebViewBuilder,
+};
 
 #[path = "markview_gui_support/mod.rs"]
 mod gui_support;
@@ -24,6 +30,49 @@ use gui_support::{
     help, load_preferences, normalize_path, persist_open_state, preferences_path, restore_files,
     update_window_size, GuiCli,
 };
+
+const APP_SHELL_URL: &str = "markview://app/";
+
+type ShellRequests = Rc<RefCell<VecDeque<(Request<Vec<u8>>, RequestAsyncResponder)>>>;
+
+struct AppWebView {
+    webview: WebView,
+    shell_requests: ShellRequests,
+}
+
+impl std::ops::Deref for AppWebView {
+    type Target = WebView;
+
+    fn deref(&self) -> &Self::Target {
+        &self.webview
+    }
+}
+
+fn is_app_shell_url(value: &str) -> bool {
+    url::Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "markview"
+            && url.host_str() == Some("app")
+            && url.path() == "/"
+            && url.query().is_none()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.port().is_none()
+    })
+}
+
+fn shell_response(request: Request<Vec<u8>>, view: &AppView) -> Response<Cow<'static, [u8]>> {
+    let (status, body) = if is_app_shell_url(&request.uri().to_string()) {
+        (200, app_shell_html(view).into_bytes())
+    } else {
+        (404, Vec::new())
+    };
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "text/html; charset=utf-8")
+        .header("Cache-Control", "no-store")
+        .body(Cow::Owned(body))
+        .expect("valid shell response")
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -61,16 +110,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .build(&event_loop)?;
 
-    let webview = build_webview(
-        &window,
-        proxy.clone(),
-        &app_view_with_preferences(&model, preferences.clone()),
-    )?;
+    let webview = build_webview(&window, proxy.clone())?;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
         match event {
+            Event::UserEvent(UserEvent::ShellRequested) => {
+                // Render after earlier IPC events (including edits) have updated the model.
+                let pending = webview.shell_requests.borrow_mut().pop_front();
+                if let Some((request, responder)) = pending {
+                    let view = app_view_with_preferences(&model, preferences.clone());
+                    responder.respond(shell_response(request, &view));
+                }
+            }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
@@ -239,12 +292,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            Event::UserEvent(UserEvent::CloseOtherTabs(id)) => {
+            Event::UserEvent(UserEvent::CloseOtherTabs(id))
                 if confirm_if_dirty(
                     &window,
                     other_tabs_dirty(&model, id),
                     "Other open tabs have unsaved changes. Discard them and close those tabs?",
-                ) {
+                ) => {
                     model.close_others(id);
                     sync_after_tab_mutation(
                         &mut watcher,
@@ -254,14 +307,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         &webview,
                         &window,
                     );
-                }
             }
-            Event::UserEvent(UserEvent::CloseTabsToLeft(id)) => {
+            Event::UserEvent(UserEvent::CloseTabsToLeft(id))
                 if confirm_if_dirty(
                     &window,
                     tabs_to_left_dirty(&model, id),
                     "Some of the tabs you're closing have unsaved changes. Discard them and close those tabs?",
-                ) {
+                ) => {
                     model.close_to_left(id);
                     sync_after_tab_mutation(
                         &mut watcher,
@@ -271,14 +323,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         &webview,
                         &window,
                     );
-                }
             }
-            Event::UserEvent(UserEvent::CloseTabsToRight(id)) => {
+            Event::UserEvent(UserEvent::CloseTabsToRight(id))
                 if confirm_if_dirty(
                     &window,
                     tabs_to_right_dirty(&model, id),
                     "Some of the tabs you're closing have unsaved changes. Discard them and close those tabs?",
-                ) {
+                ) => {
                     model.close_to_right(id);
                     sync_after_tab_mutation(
                         &mut watcher,
@@ -288,7 +339,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         &webview,
                         &window,
                     );
-                }
             }
             Event::UserEvent(UserEvent::ReloadTab(id)) => {
                 let message = model
@@ -360,8 +410,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn build_webview(
     window: &tao::window::Window,
     proxy: EventLoopProxy<UserEvent>,
-    initial_view: &AppView,
-) -> wry::Result<WebView> {
+) -> wry::Result<AppWebView> {
     let ipc_proxy = proxy.clone();
     let handler = move |request: Request<String>| {
         let body = request.body();
@@ -437,11 +486,11 @@ fn build_webview(
             let _ = navigation_proxy.send_event(UserEvent::OpenExternal(url));
             false
         } else {
-            true
+            is_app_shell_url(&url)
         }
     };
 
-    let drop_proxy = proxy;
+    let drop_proxy = proxy.clone();
     let drag_drop_handler = move |event: wry::DragDropEvent| {
         if let wry::DragDropEvent::Drop { paths, .. } = event {
             let _ = drop_proxy.send_event(UserEvent::DroppedFiles(paths));
@@ -451,12 +500,24 @@ fn build_webview(
         }
     };
 
-    WebViewBuilder::new()
-        .with_html(app_shell_html(initial_view))
+    let shell_requests: ShellRequests = Rc::new(RefCell::new(VecDeque::new()));
+    let protocol_requests = shell_requests.clone();
+    let webview = WebViewBuilder::new()
+        .with_asynchronous_custom_protocol("markview".to_owned(), move |_, request, responder| {
+            protocol_requests
+                .borrow_mut()
+                .push_back((request, responder));
+            let _ = proxy.send_event(UserEvent::ShellRequested);
+        })
+        .with_url(APP_SHELL_URL)
         .with_ipc_handler(handler)
         .with_navigation_handler(navigation_handler)
         .with_drag_drop_handler(drag_drop_handler)
-        .build(window)
+        .build(window)?;
+    Ok(AppWebView {
+        webview,
+        shell_requests,
+    })
 }
 
 fn initial_model(
@@ -694,7 +755,7 @@ fn sync_after_tab_mutation(
     preferences_path: &Path,
     preferences: &mut GuiPreferences,
     model: &AppModel,
-    webview: &WebView,
+    webview: &AppWebView,
     window: &tao::window::Window,
 ) {
     sync_watcher(watcher, model);
@@ -705,7 +766,7 @@ fn sync_persisted_view(
     preferences_path: &Path,
     preferences: &mut GuiPreferences,
     model: &AppModel,
-    webview: &WebView,
+    webview: &AppWebView,
     window: &tao::window::Window,
 ) {
     persist_open_state(preferences_path, preferences, model, Some(window));
@@ -713,11 +774,9 @@ fn sync_persisted_view(
     window.set_title(&window_title(model));
 }
 
-fn sync_view(webview: &WebView, model: &AppModel, preferences: &GuiPreferences) {
-    let script = format!(
-        "window.markview.setState({});",
-        view_js(&app_view_with_preferences(model, preferences.clone()))
-    );
+fn sync_view(webview: &AppWebView, model: &AppModel, preferences: &GuiPreferences) {
+    let next = app_view_with_preferences(model, preferences.clone());
+    let script = format!("window.markview.setState({});", view_js(&next));
     if let Err(error) = webview.evaluate_script(&script) {
         eprintln!("markview-gui: failed to update view: {error}");
     }
@@ -780,6 +839,7 @@ fn any_tab_dirty(model: &AppModel) -> bool {
 
 #[derive(Debug, Clone)]
 enum UserEvent {
+    ShellRequested,
     OpenRequested,
     RefreshRequested,
     PrintRequested,
@@ -1817,19 +1877,51 @@ function setTip(el, tip) {{
   el.dataset.tooltip = tip;
   el.setAttribute('aria-label', tip);
 }}
+function readReadingState() {{
+  try {{
+    return JSON.parse(sessionStorage.getItem('markview-reading-state') || '{{}}') || {{}};
+  }} catch {{
+    return {{}};
+  }}
+}}
+const savedReadingState = readReadingState();
 window.markview = {{
-  state: {state},
-  scrollPositions: new Map(),
-  findQuery: '',
+  state: null,
+  scrollPositions: new Map(savedReadingState.scrollPositions || []),
+  editorPositions: new Map(savedReadingState.editorPositions || []),
+  findQuery: savedReadingState.findQuery || '',
   findIndex: -1,
   findHits: [],
+  rememberPosition() {{
+    const id = this.state ? this.state.activeTabId : null;
+    if (id === null) return;
+    this.scrollPositions.set(id, document.getElementById('scroll-root').scrollTop);
+    const editor = document.querySelector('textarea.editor');
+    if (editor) {{
+      this.editorPositions.set(id, {{
+        start: editor.selectionStart, end: editor.selectionEnd,
+        direction: editor.selectionDirection, scrollTop: editor.scrollTop
+      }});
+    }}
+    try {{
+      sessionStorage.setItem('markview-reading-state', JSON.stringify({{
+        scrollPositions: Array.from(this.scrollPositions),
+        editorPositions: Array.from(this.editorPositions), findQuery: this.findQuery
+      }}));
+    }} catch {{
+      // Reading positions are optional if session storage is unavailable.
+    }}
+  }},
   setState(next) {{
     const scroller = document.getElementById('scroll-root');
-    const previousId = this.state ? this.state.activeTabId : null;
-    if (previousId !== null) {{
-      this.scrollPositions.set(previousId, scroller.scrollTop);
-    }}
+    this.rememberPosition();
     this.state = next;
+    const openIds = new Set(next.tabs.map(tab => tab.id));
+    for (const positions of [this.scrollPositions, this.editorPositions]) {{
+      for (const id of positions.keys()) {{
+        if (!openIds.has(id)) positions.delete(id);
+      }}
+    }}
     const tabs = document.getElementById('tabs');
     const pane = document.getElementById('document');
     const toc = document.getElementById('toc');
@@ -1913,9 +2005,18 @@ window.markview = {{
         textarea.placeholder = 'Start writing Markdown...';
         textarea.addEventListener('input', () => {{
           window.ipc.postMessage(`edit:${{next.activeTabId}}:${{textarea.value}}`);
+          window.markview.rememberPosition();
         }});
+        for (const event of ['select', 'keyup', 'scroll']) {{
+          textarea.addEventListener(event, () => window.markview.rememberPosition());
+        }}
         pane.appendChild(textarea);
+        const position = this.editorPositions.get(next.activeTabId);
         textarea.focus();
+        if (position) {{
+          textarea.setSelectionRange(position.start, position.end, position.direction);
+          textarea.scrollTop = position.scrollTop;
+        }}
       }}
     }} else {{
       pane.innerHTML = next.activeHtml;
@@ -1949,7 +2050,6 @@ window.markview = {{
             const target = document.getElementById(heading.id);
             if (target) {{
               scrollInside(target, 'start');
-              history.replaceState(null, '', `#${{heading.id}}`);
             }}
           }};
           list.appendChild(item);
@@ -2105,7 +2205,11 @@ function highlightText(root, query) {{
 document.getElementById('find-input').addEventListener('input', event => {{
   window.markview.findQuery = event.target.value;
   window.markview.applyFind();
+  window.markview.rememberPosition();
 }});
+document.getElementById('find-input').value = window.markview.findQuery;
+document.getElementById('scroll-root').addEventListener('scroll', () => window.markview.rememberPosition());
+window.addEventListener('pagehide', () => window.markview.rememberPosition());
 document.getElementById('find-input').addEventListener('keydown', event => {{
   if (event.key === 'Enter') {{
     event.preventDefault();
@@ -2165,7 +2269,7 @@ window.addEventListener('keydown', event => {{
 function fileName(path) {{
   return path.split(/[\\/]/).filter(Boolean).pop() || path;
 }}
-window.markview.setState(window.markview.state);
+window.markview.setState({state});
 </script>
 </body>
 </html>
@@ -2260,6 +2364,62 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn shell_url_with_heading_fragment_is_valid_for_webkit_ipc() {
+        // Wry's WKScriptMessage handler constructs this request from the frame URL.
+        let request = Request::builder()
+            .uri(format!("{APP_SHELL_URL}#first"))
+            .body("select:1".to_owned());
+        assert!(
+            request.is_ok(),
+            "heading navigation must not disable IPC: {request:?}"
+        );
+    }
+
+    #[test]
+    fn shell_reload_uses_latest_draft_and_active_tab() {
+        let mut model = AppModel::new();
+        model.open_untitled("one", "# One".to_owned());
+        let id = model.open_untitled("draft", "# Draft".to_owned());
+        model.toggle_editing(id);
+        model.update_source(id, "# Unsaved revision".to_owned());
+        let response = shell_response(
+            Request::builder()
+                .uri(APP_SHELL_URL)
+                .body(Vec::new())
+                .unwrap(),
+            &app_view_with_preferences(&model, GuiPreferences::default()),
+        );
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["Cache-Control"], "no-store");
+        let html = std::str::from_utf8(response.body()).unwrap();
+        assert!(html.contains("activeSource:\"# Unsaved revision\""));
+        assert!(html.contains(&format!("activeTabId:{id},")));
+        assert!(html.contains("editing:true,dirty:true"));
+        assert_eq!(
+            model.active_tab().unwrap().document().source(),
+            "# Unsaved revision"
+        );
+    }
+
+    #[test]
+    fn shell_protocol_only_serves_its_own_document() {
+        let view = app_view_with_preferences(&AppModel::new(), GuiPreferences::default());
+        for value in [
+            "markview://other/",
+            "markview://app/file.md",
+            "markview://app/?other=1",
+        ] {
+            let response = shell_response(
+                Request::builder().uri(value).body(Vec::new()).unwrap(),
+                &view,
+            );
+            assert_eq!(response.status(), 404);
+        }
+        assert!(is_app_shell_url("markview://app/#first"));
+        assert!(!is_app_shell_url("about:blank"));
+    }
+
+    #[test]
     fn identifies_external_http_links() {
         assert!(is_external_url("https://example.com"));
         assert!(is_external_url("http://example.com"));
@@ -2328,8 +2488,10 @@ mod tests {
             GuiPreferences::default(),
         ));
 
-        assert!(html.contains("scrollPositions: new Map()"));
-        assert!(html.contains("this.scrollPositions.set(previousId, scroller.scrollTop)"));
+        assert!(html.contains("scrollPositions: new Map(savedReadingState.scrollPositions || [])"));
+        assert!(html.contains(
+            "this.scrollPositions.set(id, document.getElementById('scroll-root').scrollTop)"
+        ));
         assert!(html.contains("const restoreY = this.scrollPositions.get(next.activeTabId) || 0"));
         assert!(html.contains("scroller.scrollTop = restoreY"));
         assert!(html.contains("document.getElementById('scroll-root')"));
@@ -2355,6 +2517,14 @@ mod tests {
             &AppModel::new(),
             GuiPreferences::default(),
         ));
+        // Test the key handler, not toolbar commands that intentionally use IPC.
+        let html = html
+            .split("window.addEventListener('keydown', event => {")
+            .nth(1)
+            .expect("keyboard handler")
+            .split("function fileName")
+            .next()
+            .unwrap();
 
         assert!(html.contains("event.key.toLowerCase() === 'q'"));
         assert!(html.contains("window.ipc.postMessage('quit')"));

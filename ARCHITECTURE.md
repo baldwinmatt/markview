@@ -43,12 +43,14 @@ The flow is:
 2. Load `GuiPreferences`.
 3. Build or restore `AppModel`.
 4. Convert the model to `AppView` with `app_view_with_preferences`.
-5. Render the app shell into the WebView.
+5. Load the app shell from the private `markview://app/` WebView protocol.
 6. Receive toolbar, tab, recent-file, print, edit, save, link, drag/drop, and file-watch events through the event loop.
 7. Mutate `AppModel`/`GuiPreferences`.
 8. Rebuild `AppView` and send a small JavaScript state update to the WebView.
 
 The WebView shell should remain a view adapter. File loading, tab state, stale state, preferences, and rendered document data should stay in Rust model types.
+
+Shell requests, including WebKit Reload, are queued through the GUI event loop and rendered from the current model after earlier edit events. Reload preserves unsaved source, dirty state, and the active tab instead of returning to the launch snapshot or an empty `about:blank` page. Scroll positions, editor selection, and find text are kept in WebView session storage across shell reloads. Table-of-contents buttons scroll within the document without modifying the shell URL; the private URL also remains valid for WebKit IPC when a Markdown anchor adds a fragment.
 
 ## Editing
 

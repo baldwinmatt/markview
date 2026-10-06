@@ -56,12 +56,26 @@ Markview is a small, fast, local-first Markdown viewer written in Rust. The proj
 
 ### BUG-001: GUI controls stop responding after backgrounding or minimizing; Reload produces a blank screen
 
-- **Status:** Open; reported 2026-10-06, scope and acceptance criteria confirmed 2026-10-06. Runtime diagnosis and cause remain unverified.
+- **Status:** Fix implemented; reported and scope confirmed 2026-10-06. Heading/IPC and Reload failures are verified repaired; repeated background/minimize acceptance verification remains in progress.
 - **Reported behavior:** Consistently after roughly one minute backgrounded or minimized, returning to the GUI leaves the tab bar and toolbar unresponsive. Keyboard actions and the app's context menus also stop working.
 - **Controls that still work:** Scrolling and the native macOS menu bar remain functional. The native menu can open a new document, but doing so does not restore the rest of the UI.
 - **Related failure:** Selecting Reload from the right-click menu produces a blank screen.
 - **Reproduction steps:** Open multiple documents, background or minimize the app for longer than one minute, return to it, and try tabs, toolbar actions, keyboard actions, and context menus. Repeat both background and minimize cycles. Check the Reload failure separately, using disposable content until unsaved-edit preservation is verified.
 - **Expected behavior:** All GUI controls continue working after returning to the foreground, with the active document/tab, scroll position, editor state, and unsaved edits preserved.
+
+**Diagnosis and fix**
+
+- A table-of-contents click changed the inline shell URL from `about:blank` to `about:blank#heading`. Wry's macOS IPC request builder rejected that URL and silently dropped GUI commands. This failure reproduced immediately without backgrounding; removing the fragment restored commands without reloading.
+- Native WebKit Reload cleared the inline `about:blank` shell. The repaired shell uses the private, reloadable `markview://app/` protocol, and table-of-contents buttons scroll without rewriting its URL.
+- Shell requests are handled in event order against the current model, preserving drafts and the active tab. WebView session storage preserves reading positions, editor selection, and find text across Reload.
+
+**Verification recorded 2026-10-06**
+
+- Current-source debug app, launched as a separate local bundle on macOS 27.0 (26A428), with two disposable Markdown files and isolated preferences.
+- The IPC URL regression test failed against `about:blank#first` and passed with the repaired shell URL. All 160 GUI-feature tests, the GUI build, GUI clippy checks, and formatting checks for the modified Rust file passed.
+- Runtime checks passed for heading navigation followed by tab switching, native WebKit Reload, reading position at Section 10 of a long document, unsaved source/dirty state/edit mode/selection preservation, and an input event immediately followed by Reload.
+- One background cycle in Edit mode longer than one minute passed, including tabs, typing, toolbar toggles, and a context-menu Reload cancelled at the unsaved-changes prompt.
+- Minimize restoration could not be reliably controlled through automation; a physical foreground check is pending. Repeated Preview and Edit background/minimize cycles remain required before closing this issue.
 
 **Investigation scope**
 
@@ -75,7 +89,7 @@ Markview is a small, fast, local-first Markdown viewer written in Rust. The proj
 - [ ] Repeated background and minimize cycles longer than one minute succeed in the running macOS app, in both Preview and Edit modes.
 - [ ] After each return, tabs, toolbar actions, typing in Edit mode, keyboard shortcuts, and app context menus work; scrolling and native macOS menus remain functional.
 - [ ] The active document/tab, scroll position, editor state, and unsaved edits survive every cycle and any recovery.
-- [ ] Reload displays a usable document instead of a blank screen and does not silently discard unsaved edits.
+- [x] Reload displays a usable document instead of a blank screen and does not silently discard unsaved edits.
 - [ ] Verification includes a document with unsaved edits and records the build, launch route, macOS version, cycle duration/count, and results.
 - [ ] Relevant automated checks pass alongside repeated runtime verification; existing generated-HTML tests alone do not establish that the lifecycle failure is fixed.
 

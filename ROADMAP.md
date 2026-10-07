@@ -105,6 +105,13 @@ Markview is a small, fast, local-first Markdown viewer written in Rust. The proj
 - **Existing foundation:** The v1.1 editing work above records a per-tab plain-text editor and Edit/Preview toggle; this request adds the context-menu entry, highlighting, squiggles, and optional syntax reference.
 - **Detail to establish before implementation:** What the squiggles should flag.
 
+### FEAT-002: Copy Path from a tab's right-click context menu
+
+- **Status:** Open; requested 2026-10-07.
+- **Requested behavior:** Add a **Copy Path** option to each file-backed tab's right-click context menu that copies that document's full file path to the clipboard.
+- **Target:** Copy the path of the right-clicked tab, even when another tab is active.
+- **Untitled tabs:** Disable the option when the document has no file path.
+
 ## Review Workflow
 
 Every commit should be reviewed before starting the next task:

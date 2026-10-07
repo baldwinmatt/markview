@@ -49,6 +49,8 @@ The GUI renders Markdown through the system WebKit view and includes:
 
 - Toolbar actions for Open, Edit/Preview, Save, Refresh, Print, sidebar visibility, auto-refresh, theme selection, recent files, and find-in-document.
 - A per-tab Markdown editor: toggle a tab into a plain-text editor (Cmd+E), edit the raw source, and toggle back to a live preview. Unsaved tabs show a dirty indicator; Cmd+S (or File > Save) writes the active tab back to its file, prompting for a destination if the tab has none yet.
+- Right-click a tab and choose Edit to open that document's editor, or Copy Path to copy its full file path. Copy Path is disabled for untitled documents.
+- The editor highlights Markdown syntax, shows spelling squiggles on macOS (excluding code and links), and offers a collapsible Markdown syntax reference beside the source. Standard Cut, Copy, Paste, Undo, and Redo shortcuts are available.
 - Tabs for multiple open documents, including per-tab close buttons and overflow scrolling.
 - Markdown document registration for bundled `.app` builds.
 - A table-of-contents sidebar generated from document headings.
@@ -76,6 +78,8 @@ Preferences are stored locally in `~/Library/Application Support/markview/prefer
 For a deeper map of the core types, GUI flow, persistence, packaging, and release process, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Development workflow
+
+Editor highlighting and spelling-response checks can be run with `node --test tests/editor.test.cjs`, alongside the Rust GUI tests.
 
 Every commit should be reviewed before starting the next task:
 

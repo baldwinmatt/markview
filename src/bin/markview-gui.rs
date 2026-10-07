@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::fs;
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::ExitCode;
@@ -394,10 +394,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     sync_view(&webview, &model, &preferences);
                 }
             }
+            Event::UserEvent(UserEvent::EditTab(id)) if edit_tab(&mut model, id) => {
+                sync_persisted_view(&preferences_path, &mut preferences, &model, &webview, &window);
+            }
+            Event::UserEvent(UserEvent::CopyTabPath(id)) => {
+                if let Some(path) = tab_copy_path(&model, id) {
+                    if let Err(error) = copy_path_to_clipboard(&path) {
+                        eprintln!("markview-gui: failed to copy path: {error}");
+                    }
+                }
+            }
             Event::UserEvent(UserEvent::EditChanged(id, text)) => {
                 model.update_source(id, text);
                 sync_view(&webview, &model, &preferences);
                 window.set_title(&window_title(&model));
+            }
+            Event::UserEvent(UserEvent::CheckSpelling(id, text)) => {
+                let ranges = spelling_ranges(&text).into_iter()
+                    .map(|(start, length)| format!("[{start},{length}]"))
+                    .collect::<Vec<_>>().join(",");
+                let script = format!("receiveEditorSpelling({id}, {}, [{ranges}]);", js_string(&text));
+                if let Err(error) = webview.evaluate_script(&script) {
+                    eprintln!("markview-gui: failed to show spelling marks: {error}");
+                }
             }
             Event::UserEvent(UserEvent::SaveRequested) => {
                 match save_active(&window, &mut model) {
@@ -431,6 +450,75 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
 }
 
+#[cfg(target_os = "macos")]
+fn spelling_ranges(text: &str) -> Vec<(usize, usize)> {
+    use objc2_app_kit::NSSpellChecker;
+    use objc2_foundation::NSString;
+
+    let checker = NSSpellChecker::sharedSpellChecker();
+    let source = NSString::from_str(text);
+    let length = text.encode_utf16().count();
+    let mut cursor = 0;
+    let mut ranges = Vec::new();
+    while cursor < length {
+        let range = checker.checkSpellingOfString_startingAt(&source, cursor as isize);
+        if range.length == 0 || range.location < cursor || range.location >= length {
+            break;
+        }
+        let end = range.location.saturating_add(range.length);
+        if end <= cursor || end > length {
+            break;
+        }
+        ranges.push((range.location, range.length));
+        cursor = end;
+    }
+    ranges
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spelling_ranges(_text: &str) -> Vec<(usize, usize)> {
+    Vec::new()
+}
+
+fn edit_tab(model: &mut AppModel, id: u64) -> bool {
+    if !model.select(id) {
+        return false;
+    }
+    if !model.active_tab().is_some_and(|tab| tab.is_editing()) {
+        model.toggle_editing(id);
+    }
+    true
+}
+
+fn tab_copy_path(model: &AppModel, id: u64) -> Option<PathBuf> {
+    let path = model.tabs().iter().find(|tab| tab.id() == id)?.path()?;
+    std::path::absolute(path).ok()
+}
+
+fn copy_path_to_clipboard(path: &Path) -> io::Result<()> {
+    let mut command = Command::new(if cfg!(target_os = "macos") {
+        "/usr/bin/pbcopy"
+    } else {
+        "xclip"
+    });
+    if !cfg!(target_os = "macos") {
+        command.args(["-selection", "clipboard"]);
+    }
+    let mut child = command.stdin(std::process::Stdio::piped()).spawn()?;
+    let write_result = child
+        .stdin
+        .take()
+        .expect("piped clipboard input")
+        .write_all(path.to_string_lossy().as_bytes());
+    let status = child.wait()?;
+    write_result?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("clipboard command failed"))
+    }
+}
+
 fn build_webview(
     window: &tao::window::Window,
     proxy: EventLoopProxy<UserEvent>,
@@ -450,6 +538,21 @@ fn build_webview(
             "cycle-theme" => Some(UserEvent::CycleTheme),
             "toggle-edit" => Some(UserEvent::ToggleActiveEdit),
             "save" => Some(UserEvent::SaveRequested),
+            _ if body.starts_with("spell:") => body.strip_prefix("spell:").and_then(|rest| {
+                rest.split_once(':').and_then(|(id, text)| {
+                    id.parse()
+                        .ok()
+                        .map(|id| UserEvent::CheckSpelling(id, text.to_owned()))
+                })
+            }),
+            _ if body.starts_with("edit-tab:") => body
+                .strip_prefix("edit-tab:")
+                .and_then(|id| id.parse().ok())
+                .map(UserEvent::EditTab),
+            _ if body.starts_with("copy-tab-path:") => body
+                .strip_prefix("copy-tab-path:")
+                .and_then(|id| id.parse().ok())
+                .map(UserEvent::CopyTabPath),
             _ if body.starts_with("edit:") => {
                 let rest = body.trim_start_matches("edit:");
                 rest.split_once(':').and_then(|(id, text)| {
@@ -910,6 +1013,9 @@ enum UserEvent {
     ExportTabHtml(u64),
     FilesChanged(Vec<PathBuf>),
     ToggleActiveEdit,
+    EditTab(u64),
+    CopyTabPath(u64),
+    CheckSpelling(u64, String),
     EditChanged(u64, String),
     SaveRequested,
 }
@@ -1127,7 +1233,12 @@ fn install_application_menu(proxy: EventLoopProxy<UserEvent>) {
 
     let edit_item = NSMenuItem::new(mtm);
     let edit_menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("Edit"));
+    system_menu_item(&edit_menu, "Undo", sel!(undo:), "z");
+    system_menu_item(&edit_menu, "Redo", sel!(redo:), "Z");
+    edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    system_menu_item(&edit_menu, "Cut", sel!(cut:), "x");
     system_menu_item(&edit_menu, "Copy", sel!(copy:), "c");
+    system_menu_item(&edit_menu, "Paste", sel!(paste:), "v");
     system_menu_item(&edit_menu, "Select All", sel!(selectAll:), "a");
     edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
     menu_item(&edit_menu, &command_target, "Find", sel!(markviewFind), "f");
@@ -1621,12 +1732,22 @@ main {{
   padding: 40px 0 64px;
   min-width: 0;
 }}
-.editor {{
+.editor-tools {{ margin-bottom: 8px; }}
+.editor-tools button {{ font: inherit; color: var(--fg); background: var(--chrome); border: 1px solid var(--rule); border-radius: 6px; padding: 6px 10px; }}
+.editor-layout {{ display: flex; gap: 16px; align-items: flex-start; }}
+.editor-surface {{ position: relative; flex: 1; min-width: 0; height: max(350px, calc(100vh - 240px)); }}
+.editor-reference {{ flex: 0 0 210px; padding: 12px; border: 1px solid var(--rule); border-radius: 8px; }}
+.editor-reference[hidden] {{ display: none; }}
+.editor-reference pre {{ font-size: 0.8rem; white-space: pre-wrap; margin: 4px 0 12px; padding: 6px; }}
+.editor, .editor-highlight {{
   appearance: none;
   display: block;
   width: 100%;
-  min-height: calc(100vh - 190px);
-  resize: vertical;
+  height: 100%;
+  box-sizing: border-box;
+  margin: 0;
+  overflow: auto;
+  white-space: pre;
   border: 1px solid var(--rule);
   border-radius: 8px;
   background: var(--code-bg);
@@ -1636,6 +1757,18 @@ main {{
   font-size: 0.92rem;
   line-height: 1.6;
   tab-size: 2;
+}}
+.editor-highlight {{ position: absolute; inset: 0; pointer-events: none; }}
+.editor {{ position: relative; resize: none; background: transparent; color: transparent; caret-color: var(--fg); }}
+.editor::placeholder {{ color: var(--muted); }}
+.md-heading, .md-link {{ color: var(--accent); }}
+.md-code {{ color: var(--muted); }}
+.md-markup {{ color: var(--accent); }}
+.md-spelling {{ text-decoration: underline wavy #e35d6a; text-underline-offset: 3px; }}
+@media (max-width: 720px) {{
+  .editor-layout {{ flex-direction: column; }}
+  .editor-surface {{ width: 100%; flex: auto; }}
+  .editor-reference {{ width: 100%; box-sizing: border-box; flex: auto; }}
 }}
 .editor:focus {{
   outline: none;
@@ -1909,6 +2042,7 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
   </div>
 </div>
 <script>
+{editor_script}
 function setTip(el, tip) {{
   el.title = tip;
   el.dataset.tooltip = tip;
@@ -2038,7 +2172,6 @@ window.markview = {{
         textarea.className = 'editor';
         textarea.dataset.tabId = String(next.activeTabId);
         textarea.value = next.activeSource;
-        textarea.spellcheck = false;
         textarea.placeholder = 'Start writing Markdown...';
         textarea.addEventListener('input', () => {{
           window.ipc.postMessage(`edit:${{next.activeTabId}}:${{textarea.value}}`);
@@ -2047,7 +2180,7 @@ window.markview = {{
         for (const event of ['select', 'keyup', 'scroll']) {{
           textarea.addEventListener(event, () => window.markview.rememberPosition());
         }}
-        pane.appendChild(textarea);
+        decorateEditor(textarea, pane);
         const position = this.editorPositions.get(next.activeTabId);
         textarea.focus();
         if (position) {{
@@ -2111,6 +2244,10 @@ window.markview = {{
     this.findHits = [];
     this.findIndex = -1;
     const query = this.findQuery.trim();
+    if (pane.querySelector('textarea.editor')) {{
+      count.textContent = '';
+      return;
+    }}
     if (query.length === 0) {{
       count.textContent = '';
       return;
@@ -2166,6 +2303,9 @@ window.markview = {{
       separator.className = 'context-menu-separator';
       menu.appendChild(separator);
     }};
+    addItem('Edit', `edit-tab:${{id}}`);
+    addItem('Copy Path', `copy-tab-path:${{id}}`, !tab.path);
+    addSeparator();
     addItem('Close', `close:${{id}}`);
     addItem('Close Others', `close-others:${{id}}`, tabs.length < 2);
     addItem('Close to the Left', `close-left:${{id}}`, index === 0);
@@ -2324,7 +2464,8 @@ window.markview.setState({state});
 </body>
 </html>
 "#,
-        state = view_js(view)
+        state = view_js(view),
+        editor_script = include_str!("markview_gui_support/editor.js")
     )
 }
 
@@ -2501,6 +2642,38 @@ mod tests {
         assert!(html.contains("tab-count"));
         assert!(html.contains("scrollIntoView"));
         assert!(html.contains("${next.tabs.length} open"));
+    }
+
+    #[test]
+    fn context_edit_selects_target_without_toggling_or_losing_draft() {
+        let mut model = AppModel::new();
+        let target = model.open_untitled("target", "# Original".into());
+        let other = model.open_untitled("other", "# Other".into());
+        assert_eq!(model.active_tab_id(), Some(other));
+        assert!(edit_tab(&mut model, target));
+        assert_eq!(model.active_tab_id(), Some(target));
+        assert!(model.active_tab().unwrap().is_editing());
+        model.update_source(target, "# Unsaved draft".into());
+        model.select(other);
+        assert!(edit_tab(&mut model, target));
+        let tab = model.active_tab().unwrap();
+        assert!(tab.is_editing());
+        assert!(tab.is_dirty());
+        assert_eq!(tab.document().source(), "# Unsaved draft");
+        assert!(!edit_tab(&mut model, u64::MAX));
+        assert_eq!(model.active_tab_id(), Some(target));
+    }
+
+    #[test]
+    fn copy_path_targets_context_tab_and_ignores_untitled_or_missing_tabs() {
+        let mut model = AppModel::new();
+        let path = std::env::current_dir().unwrap().join("file with spaces.md");
+        let target = model.open_file(path.clone(), "# File".into());
+        let untitled = model.open_untitled("draft", String::new());
+        assert_eq!(tab_copy_path(&model, target), Some(path));
+        assert_eq!(tab_copy_path(&model, untitled), None);
+        assert_eq!(tab_copy_path(&model, u64::MAX), None);
+        assert_eq!(model.active_tab_id(), Some(untitled));
     }
 
     #[test]

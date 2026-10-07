@@ -98,19 +98,21 @@ Markview is a small, fast, local-first Markdown viewer written in Rust. The proj
 
 ### FEAT-001: Edit from a tab's right-click context menu
 
-- **Status:** Open; requested 2026-10-06.
+- **Status:** Implemented and verified locally 2026-10-07; requested 2026-10-06.
 - **Requested behavior:** Add an **Edit** option to each tab's right-click context menu that opens a Markdown editor for that tab's document.
 - **Editor:** A plain-text editing panel with Markdown syntax highlighting and squiggles only.
 - **Optional reference pane:** Show Markdown syntax guidance beside the editor.
 - **Existing foundation:** The v1.1 editing work above records a per-tab plain-text editor and Edit/Preview toggle; this request adds the context-menu entry, highlighting, squiggles, and optional syntax reference.
-- **Detail to establish before implementation:** What the squiggles should flag.
+- **Squiggles:** Spelling checks using the macOS dictionary; code and links are excluded. Spelling was used as the default interpretation of the request.
+- **Verification:** Native macOS checks confirmed Edit activates the right-clicked tab, syntax highlighting and the optional reference pane render, spelling squiggles appear while typing, and Undo/Redo preserve source. Automated checks cover targeting, repeated Edit without toggling out of the editor or discarding a draft, source-preserving highlighting, Unicode spelling offsets, and stale spelling responses.
 
 ### FEAT-002: Copy Path from a tab's right-click context menu
 
-- **Status:** Open; requested 2026-10-07.
+- **Status:** Implemented and verified locally 2026-10-07; requested 2026-10-07.
 - **Requested behavior:** Add a **Copy Path** option to each file-backed tab's right-click context menu that copies that document's full file path to the clipboard.
 - **Target:** Copy the path of the right-clicked tab, even when another tab is active.
 - **Untitled tabs:** Disable the option when the document has no file path.
+- **Verification:** In the native GUI, Copy Path on an inactive test tab copied that tab's full path, confirmed by pasting into a disposable document. Automated checks cover file-backed, untitled, and missing tabs without changing the active tab.
 
 ### BUG-002 / FEAT-003: GUI document links and destination handling
 

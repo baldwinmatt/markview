@@ -23,7 +23,7 @@ highlight = []
 libc = { version = "0.2", optional = true }
 notify = { version = "8" }
 objc2 = { version = "0.6", optional = true }
-objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSEvent", "NSMenu", "NSMenuItem"], optional = true }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSSpellChecker"], optional = true }
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSObject", "NSString"], optional = true }
 open = { version = "5" }
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }

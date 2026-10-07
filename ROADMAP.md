@@ -112,6 +112,14 @@ Markview is a small, fast, local-first Markdown viewer written in Rust. The proj
 - **Target:** Copy the path of the right-clicked tab, even when another tab is active.
 - **Untitled tabs:** Disable the option when the document has no file path.
 
+### BUG-002 / FEAT-003: GUI document links and destination handling
+
+- **Status:** Open; reported and requested 2026-10-07, not yet investigated.
+- **Reported behavior:** Links in documents displayed in the GUI do not open.
+- **Relative Markdown links:** Resolve the linked Markdown file relative to the current document's directory and open it in a new GUI tab.
+- **External links:** Show a warning dialog before opening the destination, with **Cancel** and **Open in Browser** actions. Cancel leaves the link unopened; Open in Browser opens it in the user's default browser.
+- **Verification to perform:** Confirm the reported failure, check a relative Markdown link opens the correct document in a new tab, and check both actions in the external-link dialog.
+
 ## Review Workflow
 
 Every commit should be reviewed before starting the next task:

@@ -506,8 +506,14 @@ fn explicit_multi_file_serve_does_not_force_rescan_reload_for_unserved_markdown(
     std::fs::write(&unserved, "# Unserved\n").expect("write unserved");
     let event = read_until(&mut reader, "data:", Duration::from_secs(5));
 
-    assert!(event.contains("data: reload"), "unexpected event stream: {event}");
-    assert!(!event.contains("data: rescan"), "unserved file forced a structural reload: {event}");
+    assert!(
+        event.contains("data: reload"),
+        "unexpected event stream: {event}"
+    );
+    assert!(
+        !event.contains("data: rescan"),
+        "unserved file forced a structural reload: {event}"
+    );
     assert!(http_get(server.port, "/unserved.md").contains("HTTP/1.1 404 Not Found"));
     server.stop();
 }
@@ -751,10 +757,16 @@ fn serve_mode_recurse_rescans_when_a_served_file_is_renamed_away_from_markdown()
     let mut reader = open_reload_stream(server.port);
     std::fs::rename(&old, &renamed).expect("rename old doc");
     let event = read_until(&mut reader, "data: rescan", Duration::from_secs(5));
-    assert!(event.contains("data: rescan"), "unexpected event stream: {event}");
+    assert!(
+        event.contains("data: rescan"),
+        "unexpected event stream: {event}"
+    );
 
     let after = http_get(server.port, "/");
-    assert!(!after.contains(r#"href="/old.md""#), "stale nav link remained:\n{after}");
+    assert!(
+        !after.contains(r#"href="/old.md""#),
+        "stale nav link remained:\n{after}"
+    );
     assert!(http_get(server.port, "/old.md").contains("HTTP/1.1 404 Not Found"));
     server.stop();
 }
@@ -775,10 +787,19 @@ fn serve_mode_recurse_rescans_when_a_served_file_is_deleted() {
     std::fs::remove_file(&stale).expect("delete stale doc");
     let event = read_until(&mut reader, "data:", Duration::from_secs(5));
 
-    assert!(event.contains("data: reload"), "unexpected event stream: {event}");
-    assert!(!event.contains("data: rescan"), "unchanged nav layout forced full reload: {event}");
+    assert!(
+        event.contains("data: reload"),
+        "unexpected event stream: {event}"
+    );
+    assert!(
+        !event.contains("data: rescan"),
+        "unchanged nav layout forced full reload: {event}"
+    );
     let after = http_get(server.port, "/");
-    assert!(!after.contains(r#"href="/stale.md""#), "stale nav link remained:\n{after}");
+    assert!(
+        !after.contains(r#"href="/stale.md""#),
+        "stale nav link remained:\n{after}"
+    );
     assert!(http_get(server.port, "/stale.md").contains("HTTP/1.1 404 Not Found"));
     server.stop();
 }
@@ -832,8 +853,14 @@ fn serve_mode_directory_uses_content_reload_when_added_file_keeps_sidebar_layout
     std::fs::write(dir.path().join("extra.md"), "# Extra\n").expect("write extra");
     let event = read_until(&mut reader, "data:", Duration::from_secs(5));
 
-    assert!(event.contains("data: reload"), "unexpected event stream: {event}");
-    assert!(!event.contains("data: rescan"), "unchanged nav layout forced full reload: {event}");
+    assert!(
+        event.contains("data: reload"),
+        "unexpected event stream: {event}"
+    );
+    assert!(
+        !event.contains("data: rescan"),
+        "unchanged nav layout forced full reload: {event}"
+    );
     let after = http_get(server.port, "/");
     assert!(after.contains(r#"href="/extra.md""#));
     server.stop();
@@ -1002,7 +1029,10 @@ fn serve_mode_daemon_reports_failure_when_child_fails_to_start() {
 }
 
 fn parse_daemon_pid(stdout: &str) -> u32 {
-    let after = stdout.split("pid ").nth(1).expect("stdout should mention a pid");
+    let after = stdout
+        .split("pid ")
+        .nth(1)
+        .expect("stdout should mention a pid");
     let digits: String = after.chars().take_while(|ch| ch.is_ascii_digit()).collect();
     digits.parse().expect("pid should be numeric")
 }

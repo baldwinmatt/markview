@@ -507,10 +507,9 @@ impl ServeConfig {
             }
             let collision_key = route_path.to_lowercase();
             if collision_keys.iter().any(|known| known == &collision_key) {
-                return Err(format!(
-                    "directory contains colliding Markdown routes: {route_path}"
-                )
-                .into());
+                return Err(
+                    format!("directory contains colliding Markdown routes: {route_path}").into(),
+                );
             }
             collision_keys.push(collision_key);
             documents.push(document_for_path(&root, canonical)?);
@@ -1126,10 +1125,7 @@ fn rescan_and_reload(
     broadcast_reload(&clients, reload_kind);
 }
 
-fn broadcast_reload(
-    clients: &Clients,
-    reload_kind: ReloadKind,
-) {
+fn broadcast_reload(clients: &Clients, reload_kind: ReloadKind) {
     retain_clients(clients, |(_, client)| client.send(reload_kind).is_ok());
 }
 
@@ -1272,10 +1268,7 @@ fn serve_asset(
     }
 }
 
-fn serve_events(
-    mut stream: TcpStream,
-    clients: Clients,
-) -> io::Result<()> {
+fn serve_events(mut stream: TcpStream, clients: Clients) -> io::Result<()> {
     let (tx, rx) = mpsc::channel();
     let id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     clients
@@ -2231,7 +2224,14 @@ mod serve_nav_tests {
             },
         ];
 
-        handle_fs_events(events, &shared, &clients, &[dir.path().to_path_buf()], 0, true);
+        handle_fs_events(
+            events,
+            &shared,
+            &clients,
+            &[dir.path().to_path_buf()],
+            0,
+            true,
+        );
 
         assert_eq!(
             client_rx.recv_timeout(Duration::from_secs(1)),
@@ -2269,7 +2269,10 @@ mod serve_nav_tests {
         let shared: SharedConfig = Arc::new(RwLock::new(Arc::new(config)));
         let (client_tx, client_rx) = mpsc::channel();
         let clients = Arc::new(Mutex::new(vec![(0, client_tx)]));
-        let relative_file = file.strip_prefix(&cwd).expect("relative file").to_path_buf();
+        let relative_file = file
+            .strip_prefix(&cwd)
+            .expect("relative file")
+            .to_path_buf();
         let event = notify::Event {
             kind: EventKind::Modify(notify::event::ModifyKind::Data(
                 notify::event::DataChange::Content,

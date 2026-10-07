@@ -114,11 +114,14 @@ Markview is a small, fast, local-first Markdown viewer written in Rust. The proj
 
 ### BUG-002 / FEAT-003: GUI document links and destination handling
 
-- **Status:** Open; reported and requested 2026-10-07, not yet investigated.
+- **Status:** Fixed and verified locally 2026-10-07.
 - **Reported behavior:** Links in documents displayed in the GUI do not open.
 - **Relative Markdown links:** Resolve the linked Markdown file relative to the current document's directory and open it in a new GUI tab.
 - **External links:** Show a warning dialog before opening the destination, with **Cancel** and **Open in Browser** actions. Cancel leaves the link unopened; Open in Browser opens it in the user's default browser.
-- **Verification to perform:** Confirm the reported failure, check a relative Markdown link opens the correct document in a new tab, and check both actions in the external-link dialog.
+- **Diagnosis:** A relative link such as `guide.md` resolved against the private shell URL as `markview://app/guide.md`, which the navigation filter rejected. The document's file directory was never used. HTTP(S) links already opened externally but skipped the requested warning.
+- **Fix:** Document clicks send the original link destination and source tab ID through IPC. Rust resolves local Markdown destinations beside the source document and opens a new tab, updating file watching and persisted state. HTTP(S) destinations require the **Cancel** / **Open in Browser** warning, including navigation-handler fallback. Same-document heading links scroll without changing the shell URL. Missing files, unsupported destinations, and relative links from unsaved untitled documents show an error and keep the current document intact.
+- **Runtime verification:** Installed `/Applications/Markview.app` reproduced the local-link failure twice with neighboring disposable `source.md` / `guide.md` files. A separate current-source debug bundle at `target/bug002/Markview Link Test.app` on macOS 27.0 (26A428) opened the correct file in a new tab, repeated successfully after Markdown heading navigation, and kept the shell URL intact. **Cancel** dismissed the warning and added no Chrome tab; **Open in Browser** opened `https://example.com/` in the default browser, Google Chrome.
+- **Automated verification:** Relative-link opening and external cancellation tests were observed failing before their implementation and passing afterward. Regression coverage also checks source-tab routing when another tab is active, encoded paths, parent directories, unsaved-source preservation, external approval, and failures without document replacement. All 165 GUI-feature tests pass. GUI build, GUI clippy across all targets with warnings denied, and modified-file formatting pass. Repository-wide formatting still reports pre-existing differences in `src/main.rs` and `tests/cli.rs`.
 
 ## Review Workflow
 

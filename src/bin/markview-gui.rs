@@ -27,8 +27,8 @@ use wry::{
 mod gui_support;
 
 use gui_support::{
-    help, load_preferences, normalize_path, persist_open_state, preferences_path, restore_files,
-    update_window_size, GuiCli,
+    follow_document_link, help, is_markdown_path, load_preferences, normalize_path,
+    persist_open_state, preferences_path, restore_files, update_window_size, GuiCli,
 };
 
 const APP_SHELL_URL: &str = "markview://app/";
@@ -205,10 +205,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
                 *control_flow = ControlFlow::Exit;
             }
-            Event::UserEvent(UserEvent::OpenExternal(url)) => {
+            Event::UserEvent(UserEvent::OpenExternal(url))
+                if confirm_external_link(&window, &url) =>
+            {
                 if let Err(error) = open_external_url(&url) {
                     eprintln!("markview-gui: failed to open link: {error}");
                 }
+            }
+            Event::UserEvent(UserEvent::OpenDocumentLink(id, href)) => {
+                let result = follow_document_link(
+                    &mut model,
+                    id,
+                    &href,
+                    |url| confirm_external_link(&window, url),
+                    open_external_url,
+                );
+                if let Err(error) = result {
+                    eprintln!("markview-gui: failed to open link: {error}");
+                    rfd::MessageDialog::new()
+                        .set_parent(&window)
+                        .set_level(rfd::MessageLevel::Error)
+                        .set_title("Cannot Open Link")
+                        .set_description(&error)
+                        .show();
+                }
+                if let Err(error) = watcher.sync(model.watched_directories()) {
+                    eprintln!("markview-gui: failed to watch linked document: {error}");
+                }
+                sync_persisted_view(&preferences_path, &mut preferences, &model, &webview, &window);
             }
             Event::UserEvent(UserEvent::DroppedFiles(paths)) => {
                 if let Err(error) = open_dropped_documents(paths, &mut model, &mut watcher) {
@@ -434,6 +458,13 @@ fn build_webview(
                         .map(|id| UserEvent::EditChanged(id, text.to_owned()))
                 })
             }
+            _ if body.starts_with("link:") => body.strip_prefix("link:").and_then(|rest| {
+                rest.split_once(':').and_then(|(id, href)| {
+                    id.parse()
+                        .ok()
+                        .map(|id| UserEvent::OpenDocumentLink(id, href.to_owned()))
+                })
+            }),
             _ if body.starts_with("select:") => body
                 .trim_start_matches("select:")
                 .parse::<u64>()
@@ -802,6 +833,22 @@ fn confirm_discard_changes(window: &tao::window::Window, message: &str) -> bool 
         == rfd::MessageDialogResult::Yes
 }
 
+fn confirm_external_link(window: &tao::window::Window, url: &str) -> bool {
+    rfd::MessageDialog::new()
+        .set_parent(window)
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title("Open External Link?")
+        .set_description(format!(
+            "This link leaves Markview and opens in your default browser.\n\n{url}"
+        ))
+        .set_buttons(rfd::MessageButtons::OkCancelCustom(
+            "Open in Browser".to_owned(),
+            "Cancel".to_owned(),
+        ))
+        .show()
+        == rfd::MessageDialogResult::Custom("Open in Browser".to_owned())
+}
+
 fn confirm_if_dirty(window: &tao::window::Window, dirty: bool, message: &str) -> bool {
     !dirty || confirm_discard_changes(window, message)
 }
@@ -849,6 +896,7 @@ enum UserEvent {
     ToggleAutoRefresh,
     CycleTheme,
     OpenExternal(String),
+    OpenDocumentLink(u64, String),
     DroppedFiles(Vec<PathBuf>),
     OpenRecent(PathBuf),
     SelectTab(u64),
@@ -1192,17 +1240,6 @@ fn is_refresh_event(kind: &EventKind) -> bool {
 
 fn is_external_url(url: &str) -> bool {
     url.starts_with("https://") || url.starts_with("http://")
-}
-
-fn is_markdown_path(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "md" | "markdown" | "mdown"
-            )
-        })
 }
 
 fn open_external_url(url: &str) -> io::Result<()> {
@@ -2225,6 +2262,19 @@ document.getElementById('recent-files').addEventListener('change', event => {{
   }}
 }});
 document.addEventListener('click', event => {{
+  const link = event.target.closest('#document a[href]');
+  if (link) {{
+    event.preventDefault();
+    const href = link.getAttribute('href').trim();
+    if (href.startsWith('#')) {{
+      let id = href.slice(1);
+      try {{ id = decodeURIComponent(id); }} catch (_) {{}}
+      const target = document.getElementById(id);
+      if (target) scrollInside(target, 'start');
+    }} else {{
+      window.ipc.postMessage(`link:${{window.markview.state.activeTabId}}:${{href}}`);
+    }}
+  }}
   const menu = document.getElementById('tab-context-menu');
   if (!menu.classList.contains('hidden') && !menu.contains(event.target)) {{
     window.markview.hideTabContextMenu();

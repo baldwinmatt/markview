@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -203,6 +205,17 @@ fn serve_markdown(
     open: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = ServeConfig::from_inputs(inputs.clone(), port, recurse)?;
+    #[cfg(unix)]
+    let listener = if std::env::var_os("MARKVIEW_INHERITED_LISTENER").is_some() {
+        let listener = TcpListener::from(io::stdin().as_fd().try_clone_to_owned()?);
+        if listener.local_addr()?.port() != port {
+            return Err("inherited listener does not match --port".into());
+        }
+        listener
+    } else {
+        bind_serve_listener(port)?
+    };
+    #[cfg(not(unix))]
     let listener = bind_serve_listener(port)?;
     let address = listener.local_addr()?;
     config.port = address.port();
@@ -267,38 +280,14 @@ const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// 200ms, 400ms, ...) until `DAEMON_READY_TIMEOUT` is exhausted.
 const DAEMON_READY_INITIAL_DELAY: Duration = Duration::from_millis(100);
 
-/// Runs the server in a detached background process instead of blocking this
-/// one. `--serve --daemon` only returns successfully once the child has been
-/// confirmed to actually be listening — a spawned child that fails on
-/// startup (a bad `--serve` input, the port having been stolen out from
-/// under it, ...) is reported as a failure here rather than silently
-/// reported as success while the real error sits in the child's log file.
+/// Starts a background child and reports success only after its serving banner
+/// appears and it is still alive. On Unix the bound socket is inherited through
+/// stdin, so choosing a concrete port for `--port 0` never releases the port.
+/// Other platforms rebind in the child; its banner distinguishes readiness from
+/// an unrelated listener. The concrete `--port` remains visible in child argv.
 ///
-/// The port is also probed (bound, then immediately released) here in the
-/// parent so a bad `--port` is reported synchronously with a clear message
-/// before anything is even spawned, rather than only discovered via the
-/// readiness poll below. For `--port 0` the probe is also how a free port
-/// gets picked: the child is launched on the concrete port it returns. There is a small window between releasing that
-/// probe and the child re-binding the same port where another process could
-/// steal it; unlike before, that race is no longer silent — if it happens,
-/// the child fails to bind and the readiness poll below reports the timeout
-/// as a failure instead of the parent reporting success regardless.
-///
-/// The child is a fresh, argument-identical invocation of this same binary
-/// (with `--daemon` stripped so it doesn't try to detach again) via
-/// `std::env::current_exe()`, with its stdio redirected to a log file and its
-/// stdin closed. `Command::spawn` is never `wait`ed on, which is what lets
-/// this process exit as soon as the child is confirmed ready, rather than
-/// blocking for the child's whole lifetime.
-///
-/// Note: the child stays in this process's session/process group rather than
-/// starting its own via `setsid(2)` — that would need a `libc` dependency
-/// that isn't otherwise pulled in for a non-GUI build. In practice the child
-/// is reparented to init as soon as this process exits, same as an ordinary
-/// shell `&` background job, which is enough for a well-behaved CLI daemon;
-/// the one edge case this doesn't cover is the child receiving a `SIGHUP` if
-/// the controlling terminal's session ends abnormally before this process
-/// has had a chance to exit.
+/// Output goes to a per-port log. The child stays in the parent's session and
+/// process group and is reparented when this launcher exits.
 fn serve_markdown_daemon(
     inputs: Vec<PathBuf>,
     port: u16,
@@ -308,6 +297,7 @@ fn serve_markdown_daemon(
     let probe = bind_serve_listener(port)?;
     // Port 0 asks the OS for any free port; the child needs the concrete one.
     let port = probe.local_addr()?.port();
+    #[cfg(not(unix))]
     drop(probe);
 
     let current_exe = std::env::current_exe()?;
@@ -326,14 +316,21 @@ fn serve_markdown_daemon(
     if open {
         command.arg("--open");
     }
+    #[cfg(unix)]
     command
-        .stdin(Stdio::null())
+        .env("MARKVIEW_INHERITED_LISTENER", "1")
+        .stdin(Stdio::from(OwnedFd::from(probe)));
+    #[cfg(not(unix))]
+    command.stdin(Stdio::null());
+    command
         .stdout(Stdio::from(log_file.try_clone()?))
         .stderr(Stdio::from(log_file));
 
     let mut child = command.spawn()?;
 
-    if let Err(error) = wait_for_daemon_ready(&mut child, port) {
+    if let Err(error) = wait_for_daemon_ready(&mut child, port, &log_path) {
+        let _ = child.kill();
+        let _ = child.wait();
         return Err(format!("{error} — see the log for details: {}", log_path.display()).into());
     }
 
@@ -347,21 +344,17 @@ fn serve_markdown_daemon(
     Ok(())
 }
 
-/// Polls `port` with exponential backoff until something is actually
-/// accepting TCP connections on it — the real confirmation that the child
-/// came up, since a plain connect is enough and there's no need to inspect
-/// any response. Also watches the child directly via `try_wait` so an early
-/// exit (e.g. a bad `--serve` input failing `ServeConfig::from_inputs`, or
-/// losing a race for the port) is reported immediately instead of only after
-/// the full `DAEMON_READY_TIMEOUT` budget elapses.
-fn wait_for_daemon_ready(child: &mut std::process::Child, port: u16) -> Result<(), String> {
+/// Require this child's flushed startup banner and check for early exit before
+/// accepting a connection as readiness. A different listener is never enough.
+fn wait_for_daemon_ready(
+    child: &mut std::process::Child,
+    port: u16,
+    log_path: &Path,
+) -> Result<(), String> {
     let deadline = std::time::Instant::now() + DAEMON_READY_TIMEOUT;
     let mut delay = DAEMON_READY_INITIAL_DELAY;
 
     loop {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return Ok(());
-        }
         match child.try_wait() {
             Ok(Some(status)) => {
                 return Err(format!(
@@ -370,6 +363,17 @@ fn wait_for_daemon_ready(child: &mut std::process::Child, port: u16) -> Result<(
             }
             Ok(None) => {}
             Err(error) => return Err(format!("failed to check background server: {error}")),
+        }
+
+        let banner = format!("Serving on http://localhost:{port} — press Ctrl+C to stop");
+        if fs::read_to_string(log_path).is_ok_and(|log| log.lines().any(|line| line == banner))
+            && TcpStream::connect(("127.0.0.1", port)).is_ok()
+            && child
+                .try_wait()
+                .map_err(|error| error.to_string())?
+                .is_none()
+        {
+            return Ok(());
         }
 
         let now = std::time::Instant::now();
@@ -381,6 +385,40 @@ fn wait_for_daemon_ready(child: &mut std::process::Child, port: u16) -> Result<(
         }
         thread::sleep(delay.min(deadline - now));
         delay *= 2;
+    }
+}
+
+#[cfg(test)]
+mod daemon_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn unrelated_listener_cannot_make_a_dead_child_ready() {
+        let listener = bind_serve_listener(0).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let log = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            log.path(),
+            format!("Serving on http://localhost:{port} — press Ctrl+C to stop\n"),
+        )
+        .unwrap();
+        let mut child = Command::new("sh").args(["-c", "exit 1"]).spawn().unwrap();
+        child.wait().unwrap();
+        assert!(wait_for_daemon_ready(&mut child, port, log.path())
+            .unwrap_err()
+            .contains("exited before"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_listener_keeps_port_reserved() {
+        let listener = bind_serve_listener(0).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let inherited = Stdio::from(OwnedFd::from(listener));
+        assert!(bind_serve_listener(port).is_err());
+        drop(inherited);
+        assert!(bind_serve_listener(port).is_ok());
     }
 }
 

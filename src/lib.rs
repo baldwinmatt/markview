@@ -529,10 +529,12 @@ fn parse_width(value: &str) -> Result<usize, CliError> {
 }
 
 fn parse_port(value: &str) -> Result<u16, CliError> {
-    let port = value
+    if !is_numeric(value) || (value.len() > 1 && value.starts_with('0')) {
+        return Err(CliError::InvalidPort(value.to_owned()));
+    }
+    value
         .parse::<u16>()
-        .map_err(|_| CliError::InvalidPort(value.to_owned()))?;
-    Ok(port)
+        .map_err(|_| CliError::InvalidPort(value.to_owned()))
 }
 
 fn is_numeric(value: &str) -> bool {
@@ -1943,6 +1945,18 @@ mod tests {
 
     fn strip_ansi(input: &str) -> String {
         visible_chars(input).collect()
+    }
+
+    #[test]
+    fn ports_use_canonical_ascii_decimal_including_zero() {
+        for value in ["0", "1", "8080", "65535"] {
+            assert!(parse_port(value).is_ok());
+        }
+        for value in [
+            "", "00", "000", "08080", "+0", "+8080", "-1", "65536", "８０", " 80",
+        ] {
+            assert!(parse_port(value).is_err(), "{value}");
+        }
     }
 
     #[test]

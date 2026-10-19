@@ -945,6 +945,47 @@ fn serve_mode_rejects_daemon_without_serve() {
 }
 
 #[test]
+fn foreground_port_zero_forms_report_concrete_banner_ports() {
+    for args in [vec!["--port", "0"], vec!["--port=0"]] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("README.md");
+        std::fs::write(&file, "# Foreground zero").unwrap();
+        let child = std::process::Command::new(cargo_bin("markview"))
+            .arg("--serve")
+            .args(args)
+            .arg(&file)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut server = ServeProcess {
+            child,
+            port: 0,
+            stderr: Arc::new(Mutex::new(String::new())),
+        };
+        let mut line = String::new();
+        BufReader::new(server.child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        server.port = number_after(&line, "http://localhost:");
+        assert_ne!(server.port, 0, "{line}");
+        assert!(
+            poll_http_until_ready(server.port, Duration::from_secs(5)).contains("Foreground zero")
+        );
+    }
+}
+
+#[test]
+fn serve_rejects_noncanonical_zero_port() {
+    Command::cargo_bin("markview")
+        .unwrap()
+        .args(["--serve", "--port", "00", "README.md"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid port: 00"));
+}
+
+#[test]
 fn serve_mode_daemon_detaches_and_prints_pid_and_address() {
     let dir = tempfile::tempdir().expect("temp dir");
     let file = dir.path().join("README.md");
@@ -972,14 +1013,12 @@ fn serve_mode_daemon_detaches_and_prints_pid_and_address() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let _daemon = DaemonProcess(number_after(&stdout, "pid "));
     assert!(stdout.contains(&format!("http://localhost:{port}")));
     assert!(stdout.contains("pid "));
-    let pid = parse_daemon_pid(&stdout);
 
     let body = poll_http_until_ready(port, Duration::from_secs(5));
     assert!(body.contains(r#"<h1 id="daemonized">Daemonized</h1>"#));
-
-    kill_pid(pid);
 }
 
 #[test]
@@ -1001,18 +1040,16 @@ fn serve_mode_daemon_with_port_zero_reports_the_port_it_picked() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let port = parse_daemon_port(&stdout);
+    let _daemon = DaemonProcess(number_after(&stdout, "pid "));
+    let port = number_after(&stdout, "http://localhost:");
     assert_ne!(port, 0, "stdout should name the real port: {stdout}");
     assert!(
         stdout.contains(&format!(".markview-serve-{port}.log")),
         "the log file should be named for the real port: {stdout}"
     );
-    let pid = parse_daemon_pid(&stdout);
 
     let body = poll_http_until_ready(port, Duration::from_secs(5));
     assert!(body.contains(r#"<h1 id="any-port">Any port</h1>"#));
-
-    kill_pid(pid);
 }
 
 #[test]
@@ -1061,22 +1098,18 @@ fn serve_mode_daemon_reports_failure_when_child_fails_to_start() {
     assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
 }
 
-fn parse_daemon_port(stdout: &str) -> u16 {
-    let after = stdout
-        .split("http://localhost:")
-        .nth(1)
-        .expect("stdout should mention a URL");
+fn number_after<T: std::str::FromStr>(stdout: &str, marker: &str) -> T {
+    let after = stdout.split_once(marker).expect("output marker").1;
     let digits: String = after.chars().take_while(|ch| ch.is_ascii_digit()).collect();
-    digits.parse().expect("port should be numeric")
+    digits.parse().ok().expect("numeric output")
 }
 
-fn parse_daemon_pid(stdout: &str) -> u32 {
-    let after = stdout
-        .split("pid ")
-        .nth(1)
-        .expect("stdout should mention a pid");
-    let digits: String = after.chars().take_while(|ch| ch.is_ascii_digit()).collect();
-    digits.parse().expect("pid should be numeric")
+struct DaemonProcess(u32);
+
+impl Drop for DaemonProcess {
+    fn drop(&mut self) {
+        kill_pid(self.0);
+    }
 }
 
 fn poll_http_until_ready(port: u16, timeout: Duration) -> String {

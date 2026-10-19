@@ -1,4 +1,4 @@
-# markview 
+# markview
 
 `markview` is a small Markdown viewer written in idiomatic Rust. It keeps Markdown parsing and frontend rendering separate, so the same core can target a terminal, a native macOS WebKit window, or another renderer later.
 
@@ -29,21 +29,52 @@ make package-macos
 
 ## Usage
 
+### Terminal and HTML
+
 ```sh
 markview README.md
 cat README.md | markview --no-color
 markview --width 72 notes.md
 markview --html README.md > README.html
-markview --serve notes.md                    # http://localhost:7878
-markview --serve notes.md api.md             # serve an explicit doc set with navigation
-markview --serve docs/                       # serve top-level Markdown files in docs/
-markview --serve --recurse docs/             # serve docs/ and every Markdown file below it
-markview --serve notes.md --port 8080        # pick a specific port
+```
 
+| Option | Effect |
+| --- | --- |
+| `--html` | Print a complete HTML document instead of terminal output. |
+| `-w`, `--width <COLUMNS>` | Wrap terminal text at `COLUMNS` (minimum 20, default 88). |
+| `--no-color` | Drop ANSI colors, keep bold text attributes. |
+
+### Local server
+
+```sh
+markview --serve notes.md                    # http://localhost:7878
+markview --serve notes.md api.md             # explicit doc set with navigation
+markview --serve docs/                       # top-level Markdown files in docs/
+markview --serve --recurse docs/             # docs/ and every Markdown file below it
+markview --serve notes.md --port 8080        # specific port
+markview --serve docs/ --port 0              # any free port, printed on start
+markview --serve --open --daemon docs/       # background server, browser opened
+```
+
+| Option | Effect |
+| --- | --- |
+| `--serve` | Serve the given files, or a directory's Markdown files, over HTTP with navigation between documents. |
+| `--port <PORT>` | Listen on `PORT` (default 7878). `--port 0` picks any free port and prints it, which suits scripts and agents that run several servers. The old `--serve 8080 notes.md` positional form is rejected. |
+| `--recurse` | Discover Markdown files at any depth. Takes a single directory; hidden and symlinked directories are skipped. |
+| `--open` | Open the default browser once the server is ready. |
+| `--daemon` | Run in the background and return immediately, printing the PID and URL. Logs go to `.markview-serve-<PORT>.log` in the current directory. |
+
+`--port`, `--recurse`, `--open`, and `--daemon` require `--serve`.
+
+The server renders Markdown as HTML and live-reloads open browser tabs whenever a served file changes (a file watcher feeds a `/events` server-sent-events stream). It serves only the listed documents and the assets they reference; everything else returns 404. It binds to `127.0.0.1`; to view it from another machine, forward the port over SSH first, e.g. `ssh -L 8080:localhost:8080 user@host`.
+
+### macOS GUI
+
+```sh
 cargo run --features gui --bin markview-gui -- README.md docs/notes.md
 ```
 
-`--serve` renders Markdown as HTML over a local HTTP server and pushes a live-reload signal to any open browser tab whenever a served Markdown file changes on disk (via a file watcher and a `/events` server-sent-events stream). Use `--port <PORT>` for non-default ports; the old `--serve 8080 notes.md` positional-port form has been removed. Directory mode only serves top-level Markdown files by default; add `--recurse` (with a single directory argument) to discover Markdown files at any depth — hidden directories (dotfile-prefixed) and symlinked directories are skipped. The server only binds to `127.0.0.1`; to view it from another machine, forward the port over SSH first, e.g. `ssh -L 8080:localhost:8080 user@host`.
+With no files, the GUI opens piped stdin as an untitled tab, or restores the previous session's tabs.
 
 The GUI renders Markdown through the system WebKit view and includes:
 
@@ -52,15 +83,34 @@ The GUI renders Markdown through the system WebKit view and includes:
 - Right-click a tab and choose Edit to open that document's editor, or Copy Path to copy its full file path. Copy Path is disabled for untitled documents.
 - The editor highlights Markdown syntax, shows spelling squiggles on macOS (excluding code and links), and offers a collapsible Markdown syntax reference beside the source. Standard Cut, Copy, Paste, Undo, and Redo shortcuts are available.
 - Tabs for multiple open documents, including per-tab close buttons and overflow scrolling.
+- Relative links to Markdown files open in a new tab, resolved beside the linking document. Links from unsaved untitled documents show an error instead.
+- External `http` and `https` links ask for confirmation (Cancel or Open in Browser) before opening in the default browser.
 - Markdown document registration for bundled `.app` builds.
 - A table-of-contents sidebar generated from document headings.
 - Auto-refresh for file-backed tabs when files change on disk, with a modified indicator when auto-refresh is disabled or a tab has unsaved edits.
 - Scroll preservation when switching tabs or refreshing content.
-- External `http` and `https` links opened in the default browser.
 - Drag-and-drop opening for `.md`, `.markdown`, and `.mdown` files.
 - Local preferences for theme, sidebar visibility, auto-refresh, window size, recent files, and restoring the last open files.
 
 Preferences are stored locally in `~/Library/Application Support/markview/preferences.conf` on macOS.
+
+Run `markview --help` or `markview-gui --help` for the same option summary in the terminal.
+
+## Agent skill
+
+The repo ships a `markview` agent skill ([skills/markview/SKILL.md](skills/markview/SKILL.md)) that teaches a coding agent to serve a Markdown directory as a browsable local site: it installs the CLI if missing, checks for servers already running, starts `markview --serve --recurse --daemon --port 0` from `/tmp/.markview`, checks the URL, and reports how to stop the server.
+
+Install it with the [skills CLI](https://github.com/vercel-labs/skills):
+
+```sh
+npx skills add baldwinmatt/markview
+```
+
+Or copy the folder by hand, for example for Claude Code:
+
+```sh
+cp -R skills/markview ~/.claude/skills/markview
+```
 
 ## Design
 

@@ -32,7 +32,16 @@ impl GuiCli {
 }
 
 pub(crate) fn help() -> &'static str {
-    "Usage: markview-gui [FILE]...\n\nOpens Markdown files as rendered tabs in a native WebKit window.\n\nOptions:\n  -h, --help  Show this help"
+    "\
+Usage: markview-gui [FILE]...
+
+Opens each Markdown file as a rendered tab in a native WebKit window. With no
+FILE, opens piped stdin as an untitled tab, or else restores the previous
+session's tabs. Drag .md, .markdown, or .mdown files onto the window to open
+more.
+
+Options:
+  -h, --help  Show this help"
 }
 
 pub(crate) fn normalize_path(path: PathBuf) -> PathBuf {

@@ -404,10 +404,10 @@ fn serve_mode_rejects_invalid_port_values() {
         .stderr(predicate::str::contains("invalid port: nope"));
 
     let mut cmd = Command::cargo_bin("markview").expect("binary");
-    cmd.args(["--serve", "README.md", "--port", "0"])
+    cmd.args(["--serve", "README.md", "--port", "65536"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("invalid port: 0"));
+        .stderr(predicate::str::contains("invalid port: 65536"));
 }
 
 #[test]
@@ -983,6 +983,39 @@ fn serve_mode_daemon_detaches_and_prints_pid_and_address() {
 }
 
 #[test]
+fn serve_mode_daemon_with_port_zero_reports_the_port_it_picked() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("README.md");
+    std::fs::write(&file, "# Any port\n").expect("write sample");
+
+    let output = std::process::Command::new(cargo_bin("markview"))
+        .current_dir(dir.path())
+        .args(["--serve", "--daemon", "--port", "0"])
+        .arg(&file)
+        .output()
+        .expect("run daemon");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let port = parse_daemon_port(&stdout);
+    assert_ne!(port, 0, "stdout should name the real port: {stdout}");
+    assert!(
+        stdout.contains(&format!(".markview-serve-{port}.log")),
+        "the log file should be named for the real port: {stdout}"
+    );
+    let pid = parse_daemon_pid(&stdout);
+
+    let body = poll_http_until_ready(port, Duration::from_secs(5));
+    assert!(body.contains(r#"<h1 id="any-port">Any port</h1>"#));
+
+    kill_pid(pid);
+}
+
+#[test]
 fn serve_mode_daemon_reports_failure_when_child_fails_to_start() {
     let dir = tempfile::tempdir().expect("temp dir");
     let file = dir.path().join("not-markdown.txt");
@@ -1026,6 +1059,15 @@ fn serve_mode_daemon_reports_failure_when_child_fails_to_start() {
 
     // Nothing should actually be listening on the port.
     assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+}
+
+fn parse_daemon_port(stdout: &str) -> u16 {
+    let after = stdout
+        .split("http://localhost:")
+        .nth(1)
+        .expect("stdout should mention a URL");
+    let digits: String = after.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    digits.parse().expect("port should be numeric")
 }
 
 fn parse_daemon_pid(stdout: &str) -> u32 {

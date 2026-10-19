@@ -532,9 +532,6 @@ fn parse_port(value: &str) -> Result<u16, CliError> {
     let port = value
         .parse::<u16>()
         .map_err(|_| CliError::InvalidPort(value.to_owned()))?;
-    if port == 0 {
-        return Err(CliError::InvalidPort(value.to_owned()));
-    }
     Ok(port)
 }
 
@@ -543,7 +540,39 @@ fn is_numeric(value: &str) -> bool {
 }
 
 pub fn help() -> &'static str {
-    "Usage: markview [OPTIONS] [FILE]\n\nReads FILE or stdin and renders Markdown for the terminal or HTML.\n\nOptions:\n      --html             Render a complete HTML document\n      --serve            Serve Markdown files or a directory on localhost (default port 7878)\n      --recurse          With --serve and a single directory, discover Markdown files recursively\n      --open             With --serve, open the default web browser once the server is ready\n      --daemon           With --serve, run the server in the background and return immediately\n      --port <PORT>      Select the serve port\n  -w, --width <COLUMNS>  Wrap terminal text to a target width (minimum 20, default 88)\n      --no-color         Disable ANSI colors while keeping bold text attributes\n  -h, --help             Show this help\n"
+    "\
+Usage: markview [OPTIONS] [FILE]
+       markview --serve [OPTIONS] <FILE>... | <DIR>
+
+Renders FILE (or stdin) as Markdown in the terminal or as HTML, or serves
+Markdown over HTTP with live reload.
+
+Render options:
+      --html             Print a complete HTML document instead of terminal output
+  -w, --width <COLUMNS>  Wrap terminal text at COLUMNS (minimum 20, default 88)
+      --no-color         Drop ANSI colors, keep bold text attributes
+
+Serve options (all require --serve):
+      --serve            Serve the given files, or the top-level Markdown files of a
+                         directory, with navigation between documents
+      --port <PORT>      Listen on PORT (default 7878); 0 picks any free port and prints it
+      --recurse          Discover Markdown files at any depth; takes a single directory
+      --open             Open the default browser once the server is ready
+      --daemon           Run the server in the background and return immediately;
+                         logs go to .markview-serve-<PORT>.log in the current directory
+
+  -h, --help             Show this help
+
+The server binds to 127.0.0.1, serves only the listed documents and the assets
+they reference, and reloads open browser tabs when a served file changes.
+
+Examples:
+  markview README.md
+  cat notes.md | markview --no-color
+  markview --html README.md > README.html
+  markview --serve docs/ --port 8080
+  markview --serve --recurse --open docs/
+"
 }
 
 pub fn render(markdown: &str, options: RenderOptions) -> String {
@@ -1984,6 +2013,13 @@ mod tests {
         assert_eq!(cli.input.as_deref(), Some("README.md"));
         assert_eq!(cli.inputs, vec!["README.md"]);
         assert_eq!(cli.serve, Some(DEFAULT_SERVE_PORT));
+    }
+
+    #[test]
+    fn parses_cli_serve_with_port_zero_as_any_free_port() {
+        let cli = Cli::parse(["--serve", "README.md", "--port", "0"]).expect("valid serve args");
+
+        assert_eq!(cli.serve, Some(0));
     }
 
     #[test]

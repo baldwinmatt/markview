@@ -277,7 +277,8 @@ const DAEMON_READY_INITIAL_DELAY: Duration = Duration::from_millis(100);
 /// The port is also probed (bound, then immediately released) here in the
 /// parent so a bad `--port` is reported synchronously with a clear message
 /// before anything is even spawned, rather than only discovered via the
-/// readiness poll below. There is a small window between releasing that
+/// readiness poll below. For `--port 0` the probe is also how a free port
+/// gets picked: the child is launched on the concrete port it returns. There is a small window between releasing that
 /// probe and the child re-binding the same port where another process could
 /// steal it; unlike before, that race is no longer silent — if it happens,
 /// the child fails to bind and the readiness poll below reports the timeout
@@ -304,7 +305,10 @@ fn serve_markdown_daemon(
     recurse: bool,
     open: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    drop(bind_serve_listener(port)?);
+    let probe = bind_serve_listener(port)?;
+    // Port 0 asks the OS for any free port; the child needs the concrete one.
+    let port = probe.local_addr()?.port();
+    drop(probe);
 
     let current_exe = std::env::current_exe()?;
     let log_path = daemon_log_path(port);

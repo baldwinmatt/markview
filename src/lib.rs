@@ -868,9 +868,24 @@ impl AppModel {
         &self.tabs
     }
 
+    pub fn tab(&self, id: u64) -> Option<&DocumentTab> {
+        self.tabs.iter().find(|tab| tab.id == id)
+    }
+
+    /// Selects a tab and enters editing without toggling an existing editor.
+    pub fn edit(&mut self, id: u64) -> bool {
+        if !self.select(id) {
+            return false;
+        }
+        if !self.tab(id).is_some_and(DocumentTab::is_editing) {
+            self.toggle_editing(id);
+        }
+        true
+    }
+
     pub fn active_tab(&self) -> Option<&DocumentTab> {
         let id = self.active_tab?;
-        self.tabs.iter().find(|tab| tab.id == id)
+        self.tab(id)
     }
 
     pub fn active_tab_id(&self) -> Option<u64> {
@@ -1928,6 +1943,26 @@ mod tests {
 
     fn strip_ansi(input: &str) -> String {
         visible_chars(input).collect()
+    }
+
+    #[test]
+    fn context_edit_selects_target_without_toggling_or_losing_draft() {
+        let mut model = AppModel::new();
+        let target = model.open_untitled("target", "# Original".into());
+        let other = model.open_untitled("other", "# Other".into());
+        assert_eq!(model.active_tab_id(), Some(other));
+        assert!(model.edit(target));
+        assert_eq!(model.active_tab_id(), Some(target));
+        assert!(model.active_tab().unwrap().is_editing());
+        model.update_source(target, "# Unsaved draft".into());
+        model.select(other);
+        assert!(model.edit(target));
+        let tab = model.active_tab().unwrap();
+        assert!(tab.is_editing());
+        assert!(tab.is_dirty());
+        assert_eq!(tab.document().source(), "# Unsaved draft");
+        assert!(!model.edit(u64::MAX));
+        assert_eq!(model.active_tab_id(), Some(target));
     }
 
     #[test]

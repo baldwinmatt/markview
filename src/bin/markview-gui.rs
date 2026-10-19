@@ -1,12 +1,13 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::ExitCode;
 use std::rc::Rc;
+use std::sync::{mpsc, Arc, Mutex};
 
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
@@ -98,6 +99,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
     let mut watcher = FileWatcher::new(proxy.clone())?;
+    let spelling = SpellingWorker::new(proxy.clone());
 
     install_application_menu(proxy.clone());
     watcher.sync(model.watched_directories())?;
@@ -115,6 +117,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
+        spelling.latest.lock().expect("spelling requests").retain(|id, _| model.tab(*id).is_some());
         match event {
             Event::UserEvent(UserEvent::ShellRequested) => {
                 // Render after earlier IPC events (including edits) have updated the model.
@@ -394,8 +397,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     sync_view(&webview, &model, &preferences);
                 }
             }
-            Event::UserEvent(UserEvent::EditTab(id)) if edit_tab(&mut model, id) => {
-                sync_persisted_view(&preferences_path, &mut preferences, &model, &webview, &window);
+            Event::UserEvent(UserEvent::EditTab(id)) => {
+                let edited = model.edit(id);
+                if edited {
+                    sync_persisted_view(&preferences_path, &mut preferences, &model, &webview, &window);
+                }
             }
             Event::UserEvent(UserEvent::CopyTabPath(id)) => {
                 if let Some(path) = tab_copy_path(&model, id) {
@@ -405,17 +411,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Event::UserEvent(UserEvent::EditChanged(id, text)) => {
+                spelling.latest.lock().expect("spelling requests").remove(&id);
                 model.update_source(id, text);
                 sync_view(&webview, &model, &preferences);
                 window.set_title(&window_title(&model));
             }
-            Event::UserEvent(UserEvent::CheckSpelling(id, text)) => {
-                let ranges = spelling_ranges(&text).into_iter()
-                    .map(|(start, length)| format!("[{start},{length}]"))
-                    .collect::<Vec<_>>().join(",");
-                let script = format!("receiveEditorSpelling({id}, {}, [{ranges}]);", js_string(&text));
-                if let Err(error) = webview.evaluate_script(&script) {
-                    eprintln!("markview-gui: failed to show spelling marks: {error}");
+            Event::UserEvent(UserEvent::CheckSpelling(id, revision)) => {
+                if let Some(tab) = model.tab(id) {
+                    spelling.request(id, revision, tab.document().source().to_owned());
+                }
+            }
+            Event::UserEvent(UserEvent::SpellingChecked(id, revision, ranges)) => {
+                let current = model.tab(id).is_some()
+                    && spelling.latest.lock().expect("spelling requests").get(&id) == Some(&revision);
+                if current {
+                    let ranges = ranges.into_iter()
+                        .map(|(start, length)| format!("[{start},{length}]"))
+                        .collect::<Vec<_>>().join(",");
+                    let script = format!("receiveEditorSpelling({id}, {revision}, [{ranges}]);");
+                    if let Err(error) = webview.evaluate_script(&script) {
+                        eprintln!("markview-gui: failed to show spelling marks: {error}");
+                    }
                 }
             }
             Event::UserEvent(UserEvent::SaveRequested) => {
@@ -447,32 +463,114 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ => {}
         }
+        spelling.latest.lock().expect("spelling requests").retain(|id, _| model.tab(*id).is_some());
     });
+}
+
+struct SpellingWorker {
+    latest: Arc<Mutex<HashMap<u64, u64>>>,
+    sender: mpsc::Sender<(u64, u64, String)>,
+}
+
+impl SpellingWorker {
+    fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
+        let latest = Arc::new(Mutex::new(HashMap::new()));
+        let requests = Arc::clone(&latest);
+        let (sender, receiver) = mpsc::channel::<(u64, u64, String)>();
+        std::thread::spawn(move || {
+            for (id, revision, source) in receiver {
+                if requests.lock().expect("spelling requests").get(&id) != Some(&revision) {
+                    continue;
+                }
+                let text = spelling_source(&source);
+                #[cfg(target_os = "macos")]
+                let ranges = objc2::rc::autoreleasepool(|_| spelling_ranges(&text));
+                #[cfg(not(target_os = "macos"))]
+                let ranges = spelling_ranges(&text);
+                let _ = proxy.send_event(UserEvent::SpellingChecked(id, revision, ranges));
+            }
+        });
+        Self { latest, sender }
+    }
+
+    fn request(&self, id: u64, revision: u64, source: String) {
+        self.latest
+            .lock()
+            .expect("spelling requests")
+            .insert(id, revision);
+        let _ = self.sender.send((id, revision, source));
+    }
+}
+
+// Preserve source UTF-16 positions while exposing only parser-recognized prose.
+fn spelling_source(source: &str) -> String {
+    use pulldown_cmark::{Event, LinkType, Options, Parser, Tag, TagEnd};
+    let mut mask = vec![false; source.len()];
+    let mut excluded: usize = 0;
+    for (event, range) in Parser::new_ext(source, Options::all()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::CodeBlock(_) | Tag::HtmlBlock) => excluded += 1,
+            Event::Start(Tag::Link {
+                link_type: LinkType::Autolink | LinkType::Email,
+                ..
+            }) => excluded += 1,
+            Event::End(TagEnd::CodeBlock | TagEnd::HtmlBlock) => excluded -= 1,
+            Event::End(TagEnd::Link) => excluded = excluded.saturating_sub(1),
+            Event::Text(_) if excluded == 0 => mask[range].fill(true),
+            _ => {}
+        }
+    }
+    let mut result = String::new();
+    // Bare URLs are prose to CommonMark; hide them as well.
+    for (offset, ch) in source.char_indices() {
+        if mask[offset] || ch == '\n' {
+            result.push(ch);
+        } else {
+            result.extend(std::iter::repeat_n(' ', ch.len_utf16()));
+        }
+    }
+    let mut masked = String::new();
+    for word in result.split_inclusive(char::is_whitespace) {
+        let url =
+            word.starts_with("https://") || word.starts_with("http://") || word.starts_with("www.");
+        for ch in word.chars() {
+            if url && !ch.is_whitespace() {
+                masked.extend(std::iter::repeat_n(' ', ch.len_utf16()));
+            } else {
+                masked.push(ch);
+            }
+        }
+    }
+    masked
 }
 
 #[cfg(target_os = "macos")]
 fn spelling_ranges(text: &str) -> Vec<(usize, usize)> {
     use objc2_app_kit::NSSpellChecker;
-    use objc2_foundation::NSString;
-
+    use objc2_foundation::{NSRange, NSString, NSTextCheckingType};
     let checker = NSSpellChecker::sharedSpellChecker();
     let source = NSString::from_str(text);
     let length = text.encode_utf16().count();
-    let mut cursor = 0;
-    let mut ranges = Vec::new();
-    while cursor < length {
-        let range = checker.checkSpellingOfString_startingAt(&source, cursor as isize);
-        if range.length == 0 || range.location < cursor || range.location >= length {
-            break;
-        }
-        let end = range.location.saturating_add(range.length);
-        if end <= cursor || end > length {
-            break;
-        }
-        ranges.push((range.location, range.length));
-        cursor = end;
-    }
-    ranges
+    // SAFETY: no options or output pointers are passed; the range covers source.
+    let results = unsafe {
+        checker.checkString_range_types_options_inSpellDocumentWithTag_orthography_wordCount(
+            &source,
+            NSRange::new(0, length),
+            NSTextCheckingType::Spelling.0,
+            None,
+            0,
+            None,
+            std::ptr::null_mut(),
+        )
+    };
+    results
+        .iter()
+        .filter_map(|result| {
+            let range = result.range();
+            (range.length > 0 && range.location < length && range.length <= length - range.location)
+                .then_some((range.location, range.length))
+        })
+        .collect()
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -480,43 +578,74 @@ fn spelling_ranges(_text: &str) -> Vec<(usize, usize)> {
     Vec::new()
 }
 
-fn edit_tab(model: &mut AppModel, id: u64) -> bool {
-    if !model.select(id) {
-        return false;
-    }
-    if !model.active_tab().is_some_and(|tab| tab.is_editing()) {
-        model.toggle_editing(id);
-    }
-    true
-}
-
 fn tab_copy_path(model: &AppModel, id: u64) -> Option<PathBuf> {
-    let path = model.tabs().iter().find(|tab| tab.id() == id)?.path()?;
-    std::path::absolute(path).ok()
+    model.tab(id)?.path().map(Path::to_path_buf)
 }
 
+#[cfg(target_os = "macos")]
 fn copy_path_to_clipboard(path: &Path) -> io::Result<()> {
-    let mut command = Command::new(if cfg!(target_os = "macos") {
-        "/usr/bin/pbcopy"
-    } else {
-        "xclip"
-    });
-    if !cfg!(target_os = "macos") {
-        command.args(["-selection", "clipboard"]);
-    }
-    let mut child = command.stdin(std::process::Stdio::piped()).spawn()?;
-    let write_result = child
-        .stdin
-        .take()
-        .expect("piped clipboard input")
-        .write_all(path.to_string_lossy().as_bytes());
-    let status = child.wait()?;
-    write_result?;
-    if status.success() {
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+    use objc2_foundation::NSString;
+    let pasteboard = NSPasteboard::generalPasteboard();
+    pasteboard.clearContents();
+    if pasteboard.setString_forType(&NSString::from_str(&path.to_string_lossy()), unsafe {
+        NSPasteboardTypeString
+    }) {
         Ok(())
     } else {
-        Err(io::Error::other("clipboard command failed"))
+        Err(io::Error::other("failed to write clipboard"))
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn copy_path_to_clipboard(_path: &Path) -> io::Result<()> {
+    Err(io::Error::other("Copy Path requires macOS"))
+}
+
+fn ipc_event(body: &str) -> Option<UserEvent> {
+    Some(match body {
+        "open" => UserEvent::OpenRequested,
+        "refresh" => UserEvent::RefreshRequested,
+        "print" => UserEvent::PrintRequested,
+        "export-html" => UserEvent::ExportHtmlRequested,
+        "find" => UserEvent::FindRequested,
+        "quit" => UserEvent::QuitRequested,
+        "toggle-sidebar" => UserEvent::ToggleSidebar,
+        "toggle-auto-refresh" => UserEvent::ToggleAutoRefresh,
+        "cycle-theme" => UserEvent::CycleTheme,
+        "toggle-edit" => UserEvent::ToggleActiveEdit,
+        "save" => UserEvent::SaveRequested,
+        _ => {
+            let (kind, rest) = body.split_once(':')?;
+            match kind {
+                "recent" => UserEvent::OpenRecent(PathBuf::from(rest)),
+                "spell" | "edit" | "link" => {
+                    let (id, text) = rest.split_once(':')?;
+                    let id = id.parse().ok()?;
+                    match kind {
+                        "spell" => UserEvent::CheckSpelling(id, text.parse().ok()?),
+                        "edit" => UserEvent::EditChanged(id, text.to_owned()),
+                        _ => UserEvent::OpenDocumentLink(id, text.to_owned()),
+                    }
+                }
+                _ => {
+                    let id = rest.parse().ok()?;
+                    match kind {
+                        "edit-tab" => UserEvent::EditTab(id),
+                        "copy-tab-path" => UserEvent::CopyTabPath(id),
+                        "select" => UserEvent::SelectTab(id),
+                        "close" => UserEvent::CloseTab(id),
+                        "close-others" => UserEvent::CloseOtherTabs(id),
+                        "close-left" => UserEvent::CloseTabsToLeft(id),
+                        "close-right" => UserEvent::CloseTabsToRight(id),
+                        "reload-tab" => UserEvent::ReloadTab(id),
+                        "export-tab-html" => UserEvent::ExportTabHtml(id),
+                        _ => return None,
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn build_webview(
@@ -525,89 +654,7 @@ fn build_webview(
 ) -> wry::Result<AppWebView> {
     let ipc_proxy = proxy.clone();
     let handler = move |request: Request<String>| {
-        let body = request.body();
-        let event = match body.as_str() {
-            "open" => Some(UserEvent::OpenRequested),
-            "refresh" => Some(UserEvent::RefreshRequested),
-            "print" => Some(UserEvent::PrintRequested),
-            "export-html" => Some(UserEvent::ExportHtmlRequested),
-            "find" => Some(UserEvent::FindRequested),
-            "quit" => Some(UserEvent::QuitRequested),
-            "toggle-sidebar" => Some(UserEvent::ToggleSidebar),
-            "toggle-auto-refresh" => Some(UserEvent::ToggleAutoRefresh),
-            "cycle-theme" => Some(UserEvent::CycleTheme),
-            "toggle-edit" => Some(UserEvent::ToggleActiveEdit),
-            "save" => Some(UserEvent::SaveRequested),
-            _ if body.starts_with("spell:") => body.strip_prefix("spell:").and_then(|rest| {
-                rest.split_once(':').and_then(|(id, text)| {
-                    id.parse()
-                        .ok()
-                        .map(|id| UserEvent::CheckSpelling(id, text.to_owned()))
-                })
-            }),
-            _ if body.starts_with("edit-tab:") => body
-                .strip_prefix("edit-tab:")
-                .and_then(|id| id.parse().ok())
-                .map(UserEvent::EditTab),
-            _ if body.starts_with("copy-tab-path:") => body
-                .strip_prefix("copy-tab-path:")
-                .and_then(|id| id.parse().ok())
-                .map(UserEvent::CopyTabPath),
-            _ if body.starts_with("edit:") => {
-                let rest = body.trim_start_matches("edit:");
-                rest.split_once(':').and_then(|(id, text)| {
-                    id.parse::<u64>()
-                        .ok()
-                        .map(|id| UserEvent::EditChanged(id, text.to_owned()))
-                })
-            }
-            _ if body.starts_with("link:") => body.strip_prefix("link:").and_then(|rest| {
-                rest.split_once(':').and_then(|(id, href)| {
-                    id.parse()
-                        .ok()
-                        .map(|id| UserEvent::OpenDocumentLink(id, href.to_owned()))
-                })
-            }),
-            _ if body.starts_with("select:") => body
-                .trim_start_matches("select:")
-                .parse::<u64>()
-                .ok()
-                .map(UserEvent::SelectTab),
-            _ if body.starts_with("close:") => body
-                .trim_start_matches("close:")
-                .parse::<u64>()
-                .ok()
-                .map(UserEvent::CloseTab),
-            _ if body.starts_with("close-others:") => body
-                .trim_start_matches("close-others:")
-                .parse::<u64>()
-                .ok()
-                .map(UserEvent::CloseOtherTabs),
-            _ if body.starts_with("close-left:") => body
-                .trim_start_matches("close-left:")
-                .parse::<u64>()
-                .ok()
-                .map(UserEvent::CloseTabsToLeft),
-            _ if body.starts_with("close-right:") => body
-                .trim_start_matches("close-right:")
-                .parse::<u64>()
-                .ok()
-                .map(UserEvent::CloseTabsToRight),
-            _ if body.starts_with("reload-tab:") => body
-                .trim_start_matches("reload-tab:")
-                .parse::<u64>()
-                .ok()
-                .map(UserEvent::ReloadTab),
-            _ if body.starts_with("export-tab-html:") => body
-                .trim_start_matches("export-tab-html:")
-                .parse::<u64>()
-                .ok()
-                .map(UserEvent::ExportTabHtml),
-            _ if body.starts_with("recent:") => Some(UserEvent::OpenRecent(PathBuf::from(
-                body.trim_start_matches("recent:"),
-            ))),
-            _ => None,
-        };
+        let event = ipc_event(request.body());
 
         if let Some(event) = event {
             let _ = ipc_proxy.send_event(event);
@@ -957,11 +1004,7 @@ fn confirm_if_dirty(window: &tao::window::Window, dirty: bool, message: &str) ->
 }
 
 fn tab_dirty(model: &AppModel, id: u64) -> bool {
-    model
-        .tabs()
-        .iter()
-        .find(|tab| tab.id() == id)
-        .is_some_and(markview::DocumentTab::is_dirty)
+    model.tab(id).is_some_and(markview::DocumentTab::is_dirty)
 }
 
 fn ids_dirty(model: &AppModel, ids: &[u64]) -> bool {
@@ -1015,7 +1058,8 @@ enum UserEvent {
     ToggleActiveEdit,
     EditTab(u64),
     CopyTabPath(u64),
-    CheckSpelling(u64, String),
+    CheckSpelling(u64, u64),
+    SpellingChecked(u64, u64, Vec<(usize, usize)>),
     EditChanged(u64, String),
     SaveRequested,
 }
@@ -1734,8 +1778,10 @@ main {{
 }}
 .editor-tools {{ margin-bottom: 8px; }}
 .editor-tools button {{ font: inherit; color: var(--fg); background: var(--chrome); border: 1px solid var(--rule); border-radius: 6px; padding: 6px 10px; }}
-.editor-layout {{ display: flex; gap: 16px; align-items: flex-start; }}
-.editor-surface {{ position: relative; flex: 1; min-width: 0; height: max(350px, calc(100vh - 240px)); }}
+.content-shell.editing {{ height: 100%; box-sizing: border-box; padding-bottom: 16px; }}
+.content-shell.editing main {{ display: flex; flex-direction: column; min-height: 0; padding: 16px 0 0; }}
+.editor-layout {{ display: flex; flex: 1; min-height: 0; gap: 16px; align-items: stretch; }}
+.editor-surface {{ position: relative; flex: 1; min-width: 0; min-height: 0; }}
 .editor-reference {{ flex: 0 0 210px; padding: 12px; border: 1px solid var(--rule); border-radius: 8px; }}
 .editor-reference[hidden] {{ display: none; }}
 .editor-reference pre {{ font-size: 0.8rem; white-space: pre-wrap; margin: 4px 0 12px; padding: 6px; }}
@@ -1747,7 +1793,9 @@ main {{
   box-sizing: border-box;
   margin: 0;
   overflow: auto;
-  white-space: pre;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  scrollbar-gutter: stable;
   border: 1px solid var(--rule);
   border-radius: 8px;
   background: var(--code-bg);
@@ -2071,7 +2119,7 @@ window.markview = {{
     if (editor) {{
       this.editorPositions.set(id, {{
         start: editor.selectionStart, end: editor.selectionEnd,
-        direction: editor.selectionDirection, scrollTop: editor.scrollTop
+        direction: editor.selectionDirection, scrollTop: editor.scrollTop, scrollLeft: editor.scrollLeft
       }});
     }}
     try {{
@@ -2163,7 +2211,9 @@ window.markview = {{
       tabs.appendChild(count);
     }}
     const existingEditor = pane.querySelector('textarea.editor');
+    shell.classList.toggle('editing', isEditingActive);
     if (isEditingActive) {{
+      scroller.scrollTop = 0;
       shell.classList.add('sidebar-hidden');
       toc.classList.add('hidden');
       if (!existingEditor || existingEditor.dataset.tabId !== String(next.activeTabId)) {{
@@ -2186,7 +2236,14 @@ window.markview = {{
         if (position) {{
           textarea.setSelectionRange(position.start, position.end, position.direction);
           textarea.scrollTop = position.scrollTop;
+          textarea.scrollLeft = position.scrollLeft || 0;
+        }} else {{
+          textarea.setSelectionRange(0, 0);
+          textarea.scrollTop = 0;
         }}
+        textarea.syncHighlightScroll();
+      }} else if (document.activeElement === document.body) {{
+        existingEditor.focus();
       }}
     }} else {{
       pane.innerHTML = next.activeHtml;
@@ -2228,7 +2285,7 @@ window.markview = {{
       }}
     }}
     this.applyFind();
-    const restoreY = this.scrollPositions.get(next.activeTabId) || 0;
+    const restoreY = isEditingActive ? 0 : (this.scrollPositions.get(next.activeTabId) || 0);
     requestAnimationFrame(() => {{
       scroller.scrollTop = restoreY;
       const activeTab = tabs.querySelector('.tab.active');
@@ -2244,10 +2301,6 @@ window.markview = {{
     this.findHits = [];
     this.findIndex = -1;
     const query = this.findQuery.trim();
-    if (pane.querySelector('textarea.editor')) {{
-      count.textContent = '';
-      return;
-    }}
     if (query.length === 0) {{
       count.textContent = '';
       return;
@@ -2350,7 +2403,7 @@ function highlightText(root, query) {{
         return NodeFilter.FILTER_REJECT;
       }}
       const parent = node.parentElement;
-      if (!parent || parent.closest('script,style,mark')) {{
+      if (!parent || parent.closest('script,style,mark,textarea,.editor-highlight,.editor-reference,.editor-tools')) {{
         return NodeFilter.FILTER_REJECT;
       }}
       return NodeFilter.FILTER_ACCEPT;
@@ -2555,6 +2608,109 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn ipc_messages_preserve_payloads_and_reject_malformed_input() {
+        for (message, expected) in [
+            ("open", "OpenRequested"),
+            ("refresh", "RefreshRequested"),
+            ("print", "PrintRequested"),
+            ("export-html", "ExportHtmlRequested"),
+            ("find", "FindRequested"),
+            ("quit", "QuitRequested"),
+            ("toggle-sidebar", "ToggleSidebar"),
+            ("toggle-auto-refresh", "ToggleAutoRefresh"),
+            ("cycle-theme", "CycleTheme"),
+            ("toggle-edit", "ToggleActiveEdit"),
+            ("save", "SaveRequested"),
+            ("select:4", "SelectTab(4)"),
+            ("close:4", "CloseTab(4)"),
+            ("close-others:4", "CloseOtherTabs(4)"),
+            ("close-left:4", "CloseTabsToLeft(4)"),
+            ("close-right:4", "CloseTabsToRight(4)"),
+            ("reload-tab:4", "ReloadTab(4)"),
+            ("export-tab-html:4", "ExportTabHtml(4)"),
+            ("edit-tab:4", "EditTab(4)"),
+            ("copy-tab-path:4", "CopyTabPath(4)"),
+            ("spell:4:7", "CheckSpelling(4, 7)"),
+            ("edit:4:a:b", "EditChanged(4, \"a:b\")"),
+            (
+                "link:4:https://example.com",
+                "OpenDocumentLink(4, \"https://example.com\")",
+            ),
+            ("recent:/tmp/a:b.md", "OpenRecent(\"/tmp/a:b.md\")"),
+        ] {
+            assert_eq!(format!("{:?}", ipc_event(message).unwrap()), expected);
+        }
+        for message in [
+            "",
+            "unknown",
+            "select:no",
+            "select:select:1",
+            "edit:4",
+            "spell:4:text",
+            "bogus:4",
+        ] {
+            assert!(ipc_event(message).is_none(), "{message}");
+        }
+    }
+
+    #[test]
+    fn spelling_mask_keeps_prose_and_utf16_positions() {
+        let source = "# heading `codez` [labelz](destz.md) 🙂\n\n    indentedz\n\n- list\n\n      ```\n      fencedz\n      ```\n\n<https://autoz.test> https://barez.test\n\n[ref]: destz.md\n\n<div>htmlz</div>\n";
+        let masked = spelling_source(source);
+        assert_eq!(source.encode_utf16().count(), masked.encode_utf16().count());
+        assert_eq!(source.matches('\n').count(), masked.matches('\n').count());
+        for prose in ["heading", "labelz", "🙂", "list"] {
+            assert!(masked.contains(prose), "{masked:?}");
+        }
+        for hidden in [
+            "codez",
+            "destz",
+            "indentedz",
+            "fencedz",
+            "autoz",
+            "barez",
+            "htmlz",
+            "ref",
+        ] {
+            assert!(!masked.contains(hidden), "{hidden}: {masked:?}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_spelling_returns_valid_utf16_ranges_without_wrapping() {
+        objc2::rc::autoreleasepool(|_| {
+            assert!(spelling_ranges("").is_empty());
+            assert!(spelling_ranges("hello world").is_empty());
+            let source = "🙂 hello qzxqzxqzx";
+            let ranges = spelling_ranges(source);
+            assert!(ranges.contains(&(9, 9)), "{ranges:?}");
+            assert!(ranges
+                .windows(2)
+                .all(|pair| pair[0].0 + pair[0].1 <= pair[1].0));
+            assert!(ranges
+                .iter()
+                .all(|(start, len)| *len > 0 && start + len <= source.encode_utf16().count()));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_path_returns_canonical_symlink_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("résumé.md");
+        fs::write(&target, "hello").unwrap();
+        let alias = dir.path().join("alias.md");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let mut model = AppModel::new();
+        let id = model.open_file(normalize_path(alias), "hello".into());
+        assert_eq!(
+            tab_copy_path(&model, id),
+            Some(target.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
     fn shell_url_with_heading_fragment_is_valid_for_webkit_ipc() {
         // Wry's WKScriptMessage handler constructs this request from the frame URL.
         let request = Request::builder()
@@ -2645,26 +2801,6 @@ mod tests {
     }
 
     #[test]
-    fn context_edit_selects_target_without_toggling_or_losing_draft() {
-        let mut model = AppModel::new();
-        let target = model.open_untitled("target", "# Original".into());
-        let other = model.open_untitled("other", "# Other".into());
-        assert_eq!(model.active_tab_id(), Some(other));
-        assert!(edit_tab(&mut model, target));
-        assert_eq!(model.active_tab_id(), Some(target));
-        assert!(model.active_tab().unwrap().is_editing());
-        model.update_source(target, "# Unsaved draft".into());
-        model.select(other);
-        assert!(edit_tab(&mut model, target));
-        let tab = model.active_tab().unwrap();
-        assert!(tab.is_editing());
-        assert!(tab.is_dirty());
-        assert_eq!(tab.document().source(), "# Unsaved draft");
-        assert!(!edit_tab(&mut model, u64::MAX));
-        assert_eq!(model.active_tab_id(), Some(target));
-    }
-
-    #[test]
     fn copy_path_targets_context_tab_and_ignores_untitled_or_missing_tabs() {
         let mut model = AppModel::new();
         let path = std::env::current_dir().unwrap().join("file with spaces.md");
@@ -2694,6 +2830,17 @@ mod tests {
         assert!(html.contains("'Close to the Right'"));
         assert!(html.contains("'Reload'"));
         assert!(html.contains("'Export as HTML...'"));
+        for expected in [
+            "'Edit'",
+            "'Copy Path'",
+            "edit-tab:",
+            "copy-tab-path:",
+            "decorateEditor",
+            "receiveEditorSpelling",
+            include_str!("markview_gui_support/editor.js"),
+        ] {
+            assert!(html.contains(expected), "missing {expected}");
+        }
         assert!(html.contains("close-others:"));
         assert!(html.contains("close-left:"));
         assert!(html.contains("close-right:"));
@@ -2715,7 +2862,7 @@ mod tests {
         assert!(html.contains(
             "this.scrollPositions.set(id, document.getElementById('scroll-root').scrollTop)"
         ));
-        assert!(html.contains("const restoreY = this.scrollPositions.get(next.activeTabId) || 0"));
+        assert!(html.contains("const restoreY = isEditingActive ? 0 : (this.scrollPositions.get(next.activeTabId) || 0)"));
         assert!(html.contains("scroller.scrollTop = restoreY"));
         assert!(html.contains("document.getElementById('scroll-root')"));
     }

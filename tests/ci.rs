@@ -7,6 +7,8 @@ fn ci_runs_core_and_macos_gui_checks() {
     assert!(workflow.contains("cargo fmt --check"));
     assert!(workflow.contains("cargo clippy --all-targets -- -D warnings"));
     assert!(workflow.contains("cargo test"));
+    assert!(workflow.contains("actions/setup-node@v4"));
+    assert!(workflow.contains("node --test tests/editor.test.cjs"));
     assert!(workflow.contains("runs-on: macos-latest"));
     assert!(workflow.contains("cargo clippy --features gui --all-targets -- -D warnings"));
     assert!(workflow.contains("cargo test --features gui"));

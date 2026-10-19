@@ -84,9 +84,10 @@ The bundle includes `Info.plist`, `Markview.icns`, document registration for Mar
 2. Run `cargo fmt`.
 3. Run `cargo test`.
 4. Run `cargo test --features gui`.
-5. Run `cargo clippy --all-targets -- -D warnings`.
-6. Run `cargo clippy --features gui --all-targets -- -D warnings`.
-7. Run `cargo build --features gui --bin markview-gui`.
-8. Run `make package-macos`.
-9. Tag the release as `v<version>` after the reviewed release commit lands.
-10. Push the tag. The release workflow builds the macOS zip and attaches it to the GitHub release.
+5. Run `node --test tests/editor.test.cjs`.
+6. Run `cargo clippy --all-targets -- -D warnings`.
+7. Run `cargo clippy --features gui --all-targets -- -D warnings`.
+8. Run `cargo build --features gui --bin markview-gui`.
+9. Run `make package-macos`.
+10. Tag the release as `v<version>` after the reviewed release commit lands.
+11. Push the tag. The release workflow builds the macOS zip and attaches it to the GitHub release.

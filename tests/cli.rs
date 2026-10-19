@@ -69,6 +69,18 @@ fn renders_html_stdin() {
         .stdout(predicate::str::contains(r#"<h1 id="piped">Piped</h1>"#));
 }
 
+#[cfg(unix)]
+#[test]
+fn skill_port_zero_probe_reaches_input_validation_without_starting_server() {
+    Command::cargo_bin("markview")
+        .unwrap()
+        .args(["--serve", "--port", "0", "/dev/null"])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr("markview: served input is not a file: /dev/null\n");
+}
+
 #[test]
 fn prints_help() {
     let mut cmd = Command::cargo_bin("markview").expect("binary");

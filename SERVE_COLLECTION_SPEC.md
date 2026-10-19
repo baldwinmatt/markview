@@ -30,7 +30,7 @@ Markview's `--serve` mode should grow from a single-file preview into a local do
 - [x] Add `--recurse` to opt a single served directory into recursive Markdown discovery (`markview --serve --recurse docs/`); reject it when combined with explicit files, multiple inputs, a non-directory input, or without `--serve`.
 - [x] Add `--port <PORT>` as the only way to select a non-default port.
 - [x] Remove the legacy `markview --serve <PORT> <FILE>` positional-port form. Reject it with a clear, specific error (e.g. "the `--serve PORT FILE` form has been replaced by `--serve FILE --port PORT`") rather than silently trying to interpret the number as a filename.
-- [x] Reject invalid `--port` values (non-numeric, `0`, or `> 65535`) with existing-style CLI errors, distinct from a runtime "address already in use" bind failure.
+- [x] Accept `--port 0` to pick a free port; reject invalid values (non-ASCII digits, signs, leading zeros, or `> 65535`) with existing-style CLI errors, distinct from a runtime "address already in use" bind failure.
 - [x] Reject `--serve` with no file/directory input.
 - [x] Reject a `--serve` invocation that mixes a directory argument with explicit file arguments (e.g. `--serve docs/ extra.md`).
 - [x] Reject explicit file sets containing duplicate paths, including paths that canonicalize to the same file (e.g. a symlink alias, or `./a.md` vs `a.md`).
@@ -41,13 +41,13 @@ Markview's `--serve` mode should grow from a single-file preview into a local do
 - [x] Discover Markdown files only in the served directory itself (no subdirectories) by default; with `--recurse`, discover Markdown files at any depth under the served directory, skipping hidden (dotfile-prefixed) directories and not descending into symlinked directories (avoids escape/cycle risk).
 - [x] Treat `.md`, `.markdown`, and `.mdown` as Markdown documents (matching the rest of the app's accepted file set), comparing the extension case-insensitively.
 - [x] Exclude dotfiles (names starting with `.`) from discovery by default.
-- [x] Choose the default document in this order, matching exact filenames case-sensitively:
+- [x] Choose the default document in this order, matching filenames case-insensitively:
   - [x] `README.md` at the served directory's top level (even when `--recurse` also finds a nested `README.md` — the top-level one still wins)
   - [x] `index.md` at the served directory's top level
-  - [x] first Markdown file, sorted alphabetically by relative path (this generalizes to the whole tree under `--recurse`)
-- [x] If two discovered entries canonicalize to the same file, or their relative paths collide case-insensitively (possible on case-insensitive filesystems, e.g. `README.md` and `readme.md` both present in the same directory), reject at startup with a clear error instead of silently picking one.
+  - [x] first Markdown file, sorted by relative path in byte order (this generalizes to the whole tree under `--recurse`)
+- [x] Silently drop discovered aliases whose canonical file was already discovered. Reject distinct discovered files whose relative routes collide case-insensitively (e.g. `README.md` and `readme.md` on a case-sensitive filesystem). Explicit file sets reject aliases.
 - [x] Do not include assets in navigation.
-- [x] Do not scan subdirectories for navigation documents.
+- [x] Scan subdirectories for navigation documents only with `--recurse`.
 - [x] Allow nested assets (images, etc.) to load if they are directly referenced by a served document and resolve under the root.
 - [x] Do not extend that same-reference allowance to Markdown files: a link to a nested `.md` file is left as a plain, unrewritten link rather than served on demand — honoring it would reintroduce recursive discovery through link-following.
 - [x] Reject at startup any discovered document whose canonical path resolves outside the served root (e.g. a symlink escaping root).
@@ -67,7 +67,7 @@ Markview's `--serve` mode should grow from a single-file preview into a local do
 
 - [x] Serve `/` as the default document.
 - [x] Serve known Markdown documents at normalized root-relative routes, such as `/README.md` and `/notes.md`.
-- [x] Serve only referenced assets under the root, at normalized root-relative routes such as `/assets/diagram.png`. This is an allowlist populated by scanning served documents for asset references — not a general static file server over the root.
+- [x] Serve only referenced assets under the root, at normalized root-relative routes such as `/assets/diagram.png`. The allowlist scans relative Markdown image/link destinations (including reference-style links), not raw HTML or absolute destinations. Referenced assets in hidden directories are allowed. The favicon route has its own local-file/built-in fallback.
 - [x] Return `404 Not Found` for unknown routes, and for any file under root that exists on disk but is neither a served document nor a discovered-and-validated asset reference.
 - [x] Return `404 Not Found` — uniformly, never `403` — for traversal attempts that resolve outside the root, so the response code can't be used as an oracle for "exists outside root" vs. "doesn't exist."
 - [x] Percent-decode the request path (including doubly-encoded sequences) before resolving it, then canonicalize the resolved path and confirm it is prefixed by the canonicalized root. Reject requests containing null bytes or control characters outright.
@@ -92,7 +92,7 @@ Markview's `--serve` mode should grow from a single-file preview into a local do
 
 - [x] Render no navigation, or minimal chrome only, for a single served file.
 - [x] Render horizontal tabs for explicit multi-file sets of up to 6 documents.
-- [x] Render a quiet sidebar or compact file list for directory mode and for any set larger than 6 documents.
+- [x] Render a quiet sidebar or compact file list for multi-document directory mode and for any set larger than 6 documents; a one-document directory has an empty navigation area.
 - [x] Use the first heading or document title as the visible nav label.
 - [x] Fall back to the filename when no heading/title is available.
 - [x] Use the route or filename as tooltip text.

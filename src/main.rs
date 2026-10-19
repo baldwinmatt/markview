@@ -479,18 +479,7 @@ impl ServeConfig {
             canonical_files.push(canonical);
         }
 
-        let root = if canonical_files.len() == 1 {
-            canonical_files[0]
-                .parent()
-                .ok_or("served file has no parent directory")?
-                .to_path_buf()
-        } else {
-            deepest_common_ancestor(&canonical_files)
-                .ok_or("explicit served files have no common ancestor")?
-        };
-        if is_filesystem_root(&root) {
-            return Err("explicit served files must share a non-root ancestor directory".into());
-        }
+        let root = explicit_serve_root(&canonical_files)?;
 
         let mut documents = Vec::new();
         for canonical in canonical_files {
@@ -772,6 +761,23 @@ fn document_for_path(root: &Path, canonical: PathBuf) -> io::Result<ServedDocume
         route_path,
         title,
     })
+}
+
+// Inputs have already been canonicalized and checked for duplicates.
+fn explicit_serve_root(canonical_files: &[PathBuf]) -> Result<PathBuf, &'static str> {
+    let root = if canonical_files.len() == 1 {
+        canonical_files[0]
+            .parent()
+            .ok_or("served file has no parent directory")?
+            .to_path_buf()
+    } else {
+        deepest_common_ancestor(canonical_files)
+            .ok_or("explicit served files have no common ancestor")?
+    };
+    if is_filesystem_root(&root) {
+        return Err("explicit served files must share a non-root ancestor directory");
+    }
+    Ok(root)
 }
 
 fn deepest_common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
@@ -1101,6 +1107,26 @@ fn handle_fs_events(
             EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
         );
         for event_path in &event.paths {
+            // Recursive backends may report only the new directory when files
+            // are created before its watch is installed. Rescan the tree on
+            // structural directory events, including removal/rename of known
+            // document parents, rather than requiring a Markdown file event.
+            if current.mode == ServeMode::Directory
+                && recurse
+                && is_structural
+                && (event_path.is_dir()
+                    || matches!(
+                        event.kind,
+                        EventKind::Create(notify::event::CreateKind::Folder)
+                            | EventKind::Remove(notify::event::RemoveKind::Folder)
+                    )
+                    || current
+                        .documents
+                        .iter()
+                        .any(|doc| doc.source_path.starts_with(event_path)))
+            {
+                needs_rescan = true;
+            }
             if !is_markdown_path(event_path) {
                 relevant = true;
                 asset_changed = true;
@@ -2148,6 +2174,24 @@ mod serve_nav_tests {
     use super::*;
     use std::time::Duration;
 
+    #[cfg(unix)]
+    #[test]
+    fn serve_mode_rejects_explicit_files_with_only_filesystem_root_common() {
+        // These are canonical-path inputs to the same validation used after
+        // filesystem checks; no runner-specific writable directories needed.
+        assert_eq!(
+            explicit_serve_root(&[PathBuf::from("/one/a.md"), PathBuf::from("/two/b.md")]),
+            Err("explicit served files must share a non-root ancestor directory")
+        );
+        assert_eq!(
+            explicit_serve_root(&[
+                PathBuf::from("/docs/one/a.md"),
+                PathBuf::from("/docs/two/b.md")
+            ]),
+            Ok(PathBuf::from("/docs"))
+        );
+    }
+
     #[test]
     fn directory_serve_config_precomputes_sidebar_nav_tree() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -2238,6 +2282,42 @@ mod serve_nav_tests {
             "structural rescan blocked the watcher event handler"
         );
         std::fs::write(&fifo, "# Blocked\n").expect("unblock fifo reader");
+    }
+
+    #[test]
+    fn new_directory_event_discovers_files_created_before_recursive_watch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(dir.path().join("README.md"), "# Home").unwrap();
+        let config = ServeConfig::from_inputs(vec![dir.path().to_path_buf()], 0, true).unwrap();
+        let shared = Arc::new(RwLock::new(Arc::new(config)));
+        let (tx, rx) = mpsc::channel();
+        let clients = Arc::new(Mutex::new(vec![(0, tx)]));
+        let nested = dir.path().join("guides");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("setup.md"), "# Setup").unwrap();
+        // Inotify may only report the directory: setup.md was created before
+        // the backend installed its watch on that new directory.
+        handle_fs_events(
+            vec![
+                notify::Event::new(EventKind::Create(notify::event::CreateKind::Folder))
+                    .add_path(nested),
+            ],
+            &shared,
+            &clients,
+            &[dir.path().to_path_buf()],
+            0,
+            true,
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)),
+            Ok(ReloadKind::Structure)
+        );
+        assert!(shared
+            .read()
+            .unwrap()
+            .documents
+            .iter()
+            .any(|doc| doc.route_path == "/guides/setup.md"));
     }
 
     #[test]

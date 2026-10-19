@@ -461,28 +461,6 @@ fn serve_mode_rejects_duplicate_aliased_explicit_files() {
 }
 
 #[test]
-fn serve_mode_rejects_explicit_files_with_only_filesystem_root_common() {
-    let dir = tempfile::tempdir_in("/private/tmp").expect("tmp dir");
-    let tmp_file = dir.path().join("one.md");
-    let workspace_file = std::env::current_dir()
-        .expect("cwd")
-        .join("target/root-common-test.md");
-    std::fs::write(&tmp_file, "# Tmp\n").expect("write tmp file");
-    std::fs::write(&workspace_file, "# Workspace\n").expect("write workspace file");
-
-    let mut cmd = Command::cargo_bin("markview").expect("binary");
-    cmd.args(["--serve"])
-        .arg(&tmp_file)
-        .arg(&workspace_file)
-        .args(["--port", &unused_port().to_string()])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("non-root ancestor"));
-
-    let _ = std::fs::remove_file(workspace_file);
-}
-
-#[test]
 fn explicit_multi_file_serve_renders_navigation_and_defaults_to_first_input() {
     let dir = tempfile::tempdir().expect("temp dir");
     let first = dir.path().join("first.md");
@@ -1002,13 +980,11 @@ fn serve_mode_daemon_detaches_and_prints_pid_and_address() {
     let dir = tempfile::tempdir().expect("temp dir");
     let file = dir.path().join("README.md");
     std::fs::write(&file, "# Daemonized\n").expect("write sample");
-    let port = unused_port();
 
     let start = Instant::now();
     let output = std::process::Command::new(cargo_bin("markview"))
         .current_dir(dir.path())
-        .args(["--serve", "--daemon", "--port"])
-        .arg(port.to_string())
+        .args(["--serve", "--daemon", "--port", "0"])
         .arg(&file)
         .output()
         .expect("run daemon");
@@ -1019,13 +995,15 @@ fn serve_mode_daemon_detaches_and_prints_pid_and_address() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let _daemon = DaemonProcess(number_after(&stdout, "pid "));
+    let port: u16 = number_after(&stdout, "http://localhost:");
+    assert_ne!(port, 0);
     assert!(
         startup_elapsed < Duration::from_secs(5),
         "the foreground parent should exit quickly instead of blocking, took {startup_elapsed:?}"
     );
 
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let _daemon = DaemonProcess(number_after(&stdout, "pid "));
     assert!(stdout.contains(&format!("http://localhost:{port}")));
     assert!(stdout.contains("pid "));
 
@@ -1757,6 +1735,26 @@ fn unused_port() -> u16 {
         .port()
 }
 
+#[test]
+fn event_reader_retries_interrupted_reads() {
+    struct InterruptedOnce(bool);
+    impl Read for InterruptedOnce {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if !self.0 {
+                self.0 = true;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            (&b"data: rescan\n\n"[..]).read(buffer)
+        }
+    }
+    assert!(read_until(
+        &mut InterruptedOnce(false),
+        "data: rescan",
+        Duration::from_secs(1)
+    )
+    .contains("data: rescan"));
+}
+
 fn read_until<R: Read>(reader: &mut R, needle: &str, timeout: Duration) -> String {
     let start = Instant::now();
     let mut buffer = [0_u8; 128];
@@ -1773,7 +1771,9 @@ fn read_until<R: Read>(reader: &mut R, needle: &str, timeout: Duration) -> Strin
             Err(error)
                 if matches!(
                     error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
                 ) =>
             {
                 continue;

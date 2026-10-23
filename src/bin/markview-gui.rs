@@ -14,6 +14,7 @@ use std::os::fd::{AsRawFd, RawFd};
 
 use markview::{
     app_view_with_preferences, AppModel, AppView, FrontendRenderer, GuiPreferences, HtmlRenderer,
+    DIFF_DARK_VARIABLES, DIFF_LIGHT_VARIABLES, DIFF_RULES,
 };
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tao::event::{Event, WindowEvent};
@@ -1445,12 +1446,7 @@ fn app_shell_html(view: &AppView) -> String {
   --accent: #0f766e;
   --code-bg: #ebe6de;
   --quote-bg: #f1ede7;
-  --diff-add-bg: #dafbe1;
-  --diff-add-fg: #116329;
-  --diff-del-bg: #ffebe9;
-  --diff-del-fg: #82071e;
-  --diff-hunk-bg: #ddf4ff;
-  --diff-hunk-fg: #0550ae;
+{DIFF_LIGHT_VARIABLES}
 }}
 @media (prefers-color-scheme: dark) {{
   :root {{
@@ -1463,12 +1459,7 @@ fn app_shell_html(view: &AppView) -> String {
     --accent: #5eead4;
     --code-bg: #25221f;
     --quote-bg: #211f1c;
-    --diff-add-bg: #033a16;
-    --diff-add-fg: #aff5b4;
-    --diff-del-bg: #67060c;
-    --diff-del-fg: #ffdcd7;
-    --diff-hunk-bg: #0c2d6b;
-    --diff-hunk-fg: #a5d6ff;
+{DIFF_DARK_VARIABLES}
   }}
 }}
 :root[data-theme="light"] {{
@@ -1482,12 +1473,7 @@ fn app_shell_html(view: &AppView) -> String {
   --accent: #0f766e;
   --code-bg: #ebe6de;
   --quote-bg: #f1ede7;
-  --diff-add-bg: #dafbe1;
-  --diff-add-fg: #116329;
-  --diff-del-bg: #ffebe9;
-  --diff-del-fg: #82071e;
-  --diff-hunk-bg: #ddf4ff;
-  --diff-hunk-fg: #0550ae;
+{DIFF_LIGHT_VARIABLES}
 }}
 :root[data-theme="dark"] {{
   color-scheme: dark;
@@ -1500,12 +1486,7 @@ fn app_shell_html(view: &AppView) -> String {
   --accent: #5eead4;
   --code-bg: #25221f;
   --quote-bg: #211f1c;
-  --diff-add-bg: #033a16;
-  --diff-add-fg: #aff5b4;
-  --diff-del-bg: #67060c;
-  --diff-del-fg: #ffdcd7;
-  --diff-hunk-bg: #0c2d6b;
-  --diff-hunk-fg: #a5d6ff;
+{DIFF_DARK_VARIABLES}
 }}
 * {{ box-sizing: border-box; }}
 html {{
@@ -1887,12 +1868,7 @@ pre {{
   padding: 1rem;
 }}
 pre code {{ background: transparent; padding: 0; }}
-pre.diff code {{ display: block; width: max-content; min-width: 100%; }}
-.diff-line {{ display: inline-block; min-width: 100%; }}
-.diff-addition {{ background: var(--diff-add-bg); color: var(--diff-add-fg); }}
-.diff-deletion {{ background: var(--diff-del-bg); color: var(--diff-del-fg); }}
-.diff-hunk {{ background: var(--diff-hunk-bg); color: var(--diff-hunk-fg); }}
-.diff-header {{ color: var(--muted); font-weight: 700; }}
+{DIFF_RULES}
 .syntax-keyword {{ color: var(--accent); font-weight: 700; }}
 .syntax-comment {{ color: var(--muted); font-style: italic; }}
 table {{
@@ -2895,6 +2871,52 @@ mod tests {
         assert!(html.contains("const restoreY = isEditingActive ? 0 : (this.scrollPositions.get(next.activeTabId) || 0)"));
         assert!(html.contains("scroller.scrollTop = restoreY"));
         assert!(html.contains("document.getElementById('scroll-root')"));
+    }
+
+    #[test]
+    fn diff_styles_cover_emitted_classes_and_every_theme() {
+        let document = markview::render_html(
+            "```diff\ndiff --git a/x b/x\n--- a/x\n+++ b/x\n@@\n context\n-old\n+new\n```",
+        );
+        let shell = app_shell_html(&app_view_with_preferences(
+            &AppModel::new(),
+            GuiPreferences::default(),
+        ));
+        let body = document.split("<main>").nth(1).unwrap();
+        let classes: HashSet<_> = body
+            .split("class=\"")
+            .skip(1)
+            .flat_map(|attr| attr.split('"').next().unwrap().split_whitespace())
+            .filter(|class| class.starts_with("diff-"))
+            .collect();
+        for (html, theme_count) in [(&document, 2), (&shell, 4)] {
+            let css = html
+                .split("<style>")
+                .nth(1)
+                .unwrap()
+                .split("</style>")
+                .next()
+                .unwrap();
+            for class in &classes {
+                assert!(
+                    css.contains(&format!(".{class} {{")),
+                    "missing rule {class}"
+                );
+            }
+            let themes: Vec<_> = css
+                .split('{')
+                .filter(|block| block.contains("--bg:"))
+                .collect();
+            assert_eq!(themes.len(), theme_count);
+            for theme in themes {
+                for variable in ["add-bg", "add-fg", "del-bg", "del-fg", "hunk-bg", "hunk-fg"] {
+                    assert!(
+                        theme.contains(&format!("--diff-{variable}:")),
+                        "missing {variable}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

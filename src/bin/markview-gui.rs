@@ -2898,6 +2898,7 @@ mod tests {
                 .next()
                 .unwrap();
             assert!(css.contains(".diff-line { display: block; min-width: 100%; }"));
+            assert!(css.contains("line-height: calc(1.65em / 0.92)"));
             for class in &classes {
                 assert!(
                     css.contains(&format!(".{class} {{")),

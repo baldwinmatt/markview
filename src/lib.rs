@@ -1166,7 +1166,13 @@ fn highlight_fenced_events<'a>(
         if let Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) = &event {
             let language = info.split(' ').next().unwrap_or("");
             let (class, highlight): (&str, fn(&str) -> String) = match language {
-                "diff" | "patch" | "dff" => (" class=\"diff\"", highlight_diff_code),
+                language
+                    if ["diff", "patch", "udiff", "dff"]
+                        .iter()
+                        .any(|alias| language.eq_ignore_ascii_case(alias)) =>
+                {
+                    (" class=\"diff\"", highlight_diff_code)
+                }
                 #[cfg(feature = "highlight")]
                 "rust" | "rs" => ("", highlight_rust_code),
                 _ => return Some(event),
@@ -2304,6 +2310,26 @@ mod tests {
             assert_eq!(RenderedDocument::from_markdown(&MarkdownDocument::new(markdown)).html(), format!("{prefix}<pre class=\"diff\"><code class=\"language-{}\"><span class=\"diff-line diff-addition\">+x</span>\n</code></pre>\n{suffix}", if markdown.contains("patch") { "patch" } else if markdown.contains("dff") { "dff" } else { "diff" }));
         }
         assert!(render_html("```diff\n+café\n```").contains("+caf&#233;"));
+    }
+
+    #[test]
+    fn diff_language_aliases_are_case_insensitive_and_exact() {
+        for language in [
+            "diff", "patch", "udiff", "dff", "Diff", "DIFF", "Patch", "UDIFF", "DFF",
+        ] {
+            assert!(
+                render_html(&format!("```{language} extra\n+x\n```")).contains(&format!(
+                    "<pre class=\"diff\"><code class=\"language-{language}\">"
+                )),
+                "{language}"
+            );
+        }
+        for language in ["diffx", "xdiff", ""] {
+            assert!(
+                !render_html(&format!("```{language}\n+x\n```")).contains("<pre class=\"diff\">"),
+                "{language}"
+            );
+        }
     }
 
     #[test]

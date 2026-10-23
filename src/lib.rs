@@ -1308,28 +1308,68 @@ fn slugify(title: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffLine {
+    Header,
+    Hunk,
+    Addition,
+    Deletion,
+    Context,
+}
+
+impl DiffLine {
+    fn class(self) -> &'static str {
+        match self {
+            Self::Header => "diff-header",
+            Self::Hunk => "diff-hunk",
+            Self::Addition => "diff-addition",
+            Self::Deletion => "diff-deletion",
+            Self::Context => "diff-context",
+        }
+    }
+}
+
+fn classify_diff_lines(code: &str) -> impl Iterator<Item = (DiffLine, &str)> {
+    let mut lines = code.split_inclusive('\n').peekable();
+    let mut preamble = false;
+    std::iter::from_fn(move || {
+        let line = lines.next()?;
+        let source = line.strip_suffix('\n').unwrap_or(line);
+        let kind = if source.starts_with("@@") {
+            preamble = false;
+            DiffLine::Hunk
+        } else {
+            if source.starts_with("diff -")
+                || source.starts_with("Index: ")
+                || (source.starts_with("--- ")
+                    && lines.peek().is_some_and(|next| next.starts_with("+++ ")))
+            {
+                preamble = true;
+            }
+            if source == "---" || source == "-- " || source == "\\ No newline at end of file" {
+                DiffLine::Context
+            } else if preamble {
+                DiffLine::Header
+            } else if source.starts_with('+') {
+                DiffLine::Addition
+            } else if source.starts_with('-') {
+                DiffLine::Deletion
+            } else {
+                DiffLine::Context
+            }
+        };
+        Some((kind, line))
+    })
+}
+
 // Preserve escaped text and newlines within highlighted rows.
 fn highlight_diff_code(code: &str) -> String {
     let mut highlighted = String::with_capacity(code.len());
-    for line in code.split_inclusive('\n') {
+    for (kind, line) in classify_diff_lines(code) {
         let (source, newline) = line
             .strip_suffix('\n')
             .map_or((line, ""), |source| (source, "\n"));
-        let class = if source.starts_with("diff ")
-            || source.starts_with("index ")
-            || source.starts_with("--- ")
-            || source.starts_with("+++ ")
-        {
-            "diff-header"
-        } else if source.starts_with("@@") {
-            "diff-hunk"
-        } else if source.starts_with('+') {
-            "diff-addition"
-        } else if source.starts_with('-') {
-            "diff-deletion"
-        } else {
-            "diff-context"
-        };
+        let class = kind.class();
         highlighted.push_str(r#"<span class="diff-line "#);
         highlighted.push_str(class);
         highlighted.push_str(r#"">"#);
@@ -2329,6 +2369,53 @@ mod tests {
                 !render_html(&format!("```{language}\n+x\n```")).contains("<pre class=\"diff\">"),
                 "{language}"
             );
+        }
+    }
+
+    #[test]
+    fn diff_classification_tracks_preambles_and_body() {
+        for (code, rows) in [
+            ("@@ wrong counts\n--- drop old comment\n context\n+++ y\nindex += 1\ndiff = a - b\n\\ No newline at end of file\n", vec![
+                ("diff-hunk", "@@ wrong counts"),
+                ("diff-deletion", "--- drop old comment"),
+                ("diff-addition", "+++ y"),
+                ("diff-context", "index += 1"),
+                ("diff-context", "diff = a - b"),
+                ("diff-context", "\\ No newline at end of file"),
+            ]),
+            ("diff --git a/x b/y\nnew file mode 100644\ndeleted file mode 100644\nold mode 100644\nnew mode 100755\nsimilarity index 80%\nrename from x\nrename to y\ncopy from x\ncopy to y\nindex abc..def\n--- a/x\n+++ b/y\n@@\n+x\n", vec![
+                ("diff-header", "new file mode 100644"),
+                ("diff-header", "deleted file mode 100644"),
+                ("diff-header", "old mode 100644"),
+                ("diff-header", "new mode 100755"),
+                ("diff-header", "similarity index 80%"),
+                ("diff-header", "rename from x"),
+                ("diff-header", "rename to y"),
+                ("diff-header", "copy from x"),
+                ("diff-header", "copy to y"),
+                ("diff-addition", "+x"),
+            ]),
+            ("From abc Mon Sep 17\nSubject: example\n---\n x | 2 +-\n 1 file changed\ndiff --git a/x b/x\n--- a/x\n+++ b/x\n@@\n-x\n+y\n-- \n2.50\n", vec![
+                ("diff-context", "---"),
+                ("diff-context", " x | 2 +-"),
+                ("diff-context", "-- "),
+            ]),
+            ("-snippet\n+snippet\ndiff -u a/x b/x\n--- a/x\n+++ b/x\ndiff --cc x\nindex abc..def\n@@ wrong\n-old\n+new\nIndex: next\n===\n--- old\n+++ new\n@@\n+last\n", vec![
+                ("diff-deletion", "-snippet"),
+                ("diff-addition", "+snippet"),
+                ("diff-header", "diff -u a/x b/x"),
+                ("diff-header", "diff --cc x"),
+                ("diff-header", "index abc..def"),
+                ("diff-header", "Index: next"),
+                ("diff-header", "==="),
+                ("diff-addition", "+last"),
+            ]),
+            ("--- old\n+++ new\nmetadata\n", vec![("diff-header", "metadata")]),
+        ] {
+            let html = render_html(&format!("```patch\n{code}```"));
+            for (class, text) in rows {
+                assert!(html.contains(&format!("<span class=\"diff-line {class}\">{text}</span>")), "{class}: {text}");
+            }
         }
     }
 

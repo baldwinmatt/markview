@@ -22,7 +22,6 @@ fn diff_blocks_are_documented_in_usage_with_current_aliases_and_frontends() {
         "`diff`",
         "`patch`",
         "`udiff`",
-        "`dff`",
         "`--html`",
         "`--serve`",
         "terminal renderer",
@@ -31,5 +30,6 @@ fn diff_blocks_are_documented_in_usage_with_current_aliases_and_frontends() {
     ] {
         assert!(diff.contains(term), "missing diff documentation: {term}");
     }
+    assert!(!diff.contains("`dff`"));
     assert_eq!(readme.matches("### Diff blocks\n").count(), 1);
 }

@@ -1196,7 +1196,7 @@ fn highlight_fenced_events<'a>(
             let language = info.split(' ').next().unwrap_or("");
             let (class, highlight): (&str, fn(&str) -> String) = match language {
                 language
-                    if ["diff", "patch", "udiff", "dff"]
+                    if ["diff", "patch", "udiff"]
                         .iter()
                         .any(|alias| language.eq_ignore_ascii_case(alias)) =>
                 {
@@ -2357,10 +2357,14 @@ mod tests {
         for (markdown, prefix, suffix) in [
             ("~~~diff\n+x\n~~~", "", ""),
             ("```patch\n+x\n", "", ""),
-            ("> ```dff\n> +x\n> ```", "<blockquote>\n", "</blockquote>\n"),
+            (
+                "> ```diff\n> +x\n> ```",
+                "<blockquote>\n",
+                "</blockquote>\n",
+            ),
             ("- ```diff\n  +x\n  ```", "<ul>\n<li>\n", "</li>\n</ul>\n"),
         ] {
-            assert_eq!(RenderedDocument::from_markdown(&MarkdownDocument::new(markdown)).html(), format!("{prefix}<pre class=\"diff\"><code class=\"language-{}\"><span class=\"diff-line diff-addition\">+x\n</span></code></pre>\n{suffix}", if markdown.contains("patch") { "patch" } else if markdown.contains("dff") { "dff" } else { "diff" }));
+            assert_eq!(RenderedDocument::from_markdown(&MarkdownDocument::new(markdown)).html(), format!("{prefix}<pre class=\"diff\"><code class=\"language-{}\"><span class=\"diff-line diff-addition\">+x\n</span></code></pre>\n{suffix}", if markdown.contains("patch") { "patch" } else { "diff" }));
         }
         assert!(render_html("```diff\n+café\n```").contains("+caf&#233;"));
     }
@@ -2368,7 +2372,7 @@ mod tests {
     #[test]
     fn diff_language_aliases_render_exact_rows() {
         for language in [
-            "diff", "patch", "udiff", "dff", "Diff", "DIFF", "Patch", "pAtCh", "UDIFF", "DFF",
+            "diff", "patch", "udiff", "Diff", "DIFF", "Patch", "pAtCh", "UDIFF",
         ] {
             let markdown = format!("```{language} extra\ndiff --git a/x b/x\nindex abc..def\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n context\n-old();\n+new(<value>);\n\n```");
             let document = RenderedDocument::from_markdown(&MarkdownDocument::new(markdown));
@@ -2396,7 +2400,7 @@ mod tests {
 
     #[test]
     fn non_diff_labels_round_trip_without_highlighting() {
-        for language in ["diffx", "xdiff", "dIfFx", "xDIFF", ""] {
+        for language in ["diffx", "xdiff", "dIfFx", "xDIFF", "dff", "DFF", "DfF", ""] {
             let markdown = format!("```{language}\n+x\n```");
             let mut expected = String::new();
             html::push_html(

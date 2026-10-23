@@ -74,8 +74,8 @@ On daemon startup failure, read the log path printed by the launcher with `cat`,
 
 ### Diff blocks
 
-Use a fenced code block with a case-insensitive label: `diff`, `patch`,
-`udiff`, or the retained `dff` alias. Diff row colours are always on in the GUI,
+Use a fenced code block with a case-insensitive label: `diff`, `patch`, or
+`udiff`. Diff row colours are always on in the GUI,
 `--html` output, and `--serve` pages, and follow the light or dark theme.
 The terminal renderer shows diff code without row colouring. Only Rust keyword
 highlighting requires the `highlight` Cargo feature.

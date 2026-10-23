@@ -2366,74 +2366,70 @@ mod tests {
     }
 
     #[test]
-    fn diff_language_aliases_are_case_insensitive_and_exact() {
+    fn diff_language_aliases_render_exact_rows() {
         for language in [
-            "diff", "patch", "udiff", "dff", "Diff", "DIFF", "Patch", "UDIFF", "DFF",
+            "diff", "patch", "udiff", "dff", "Diff", "DIFF", "Patch", "pAtCh", "UDIFF", "DFF",
         ] {
-            assert!(
-                render_html(&format!("```{language} extra\n+x\n```")).contains(&format!(
-                    "<pre class=\"diff\"><code class=\"language-{language}\">"
-                )),
-                "{language}"
-            );
-        }
-        for language in ["diffx", "xdiff", ""] {
-            assert!(
-                !render_html(&format!("```{language}\n+x\n```")).contains("<pre class=\"diff\">"),
+            let markdown = format!("```{language} extra\ndiff --git a/x b/x\nindex abc..def\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n context\n-old();\n+new(<value>);\n\n```");
+            let document = RenderedDocument::from_markdown(&MarkdownDocument::new(markdown));
+            assert_eq!(
+                document.html(),
+                format!(
+                    concat!(
+                        "<pre class=\"diff\"><code class=\"language-{}\">",
+                        "<span class=\"diff-line diff-header\">diff --git a/x b/x\n</span>",
+                        "<span class=\"diff-line diff-header\">index abc..def\n</span>",
+                        "<span class=\"diff-line diff-header\">--- a/x\n</span>",
+                        "<span class=\"diff-line diff-header\">+++ b/x\n</span>",
+                        "<span class=\"diff-line diff-hunk\">@@ -1 +1 @@\n</span>",
+                        " context\n",
+                        "<span class=\"diff-line diff-deletion\">-old();\n</span>",
+                        "<span class=\"diff-line diff-addition\">+new(&lt;value&gt;);\n</span>",
+                        "\n</code></pre>\n"
+                    ),
+                    language
+                ),
                 "{language}"
             );
         }
     }
 
     #[test]
-    fn diff_classification_tracks_preambles_and_body() {
-        for (code, rows) in [
-            ("@@ wrong counts\n--- drop old comment\n context\n+++ y\nindex += 1\ndiff = a - b\n\\ No newline at end of file\n", vec![
-                ("diff-hunk", "@@ wrong counts"),
-                ("diff-deletion", "--- drop old comment"),
-                ("diff-addition", "+++ y"),
-                ("diff-context", "index += 1"),
-                ("diff-context", "diff = a - b"),
-                ("diff-context", "\\ No newline at end of file"),
-            ]),
-            ("diff --git a/x b/y\nnew file mode 100644\ndeleted file mode 100644\nold mode 100644\nnew mode 100755\nsimilarity index 80%\nrename from x\nrename to y\ncopy from x\ncopy to y\nindex abc..def\n--- a/x\n+++ b/y\n@@\n+x\n", vec![
-                ("diff-header", "new file mode 100644"),
-                ("diff-header", "deleted file mode 100644"),
-                ("diff-header", "old mode 100644"),
-                ("diff-header", "new mode 100755"),
-                ("diff-header", "similarity index 80%"),
-                ("diff-header", "rename from x"),
-                ("diff-header", "rename to y"),
-                ("diff-header", "copy from x"),
-                ("diff-header", "copy to y"),
-                ("diff-addition", "+x"),
-            ]),
-            ("From abc Mon Sep 17\nSubject: example\n---\n x | 2 +-\n 1 file changed\ndiff --git a/x b/x\n--- a/x\n+++ b/x\n@@\n-x\n+y\n-- \n2.50\n", vec![
-                ("diff-context", "---"),
-                ("diff-context", " x | 2 +-"),
-                ("diff-context", "-- "),
-            ]),
-            ("-snippet\n+snippet\ndiff -u a/x b/x\n--- a/x\n+++ b/x\ndiff --cc x\nindex abc..def\n@@ wrong\n-old\n+new\nIndex: next\n===\n--- old\n+++ new\n@@\n+last\n", vec![
-                ("diff-deletion", "-snippet"),
-                ("diff-addition", "+snippet"),
-                ("diff-header", "diff -u a/x b/x"),
-                ("diff-header", "diff --cc x"),
-                ("diff-header", "index abc..def"),
-                ("diff-header", "Index: next"),
-                ("diff-header", "==="),
-                ("diff-addition", "+last"),
-            ]),
-            ("--- old\n+++ new\nmetadata\n", vec![("diff-header", "metadata")]),
+    fn non_diff_labels_round_trip_without_highlighting() {
+        for language in ["diffx", "xdiff", "dIfFx", "xDIFF", ""] {
+            let markdown = format!("```{language}\n+x\n```");
+            let mut expected = String::new();
+            html::push_html(
+                &mut expected,
+                Parser::new_ext(&markdown, markdown_options()),
+            );
+            assert_eq!(
+                RenderedDocument::from_markdown(&MarkdownDocument::new(markdown)).html(),
+                expected,
+                "{language}"
+            );
+        }
+    }
+
+    #[test]
+    fn diff_classifier_covers_preambles_and_body_rows() {
+        use DiffLine::{Addition, Context, Deletion, Header, Hunk};
+        for (code, expected) in [
+            ("@@ wrong counts\n--- drop old comment\n context\n+++ y\nindex += 1\ndiff = a - b\n\\ No newline at end of file\n",
+                vec![Hunk, Deletion, Context, Addition, Context, Context, Context]),
+            ("diff --git a/x b/y\nnew file mode 100644\ndeleted file mode 100644\nold mode 100644\nnew mode 100755\nsimilarity index 80%\nrename from x\nrename to y\ncopy from x\ncopy to y\nindex abc..def\n--- a/x\n+++ b/y\n@@\n+x\n",
+                vec![Header, Header, Header, Header, Header, Header, Header, Header, Header, Header, Header, Header, Header, Hunk, Addition]),
+            ("From abc Mon Sep 17\nSubject: example\n---\n x | 2 +-\n 1 file changed\ndiff --git a/x b/x\n--- a/x\n+++ b/x\n@@\n-x\n+y\n-- \n2.50\n",
+                vec![Context, Context, Context, Context, Context, Header, Header, Header, Hunk, Deletion, Addition, Context, Context]),
+            ("-snippet\n+snippet\ndiff -u a/x b/x\n--- a/x\n+++ b/x\ndiff --cc x\nindex abc..def\n@@ wrong\n-old\n+new\nIndex: next\n===\n--- old\n+++ new\n@@\n+last\n",
+                vec![Deletion, Addition, Header, Header, Header, Header, Header, Hunk, Deletion, Addition, Header, Header, Header, Header, Hunk, Addition]),
+            ("--- old\n+++ new\nmetadata\n", vec![Header, Header, Header]),
+            ("\n+added\n-removed\n context\nlast", vec![Context, Addition, Deletion, Context, Context]),
+            ("", vec![]),
         ] {
-            let html = render_html(&format!("```patch\n{code}```"));
-            for (class, text) in rows {
-                let expected = if class == "diff-context" {
-                    format!("{text}\n")
-                } else {
-                    format!("<span class=\"diff-line {class}\">{text}\n</span>")
-                };
-                assert!(html.contains(&expected), "{class}: {text}");
-            }
+            let classified: Vec<_> = classify_diff_lines(code).collect();
+            assert_eq!(classified.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(), expected, "{code}");
+            assert_eq!(classified.iter().map(|(_, line)| *line).collect::<String>(), code);
         }
     }
 
@@ -2451,56 +2447,6 @@ mod tests {
                 "<span class=\"diff-line diff-addition\">+last</span></code></pre>\n"
             )
         );
-    }
-
-    #[test]
-    fn html_renderer_highlights_diff_rows_by_default() {
-        for language in ["diff", "patch", "dff"] {
-            let markdown = format!(
-                "```{language}\ndiff --git a/test.c b/test.c\nindex abc..def 100644\n--- a/test.c\n+++ b/test.c\n@@ -1,2 +1,2 @@\n context\n-old();\n+new(<value>);\n\n```"
-            );
-            let html = render_html(&markdown);
-            assert!(html.contains(&format!(
-                r#"<pre class="diff"><code class="language-{language}">"#
-            )));
-            for header in [
-                "diff --git a/test.c b/test.c",
-                "index abc..def 100644",
-                "--- a/test.c",
-                "+++ b/test.c",
-            ] {
-                assert!(html.contains(&format!(
-                    "<span class=\"diff-line diff-header\">{header}\n</span>"
-                )));
-            }
-            assert!(html.contains("<span class=\"diff-line diff-hunk\">@@ -1,2 +1,2 @@\n</span>"));
-            assert!(html.contains(" context\n"));
-            assert!(html.contains("<span class=\"diff-line diff-deletion\">-old();\n</span>"));
-            assert!(html
-                .contains("<span class=\"diff-line diff-addition\">+new(&lt;value&gt;);\n</span>"));
-            assert!(html.contains("</span>\n</code>"));
-        }
-    }
-
-    #[test]
-    fn diff_highlighting_preserves_text_and_unrelated_blocks() {
-        let code = " context\n-removed\n+<script>&\n\n+last";
-        let escaped = " context\n-removed\n+&lt;script&gt;&amp;\n\n+last";
-        let highlighted = highlight_diff_code(escaped);
-        let mut plain = String::new();
-        let mut in_tag = false;
-        for ch in highlighted.chars() {
-            match ch {
-                '<' => in_tag = true,
-                '>' => in_tag = false,
-                _ if !in_tag => plain.push(ch),
-                _ => {}
-            }
-        }
-        assert_eq!(plain, escaped);
-        let html = render_html(&format!("```text\n{code}\n```\n\n```\n+plain\n```"));
-        assert!(!html.contains("<span class=\"diff-line"));
-        assert!(html.contains("<pre><code>+plain\n</code></pre>"));
     }
 
     #[cfg(not(feature = "highlight"))]

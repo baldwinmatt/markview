@@ -22,12 +22,11 @@ pub const DIFF_DARK_VARIABLES: &str = r#"  --diff-add-bg: #033a16;
 
 /// Shared diff layout and colours. Headers inherit the surrounding code colour.
 pub const DIFF_RULES: &str = r#"pre.diff code { display: block; width: max-content; min-width: 100%; }
-.diff-line { display: inline-block; min-width: 100%; }
+.diff-line { display: block; min-width: 100%; }
 .diff-addition { background: var(--diff-add-bg); color: var(--diff-add-fg); }
 .diff-deletion { background: var(--diff-del-bg); color: var(--diff-del-fg); }
 .diff-hunk { background: var(--diff-hunk-bg); color: var(--diff-hunk-fg); }
-.diff-header { color: inherit; font-weight: 700; }
-.diff-context { color: inherit; }"#;
+.diff-header { color: inherit; font-weight: 700; }"#;
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -1391,16 +1390,15 @@ fn classify_diff_lines(code: &str) -> impl Iterator<Item = (DiffLine, &str)> {
 fn highlight_diff_code(code: &str) -> String {
     let mut highlighted = String::with_capacity(code.len());
     for (kind, line) in classify_diff_lines(code) {
-        let (source, newline) = line
-            .strip_suffix('\n')
-            .map_or((line, ""), |source| (source, "\n"));
-        let class = kind.class();
+        if kind == DiffLine::Context {
+            highlighted.push_str(line);
+            continue;
+        }
         highlighted.push_str(r#"<span class="diff-line "#);
-        highlighted.push_str(class);
+        highlighted.push_str(kind.class());
         highlighted.push_str(r#"">"#);
-        highlighted.push_str(source);
+        highlighted.push_str(line);
         highlighted.push_str("</span>");
-        highlighted.push_str(newline);
     }
     highlighted
 }
@@ -2357,7 +2355,7 @@ mod tests {
             ("> ```dff\n> +x\n> ```", "<blockquote>\n", "</blockquote>\n"),
             ("- ```diff\n  +x\n  ```", "<ul>\n<li>\n", "</li>\n</ul>\n"),
         ] {
-            assert_eq!(RenderedDocument::from_markdown(&MarkdownDocument::new(markdown)).html(), format!("{prefix}<pre class=\"diff\"><code class=\"language-{}\"><span class=\"diff-line diff-addition\">+x</span>\n</code></pre>\n{suffix}", if markdown.contains("patch") { "patch" } else if markdown.contains("dff") { "dff" } else { "diff" }));
+            assert_eq!(RenderedDocument::from_markdown(&MarkdownDocument::new(markdown)).html(), format!("{prefix}<pre class=\"diff\"><code class=\"language-{}\"><span class=\"diff-line diff-addition\">+x\n</span></code></pre>\n{suffix}", if markdown.contains("patch") { "patch" } else if markdown.contains("dff") { "dff" } else { "diff" }));
         }
         assert!(render_html("```diff\n+café\n```").contains("+caf&#233;"));
     }
@@ -2424,9 +2422,30 @@ mod tests {
         ] {
             let html = render_html(&format!("```patch\n{code}```"));
             for (class, text) in rows {
-                assert!(html.contains(&format!("<span class=\"diff-line {class}\">{text}</span>")), "{class}: {text}");
+                let expected = if class == "diff-context" {
+                    format!("{text}\n")
+                } else {
+                    format!("<span class=\"diff-line {class}\">{text}\n</span>")
+                };
+                assert!(html.contains(&expected), "{class}: {text}");
             }
         }
+    }
+
+    #[test]
+    fn diff_rows_include_newlines_and_leave_context_bare() {
+        let document = RenderedDocument::from_markdown(&MarkdownDocument::new(
+            "```diff\n context\n\n-<&\"'\n+new\n+last",
+        ));
+        assert_eq!(
+            document.html(),
+            concat!(
+                "<pre class=\"diff\"><code class=\"language-diff\"> context\n\n",
+                "<span class=\"diff-line diff-deletion\">-&lt;&amp;&quot;&#39;\n</span>",
+                "<span class=\"diff-line diff-addition\">+new\n</span>",
+                "<span class=\"diff-line diff-addition\">+last</span></code></pre>\n"
+            )
+        );
     }
 
     #[test]
@@ -2446,15 +2465,15 @@ mod tests {
                 "+++ b/test.c",
             ] {
                 assert!(html.contains(&format!(
-                    r#"<span class="diff-line diff-header">{header}</span>"#
+                    "<span class=\"diff-line diff-header\">{header}\n</span>"
                 )));
             }
-            assert!(html.contains(r#"<span class="diff-line diff-hunk">@@ -1,2 +1,2 @@</span>"#));
-            assert!(html.contains(r#"<span class="diff-line diff-context"> context</span>"#));
-            assert!(html.contains(r#"<span class="diff-line diff-deletion">-old();</span>"#));
+            assert!(html.contains("<span class=\"diff-line diff-hunk\">@@ -1,2 +1,2 @@\n</span>"));
+            assert!(html.contains(" context\n"));
+            assert!(html.contains("<span class=\"diff-line diff-deletion\">-old();\n</span>"));
             assert!(html
-                .contains(r#"<span class="diff-line diff-addition">+new(&lt;value&gt;);</span>"#));
-            assert!(html.contains("<span class=\"diff-line diff-context\"></span>\n</code>"));
+                .contains("<span class=\"diff-line diff-addition\">+new(&lt;value&gt;);\n</span>"));
+            assert!(html.contains("</span>\n</code>"));
         }
     }
 

@@ -2897,6 +2897,7 @@ mod tests {
                 .split("</style>")
                 .next()
                 .unwrap();
+            assert!(css.contains(".diff-line { display: block; min-width: 100%; }"));
             for class in &classes {
                 assert!(
                     css.contains(&format!(".{class} {{")),

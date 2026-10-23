@@ -1794,6 +1794,7 @@ impl Renderer {
             Tag::Emphasis => self.push_style(TerminalStyle::Italic),
             Tag::Strong => self.push_style(TerminalStyle::Bold),
             Tag::Strikethrough => self.push_text("~"),
+            // markdown_options() omits these flags; enabling them needs a terminal rendering decision.
             Tag::Superscript | Tag::Subscript => {}
             Tag::Link { dest_url, .. } => self.pending_link = Some(dest_url.to_string()),
             Tag::Image {
@@ -1848,6 +1849,7 @@ impl Renderer {
             TagEnd::Item => self.flush_line(),
             TagEnd::Emphasis | TagEnd::Strong => self.push_reset(),
             TagEnd::Strikethrough => self.push_text("~"),
+            // markdown_options() omits these flags; enabling them needs a terminal rendering decision.
             TagEnd::Superscript | TagEnd::Subscript => {}
             TagEnd::Link => {
                 if let Some(dest) = self.pending_link.take() {
@@ -2333,6 +2335,46 @@ mod tests {
         assert!(html.contains(r#"<h1 id="intro">Intro!</h1>"#));
         assert!(html.contains(r#"<h2 id="intro-2">Intro</h2>"#));
         assert!(html.contains(r#"<h3 id="details">Details</h3>"#));
+    }
+
+    #[test]
+    fn terminal_ignores_superscript_and_subscript_event_wrappers() {
+        let mut renderer = Renderer::new(RenderOptions {
+            color: false,
+            width: 80,
+        });
+        for event in [
+            Event::Start(Tag::Paragraph),
+            Event::Text("a ".into()),
+            Event::Start(Tag::Superscript),
+            Event::Text("sup ".into()),
+            Event::End(TagEnd::Superscript),
+            Event::Text("b ".into()),
+            Event::Start(Tag::Subscript),
+            Event::Text("sub ".into()),
+            Event::End(TagEnd::Subscript),
+            Event::Text("c".into()),
+            Event::End(TagEnd::Paragraph),
+        ] {
+            renderer.event(event);
+        }
+        assert_eq!(renderer.finish(), "a sup b sub c\n");
+    }
+
+    #[test]
+    fn shipped_options_preserve_script_delimiters_and_literal_wikilinks() {
+        let options = RenderOptions {
+            color: false,
+            width: 80,
+        };
+        assert_eq!(
+            render("a ^sup^ b ~sub~ c", options),
+            "a ^sup^ b ~ sub ~ c\n"
+        );
+        assert_eq!(
+            render("See [[Target]] now", options),
+            "See [ [ Target]] now\n"
+        );
     }
 
     #[test]

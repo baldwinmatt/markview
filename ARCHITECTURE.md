@@ -33,6 +33,14 @@ Current implementations:
 
 `render_html` and `render` are convenience functions for CLI-style callers. New frontends should use the document and renderer types directly when they need titles, headings, or alternate output formats.
 
+HTML rendering applies heading IDs and a fenced-code iterator adapter to parser
+events before serializing them. The adapter buffers raw text only for recognized
+diff fences and, with `highlight`, Rust fences; other events pass through.
+Buffered text is escaped before emitting highlighted HTML. Diff rows use a
+preamble/body classifier without relying on hunk line counts. Rendering no longer
+scans the generated HTML for code blocks. The library owns the shared diff palette,
+layout rules, and print colour override used by the GUI shell.
+
 ## GUI Event Flow
 
 The macOS GUI binary is behind the `gui` Cargo feature. It uses `tao` for the window/event loop and `wry` for the system WebKit view.

@@ -72,6 +72,30 @@ For directory collections, `/` chooses the top-level `README.md`, then `index.md
 
 On daemon startup failure, read the log path printed by the launcher with `cat`, report that underlying error, and remove the failed log. Daemon children retain their concrete `--port` in process arguments; foreground processes may omit it or show `0`, so read their startup banner for the actual port. Unix daemons inherit the bound listener, keeping the selected port reserved throughout startup.
 
+### Diff blocks
+
+Use a fenced code block with a case-insensitive label: `diff`, `patch`,
+`udiff`, or the retained `dff` alias. Diff row colours are always on in the GUI,
+`--html` output, and `--serve` pages, and follow the light or dark theme.
+The terminal renderer shows diff code without row colouring. Only Rust keyword
+highlighting requires the `highlight` Cargo feature.
+
+Added lines (`+`) are green, removed lines (`-`) are red, and hunk headers
+(`@@`) are blue. File and git preamble headers use neutral, bold text, including
+mode changes and rename/copy metadata. After a hunk header, comment lines such
+as `--- removed comment` are deletions, while ordinary context stays uncoloured.
+Format-patch separators and signatures also stay uncoloured.
+
+````markdown
+```diff
+--- a/example.txt
++++ b/example.txt
+@@ -1 +1 @@
+-old text
++new text
+```
+````
+
 ### macOS GUI
 
 ```sh
@@ -147,20 +171,3 @@ Every commit should be reviewed before starting the next task:
 5. Amend the original commit with the fixes before proceeding.
 
 Minor findings may be fixed immediately, explicitly deferred in the review file, or turned into follow-up work.
-
-### Diff blocks
-
-Use a fenced code block labeled `diff` (or `patch` / `dff`) to show changes
-with GitHub-style row colors in the GUI and exported HTML. Added lines (`+`)
-are green, removed lines (`-`) are red, and hunk headers (`@@`) are blue.
-File headers stay neutral. Colors follow the light or dark theme.
-
-````markdown
-```diff
---- a/example.txt
-+++ b/example.txt
-@@ -1 +1 @@
--old text
-+new text
-```
-````

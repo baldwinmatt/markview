@@ -505,10 +505,10 @@ impl SpellingWorker {
 
 // Preserve source UTF-16 positions while exposing only parser-recognized prose.
 fn spelling_source(source: &str) -> String {
-    use pulldown_cmark::{Event, LinkType, Options, Parser, Tag, TagEnd};
+    use pulldown_cmark::{Event, LinkType, Parser, Tag, TagEnd};
     let mut mask = vec![false; source.len()];
     let mut excluded: usize = 0;
-    for (event, range) in Parser::new_ext(source, Options::all()).into_offset_iter() {
+    for (event, range) in Parser::new_ext(source, markview::scanner_options()).into_offset_iter() {
         match event {
             Event::Start(Tag::CodeBlock(_) | Tag::HtmlBlock) => excluded += 1,
             Event::Start(Tag::Link {
@@ -2680,6 +2680,43 @@ mod tests {
             "ref",
         ] {
             assert!(!masked.contains(hidden), "{hidden}: {masked:?}");
+        }
+    }
+
+    #[test]
+    fn spelling_mask_hides_bracket_label_destinations_and_keeps_utf16_positions() {
+        for (link, visible, destination) in [
+            (
+                "[[RFC 2119]](https://www.rfc-editor.org/rfc/rfc2119)",
+                "RFC 2119",
+                "https://www.rfc-editor.org/rfc/rfc2119",
+            ),
+            (
+                "[RFC 2119](https://www.rfc-editor.org/rfc/rfc2119)",
+                "RFC 2119",
+                "https://www.rfc-editor.org/rfc/rfc2119",
+            ),
+            ("[1](paperz.pdf)", "1", "paperz.pdf"),
+            ("![figz](imagez.png)", "figz", "imagez.png"),
+            ("[[1]](paperz.pdf)", "1", "paperz.pdf"),
+            ("![[figz]](imagez.png)", "figz", "imagez.png"),
+        ] {
+            let source = format!("🙂 {link} says\n");
+            let masked = spelling_source(&source);
+            assert_eq!(masked.encode_utf16().count(), source.encode_utf16().count());
+            assert!(masked.starts_with("🙂 "));
+            let destination_start = source.find(destination).unwrap();
+            let prefix_len = source[..destination_start].encode_utf16().count();
+            let units: Vec<_> = masked.encode_utf16().collect();
+            assert!(
+                units[prefix_len..prefix_len + destination.len()]
+                    .iter()
+                    .all(|unit| *unit == u16::from(b' ')),
+                "{masked:?}"
+            );
+            assert!(!masked.contains(destination), "{masked:?}");
+            assert!(masked.contains(visible), "{masked:?}");
+            assert!(masked.ends_with(" says\n"), "{masked:?}");
         }
     }
 

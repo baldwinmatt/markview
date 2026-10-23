@@ -935,7 +935,7 @@ fn hex_value(byte: u8) -> Option<u8> {
 }
 
 fn markdown_references(source: &str) -> Vec<String> {
-    Parser::new_ext(source, Options::all())
+    Parser::new_ext(source, markview::scanner_options())
         .filter_map(|event| match event {
             Event::Start(Tag::Link { dest_url, .. })
             | Event::Start(Tag::Image { dest_url, .. }) => Some(dest_url.to_string()),
@@ -2167,6 +2167,99 @@ fn write_404(stream: &mut TcpStream, head_only: bool) -> io::Result<()> {
         "Not found",
         head_only,
     )
+}
+
+#[cfg(test)]
+mod reference_scan_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn rendered_references(source: &str) -> Vec<String> {
+        let document = markview::RenderedDocument::from_markdown(&MarkdownDocument::new(source));
+        let mut references = Vec::new();
+        for (tag, attribute) in [("<a ", "href=\""), ("<img ", "src=\"")] {
+            for element in document.html().split(tag).skip(1) {
+                let opening = element.split('>').next().unwrap();
+                if let Some(value) = opening.split(attribute).nth(1) {
+                    let value = value.split('"').next().unwrap().replace("&amp;", "&");
+                    // Generated footnote backlinks are not source asset references.
+                    if !value.starts_with('#') {
+                        references.push(value);
+                    }
+                }
+            }
+        }
+        references.sort();
+        references
+    }
+
+    #[test]
+    fn reference_scanner_agrees_with_rendered_links_and_images() {
+        for source in [
+            "[[1]](cite.txt)",
+            "[[RFC 2119]](rfc.txt)",
+            "![[x]](pic2.png)",
+            "[see [[x]]](d.txt)",
+            "[[RFC2119]]\n\n[RFC2119]: rfc2119.txt\n",
+            "[[x.txt]] ![[x.png]] [[.hidden/secret.txt]]",
+            "| Text |\n| --- |\n| [[x.txt]] |\n",
+            "- [[x.txt]]",
+            "> ![[x.png]]",
+            "[E=mc^2^](caret.txt) ![~x~](sub.png)",
+            "# Title ^sup^ and [[Other Page]]\n\n[normal](normal.txt)",
+            "`[code](hidden.txt)`\n\n```text\n![code](hidden.png)\n```",
+            "<span>[label](visible.txt)</span>",
+            "[query](paper.txt?a=1&b=2)",
+        ] {
+            let mut scanned = markdown_references(source);
+            scanned.sort();
+            assert_eq!(scanned, rendered_references(source), "{source}");
+        }
+    }
+
+    #[test]
+    fn reference_scanner_preserves_known_pre_013_divergences() {
+        // These scanner/renderer differences predate 0.13. Do not hide new
+        // divergences in this list: each exception pins both existing outputs.
+        for (name, source, scanned, rendered) in [
+            (
+                "YAML front matter",
+                "---\nasset: [x](yaml.txt)\n---\n",
+                vec![],
+                vec!["yaml.txt"],
+            ),
+            ("math", "$[x](math.txt)$", vec![], vec!["math.txt"]),
+            (
+                "old footnotes",
+                "[^3]:\n\n    [x](footnote.txt)\n",
+                vec![],
+                vec!["footnote.txt"],
+            ),
+            (
+                "definition lists",
+                "Term\n: definition\n\n    [x](definition.txt)\n",
+                vec!["definition.txt"],
+                vec![],
+            ),
+        ] {
+            assert_eq!(markdown_references(source), scanned, "scanner: {name}");
+            assert_eq!(rendered_references(source), rendered, "renderer: {name}");
+        }
+    }
+
+    #[test]
+    fn reference_scan_is_fast_for_nested_wikilink_style_prose() {
+        let source = format!("{}{}", "![[".repeat(40_000), "]]".repeat(40_000));
+        let start = Instant::now();
+        let references = markdown_references(&source);
+        let elapsed = start.elapsed();
+        eprintln!("reference scan: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "reference scan took {elapsed:?}"
+        );
+        assert!(references.is_empty());
+    }
 }
 
 #[cfg(test)]

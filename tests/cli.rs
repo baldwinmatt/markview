@@ -1208,6 +1208,58 @@ fn directory_serve_loads_referenced_assets_but_not_unreferenced_files() {
 }
 
 #[test]
+fn serve_mode_serves_assets_referenced_through_links_whose_label_starts_with_a_bracket() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("README.md"),
+        "# Doc\n\n[[1]](cite.txt)\n[[RFC 2119]](rfc.txt)\n![[x]](pic2.png)\n[see [[x]]](d.txt)\n[[RFC2119]]\n\n[RFC2119]: ref.txt\n").unwrap();
+    for asset in ["cite.txt", "rfc.txt", "pic2.png", "d.txt", "ref.txt"] {
+        std::fs::write(dir.path().join(asset), "asset").unwrap();
+    }
+    let mut server = ServeProcess::start_dir(dir.path());
+    let document = http_get(server.port, "/");
+    for (attribute, asset) in [
+        ("href", "cite.txt"),
+        ("href", "rfc.txt"),
+        ("src", "pic2.png"),
+        ("href", "d.txt"),
+        ("href", "ref.txt"),
+    ] {
+        assert!(
+            http_get(server.port, &format!("/{asset}")).contains("HTTP/1.1 200 OK"),
+            "{asset}"
+        );
+        assert!(
+            document.contains(&format!("{attribute}=\"/{asset}\"")),
+            "{asset}: {document}"
+        );
+    }
+    server.stop();
+}
+
+#[test]
+fn serve_mode_does_not_serve_files_named_only_by_wikilink_style_prose() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::create_dir(dir.path().join(".hidden")).unwrap();
+    let prose = "[[x.txt]] ![[y.png]] [[.hidden/secret.txt]]";
+    std::fs::write(
+        dir.path().join("README.md"),
+        format!("# Doc\n\n{prose}\n\n| Text |\n| --- |\n| {prose} |\n\n- {prose}\n\n> {prose}\n"),
+    )
+    .unwrap();
+    for asset in ["x.txt", "y.png", ".hidden/secret.txt"] {
+        std::fs::write(dir.path().join(asset), "private").unwrap();
+    }
+    let mut server = ServeProcess::start_dir(dir.path());
+    for asset in ["x.txt", "y.png", ".hidden/secret.txt"] {
+        assert!(
+            http_get(server.port, &format!("/{asset}")).contains("HTTP/1.1 404 Not Found"),
+            "{asset}"
+        );
+    }
+    server.stop();
+}
+
+#[test]
 fn serve_mode_discovers_assets_added_after_startup() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("README.md"), "# Doc\n").expect("write readme");

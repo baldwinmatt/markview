@@ -1619,6 +1619,25 @@ fn empty_state_html() -> String {
         .to_owned()
 }
 
+/// Parser options used by serve scanning and the GUI spelling mask.
+/// Serve scanning must agree with what the renderer turns into links; this
+/// explicit pre-0.13 option set preserves historical scanner behaviour while
+/// intentionally declining superscript, subscript, and wikilinks.
+pub fn scanner_options() -> Options {
+    Options::ENABLE_TABLES
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_SMART_PUNCTUATION
+        | Options::ENABLE_HEADING_ATTRIBUTES
+        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+        | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS
+        | Options::ENABLE_OLD_FOOTNOTES
+        | Options::ENABLE_MATH
+        | Options::ENABLE_GFM
+        | Options::ENABLE_DEFINITION_LIST
+}
+
 fn markdown_options() -> Options {
     Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH

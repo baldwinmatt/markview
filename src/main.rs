@@ -16,7 +16,7 @@ use markview::{
     OutputFormat,
 };
 use notify::{event::ModifyKind, Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use pulldown_cmark::{Event, Options, Parser, Tag};
+use pulldown_cmark::{Event, Parser, Tag};
 
 fn main() -> ExitCode {
     match run() {
@@ -947,7 +947,7 @@ fn markdown_references(source: &str) -> Vec<String> {
 fn first_heading_title(source: &str) -> Option<String> {
     let mut active = false;
     let mut title = String::new();
-    for event in Parser::new_ext(source, Options::all()) {
+    for event in Parser::new_ext(source, markview::scanner_options()) {
         match event {
             Event::Start(Tag::Heading { .. }) => active = true,
             Event::End(pulldown_cmark::TagEnd::Heading(_)) if active => {
@@ -2259,6 +2259,26 @@ mod reference_scan_tests {
             "reference scan took {elapsed:?}"
         );
         assert!(references.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod title_scan_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn title_scan_is_fast_for_nested_wikilink_style_prose() {
+        let source = format!("{}{}", "![[".repeat(40_000), "]]".repeat(40_000));
+        let start = Instant::now();
+        let title = first_heading_title(&source);
+        let elapsed = start.elapsed();
+        eprintln!("title scan: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "title scan took {elapsed:?}"
+        );
+        assert_eq!(title, None);
     }
 }
 

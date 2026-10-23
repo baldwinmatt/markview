@@ -1260,6 +1260,44 @@ fn serve_mode_does_not_serve_files_named_only_by_wikilink_style_prose() {
 }
 
 #[test]
+fn serve_mode_preserves_legacy_heading_titles_and_navigation_labels() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("README.md"), "# Home").unwrap();
+    let cases = [
+        ("Title ^sup^ and E=mc^2^", "Title ^sup^ and E=mc^2^"),
+        ("Bitwise XOR (^) operator", "Bitwise XOR (^) operator"),
+        ("Scaling 10^-3", "Scaling 10^-3"),
+        ("Press Ctrl+^", "Press Ctrl+^"),
+        // Keep the pre-existing space-joining quirk between parser text events.
+        ("See [[Other Page]] now", "See [ [ Other Page ] ] now"),
+    ];
+    for (index, (heading, _)) in cases.iter().enumerate() {
+        std::fs::write(
+            dir.path().join(format!("doc{index}.md")),
+            format!("# {heading}\n"),
+        )
+        .unwrap();
+    }
+    let mut server = ServeProcess::start_dir(dir.path());
+    let home = http_get(server.port, "/");
+    for (index, (_, title)) in cases.iter().enumerate() {
+        let route = format!("/doc{index}.md");
+        let page = http_get(server.port, &route);
+        assert!(
+            page.contains(&format!("<title>{title}</title>")),
+            "{title}: {page}"
+        );
+        assert!(
+            home.contains(&format!(
+                "<a href=\"{route}\" title=\"{route}\">{title}</a>"
+            )),
+            "{title}: {home}"
+        );
+    }
+    server.stop();
+}
+
+#[test]
 fn serve_mode_discovers_assets_added_after_startup() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("README.md"), "# Doc\n").expect("write readme");

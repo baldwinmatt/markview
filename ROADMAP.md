@@ -144,6 +144,7 @@ Review files are local artifacts and should not be committed. Minor findings may
 - [ ] Run `cargo build --features gui --bin markview-gui` before handing off GUI work.
 - [ ] Add unit tests near the model or renderer code for pure behavior.
 - [ ] Add integration or feature-gated GUI tests for persistence, command parsing, file restore, and watcher-adjacent logic.
+- [ ] For a parser dependency bump, search for `Options::all()` (the scoped tripwire is the only allowed call), run `cargo test --locked --lib parser_option_sets_require_explicit_extension_decisions`, and compare before/after `--html` and `--no-color` output over a corpus including `[[`, `^x^`, `~x~`, task lists, and footnotes. Decide explicitly on new flags in `markdown_options()` and `scanner_options()`.
 
 ## Assumptions
 

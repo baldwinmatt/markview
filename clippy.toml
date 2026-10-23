@@ -1,0 +1,1 @@
+disallowed-methods = [{ path = "pulldown_cmark::Options::all", reason = "scanner options must be explicit; use markdown_options() for rendering or scanner_options() for scanning" }]

@@ -2352,6 +2352,17 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn parser_option_sets_require_explicit_extension_decisions() {
+        let declined =
+            Options::ENABLE_SUPERSCRIPT | Options::ENABLE_SUBSCRIPT | Options::ENABLE_WIKILINKS;
+        assert_eq!(
+            Options::all() - markdown_options() - scanner_options(),
+            declined
+        );
+    }
+
+    #[test]
     fn code_free_events_pass_through_without_html_scanning() {
         let markup = "<pre><code class=\"language-diff\">+literal\n</code></pre>";
         assert_eq!(render_html_body(&[Event::Html(markup.into())], &[]), markup);

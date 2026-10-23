@@ -1150,9 +1150,60 @@ fn render_html_body(events: &[Event<'_>], headings: &[HeadingView]) -> String {
         .iter()
         .cloned()
         .map(|event| add_heading_id(event, &mut heading_ids));
-    html::push_html(&mut body, events);
-    body = highlight_code_blocks(&body);
+    html::push_html(&mut body, highlight_fenced_events(events));
     escape_non_ascii_html(&body)
+}
+
+fn highlight_fenced_events<'a>(
+    events: impl Iterator<Item = Event<'a>>,
+) -> impl Iterator<Item = Event<'a>> {
+    let mut events = events;
+    let mut after_item_start = false;
+    std::iter::from_fn(move || {
+        let event = events.next()?;
+        let prefix = if after_item_start { "\n" } else { "" };
+        after_item_start = matches!(event, Event::Start(Tag::Item));
+        if let Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) = &event {
+            let language = info.split(' ').next().unwrap_or("");
+            let is_diff = matches!(language, "diff" | "patch" | "dff");
+            #[cfg(feature = "highlight")]
+            let highlighted = is_diff || matches!(language, "rust" | "rs");
+            #[cfg(not(feature = "highlight"))]
+            let highlighted = is_diff;
+            if highlighted {
+                let mut code = String::new();
+                for event in events.by_ref() {
+                    match event {
+                        Event::Text(text) => code.push_str(&text),
+                        Event::End(TagEnd::CodeBlock) => break,
+                        _ => {}
+                    }
+                }
+                let escaped = escape_html(&code);
+                let rows = if is_diff {
+                    highlight_diff_code(&escaped)
+                } else {
+                    #[cfg(feature = "highlight")]
+                    {
+                        highlight_rust_code(&escaped)
+                    }
+                    #[cfg(not(feature = "highlight"))]
+                    {
+                        escaped
+                    }
+                };
+                let class = if is_diff { " class=\"diff\"" } else { "" };
+                return Some(Event::Html(
+                    format!(
+                        "{prefix}<pre{class}><code class=\"language-{}\">{rows}</code></pre>\n",
+                        escape_html(language)
+                    )
+                    .into(),
+                ));
+            }
+        }
+        Some(event)
+    })
 }
 
 fn add_heading_id<'a>(
@@ -1264,50 +1315,7 @@ fn slugify(title: &str) -> String {
     }
 }
 
-fn highlight_code_blocks(markup: &str) -> String {
-    let mut highlighted = String::with_capacity(markup.len());
-    let mut rest = markup;
-
-    while let Some(start) = rest.find(r#"<pre><code class="language-"#) {
-        highlighted.push_str(&rest[..start]);
-        let block = &rest[start..];
-        let Some(language_end) = block.find(r#"">"#) else {
-            highlighted.push_str(block);
-            return highlighted;
-        };
-        let language = &block[r#"<pre><code class="language-"#.len()..language_end];
-        let content_start = language_end + 2;
-        let Some(content_end) = block[content_start..].find("</code></pre>") else {
-            highlighted.push_str(block);
-            return highlighted;
-        };
-        let content_end = content_start + content_end;
-        let code = &block[content_start..content_end];
-        if matches!(language, "diff" | "patch" | "dff") {
-            highlighted.push_str(r#"<pre class="diff"><code class="language-"#);
-            highlighted.push_str(language);
-            highlighted.push_str(r#"">"#);
-            highlighted.push_str(&highlight_diff_code(code));
-        } else {
-            highlighted.push_str(&block[..content_start]);
-            #[cfg(feature = "highlight")]
-            if matches!(language, "rust" | "rs") {
-                highlighted.push_str(&highlight_rust_code(code));
-            } else {
-                highlighted.push_str(code);
-            }
-            #[cfg(not(feature = "highlight"))]
-            highlighted.push_str(code);
-        }
-        highlighted.push_str("</code></pre>");
-        rest = &block[content_end + "</code></pre>".len()..];
-    }
-
-    highlighted.push_str(rest);
-    highlighted
-}
-
-// The input is already HTML-escaped by pulldown-cmark. Preserve its text and newlines.
+// Preserve escaped text and newlines within highlighted rows.
 fn highlight_diff_code(code: &str) -> String {
     let mut highlighted = String::with_capacity(code.len());
     for line in code.split_inclusive('\n') {
@@ -2274,6 +2282,41 @@ mod tests {
 
         assert!(html.contains("Footnote text"));
         assert!(html.contains("footnote"));
+    }
+
+    #[test]
+    fn code_free_events_pass_through_without_html_scanning() {
+        let markup = "<pre><code class=\"language-diff\">+literal\n</code></pre>";
+        assert_eq!(render_html_body(&[Event::Html(markup.into())], &[]), markup);
+    }
+
+    #[test]
+    fn fenced_blocks_preserve_parser_output_and_containers() {
+        for language in ["text", "", "rust"] {
+            if cfg!(feature = "highlight") && language == "rust" {
+                continue;
+            }
+            let markdown = format!("```{language} extra\n<&\"'\n\nlast\n```\n");
+            let mut expected = String::new();
+            html::push_html(
+                &mut expected,
+                Parser::new_ext(&markdown, markdown_options()),
+            );
+            assert_eq!(
+                RenderedDocument::from_markdown(&MarkdownDocument::new(&markdown)).html(),
+                expected,
+                "{language}"
+            );
+        }
+        for (markdown, prefix, suffix) in [
+            ("~~~diff\n+x\n~~~", "", ""),
+            ("```patch\n+x\n", "", ""),
+            ("> ```dff\n> +x\n> ```", "<blockquote>\n", "</blockquote>\n"),
+            ("- ```diff\n  +x\n  ```", "<ul>\n<li>\n", "</li>\n</ul>\n"),
+        ] {
+            assert_eq!(RenderedDocument::from_markdown(&MarkdownDocument::new(markdown)).html(), format!("{prefix}<pre class=\"diff\"><code class=\"language-{}\"><span class=\"diff-line diff-addition\">+x</span>\n</code></pre>\n{suffix}", if markdown.contains("patch") { "patch" } else if markdown.contains("dff") { "dff" } else { "diff" }));
+        }
+        assert!(render_html("```diff\n+café\n```").contains("+caf&#233;"));
     }
 
     #[test]

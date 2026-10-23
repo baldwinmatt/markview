@@ -21,8 +21,9 @@ pub const DIFF_DARK_VARIABLES: &str = r#"  --diff-add-bg: #033a16;
   --diff-hunk-fg: #a5d6ff;"#;
 
 /// Shared diff layout and colours. Headers inherit the surrounding code colour.
-pub const DIFF_RULES: &str = r#"pre.diff code { display: block; width: max-content; min-width: 100%; line-height: calc(1.65em / 0.92); }
-.diff-line { display: block; min-width: 100%; }
+pub const DIFF_RULES: &str = r#"pre.diff { padding: 1rem 0; }
+pre.diff code { display: block; width: max-content; min-width: 100%; line-height: calc(1.65em / 0.92); }
+.diff-line { display: block; min-width: 100%; padding: 0 1rem; }
 .diff-addition { background: var(--diff-add-bg); color: var(--diff-add-fg); }
 .diff-deletion { background: var(--diff-del-bg); color: var(--diff-del-fg); }
 .diff-hunk { background: var(--diff-hunk-bg); color: var(--diff-hunk-fg); }

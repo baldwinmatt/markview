@@ -1775,6 +1775,7 @@ impl Renderer {
             Tag::Emphasis => self.push_style(TerminalStyle::Italic),
             Tag::Strong => self.push_style(TerminalStyle::Bold),
             Tag::Strikethrough => self.push_text("~"),
+            Tag::Superscript | Tag::Subscript => {}
             Tag::Link { dest_url, .. } => self.pending_link = Some(dest_url.to_string()),
             Tag::Image {
                 title, dest_url, ..
@@ -1828,6 +1829,7 @@ impl Renderer {
             TagEnd::Item => self.flush_line(),
             TagEnd::Emphasis | TagEnd::Strong => self.push_reset(),
             TagEnd::Strikethrough => self.push_text("~"),
+            TagEnd::Superscript | TagEnd::Subscript => {}
             TagEnd::Link => {
                 if let Some(dest) = self.pending_link.take() {
                     self.push_styled(&format!(" ({dest})"), &[TerminalStyle::Dim]);

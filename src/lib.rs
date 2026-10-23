@@ -29,6 +29,10 @@ pre.diff code { display: block; width: max-content; min-width: 100%; line-height
 .diff-hunk { background: var(--diff-hunk-bg); color: var(--diff-hunk-fg); }
 .diff-header { color: inherit; font-weight: 700; }"#;
 
+/// Neutral diff colours for printing, independent of the selected screen theme.
+pub const DIFF_PRINT_RULES: &str =
+    ".diff-addition, .diff-deletion, .diff-hunk, .diff-header { background: none; color: #000; }";
+
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";

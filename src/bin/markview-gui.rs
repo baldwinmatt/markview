@@ -14,7 +14,7 @@ use std::os::fd::{AsRawFd, RawFd};
 
 use markview::{
     app_view_with_preferences, AppModel, AppView, FrontendRenderer, GuiPreferences, HtmlRenderer,
-    DIFF_DARK_VARIABLES, DIFF_LIGHT_VARIABLES, DIFF_RULES,
+    DIFF_DARK_VARIABLES, DIFF_LIGHT_VARIABLES, DIFF_PRINT_RULES, DIFF_RULES,
 };
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tao::event::{Event, WindowEvent};
@@ -1997,6 +1997,7 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
     background: #f5f5f5;
     color: #000;
   }}
+  {DIFF_PRINT_RULES}
   .syntax-keyword, .syntax-comment {{
     color: #000;
     font-weight: 700;
@@ -2931,6 +2932,14 @@ mod tests {
             GuiPreferences::default(),
         ));
 
+        let print_css = html
+            .split("@media print {")
+            .nth(1)
+            .unwrap()
+            .split("</style>")
+            .next()
+            .unwrap();
+        assert!(print_css.contains(".diff-addition, .diff-deletion, .diff-hunk, .diff-header { background: none; color: #000; }"));
         assert!(html.contains("@page"));
         assert!(html.contains("a[href^=\"http\"]::after"));
         assert!(html.contains("break-after: avoid"));

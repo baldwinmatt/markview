@@ -1165,42 +1165,29 @@ fn highlight_fenced_events<'a>(
         after_item_start = matches!(event, Event::Start(Tag::Item));
         if let Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) = &event {
             let language = info.split(' ').next().unwrap_or("");
-            let is_diff = matches!(language, "diff" | "patch" | "dff");
-            #[cfg(feature = "highlight")]
-            let highlighted = is_diff || matches!(language, "rust" | "rs");
-            #[cfg(not(feature = "highlight"))]
-            let highlighted = is_diff;
-            if highlighted {
-                let mut code = String::new();
-                for event in events.by_ref() {
-                    match event {
-                        Event::Text(text) => code.push_str(&text),
-                        Event::End(TagEnd::CodeBlock) => break,
-                        _ => {}
-                    }
+            let (class, highlight): (&str, fn(&str) -> String) = match language {
+                "diff" | "patch" | "dff" => (" class=\"diff\"", highlight_diff_code),
+                #[cfg(feature = "highlight")]
+                "rust" | "rs" => ("", highlight_rust_code),
+                _ => return Some(event),
+            };
+            let mut code = String::new();
+            for event in events.by_ref() {
+                match event {
+                    Event::Text(text) => code.push_str(&text),
+                    Event::End(TagEnd::CodeBlock) => break,
+                    _ => {}
                 }
-                let escaped = escape_html(&code);
-                let rows = if is_diff {
-                    highlight_diff_code(&escaped)
-                } else {
-                    #[cfg(feature = "highlight")]
-                    {
-                        highlight_rust_code(&escaped)
-                    }
-                    #[cfg(not(feature = "highlight"))]
-                    {
-                        escaped
-                    }
-                };
-                let class = if is_diff { " class=\"diff\"" } else { "" };
-                return Some(Event::Html(
-                    format!(
-                        "{prefix}<pre{class}><code class=\"language-{}\">{rows}</code></pre>\n",
-                        escape_html(language)
-                    )
-                    .into(),
-                ));
             }
+            let escaped = escape_html(&code);
+            let rows = highlight(&escaped);
+            return Some(Event::Html(
+                format!(
+                    "{prefix}<pre{class}><code class=\"language-{}\">{rows}</code></pre>\n",
+                    escape_html(language)
+                )
+                .into(),
+            ));
         }
         Some(event)
     })
@@ -2367,6 +2354,14 @@ mod tests {
         let html = render_html(&format!("```text\n{code}\n```\n\n```\n+plain\n```"));
         assert!(!html.contains("<span class=\"diff-line"));
         assert!(html.contains("<pre><code>+plain\n</code></pre>"));
+    }
+
+    #[cfg(not(feature = "highlight"))]
+    #[test]
+    fn rust_fences_are_plain_without_highlight() {
+        let html = render_html("```rust\nfn main() {}\n```");
+        assert!(html.contains("<pre><code class=\"language-rust\">fn main() {}\n</code></pre>"));
+        assert!(!html.contains("<span class=\"syntax-"));
     }
 
     #[cfg(feature = "highlight")]

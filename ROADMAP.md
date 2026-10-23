@@ -24,7 +24,7 @@ Markview is a small, fast, local-first Markdown viewer written in Rust. The proj
 ## v0.3: Reading Quality
 
 - [x] Add Markdown extensions that fit the lightweight goal: tables, task lists, strikethrough, footnotes, and heading anchors.
-- [x] Add code block syntax highlighting behind an optional feature or a small dependency.
+- [x] Add always-on diff colouring and Rust keyword highlighting behind the `highlight` feature.
 - [x] Add built-in light, dark, and system themes.
 - [x] Tune print-specific theme behavior.
 - [x] Add export-to-HTML through the shared renderer layer.

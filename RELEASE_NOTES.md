@@ -13,7 +13,7 @@ Highlights:
 - External browser handling for `http` and `https` links.
 - Drag-and-drop opening for Markdown files.
 - Local preferences for theme, sidebar visibility, auto-refresh, window size, recent files, and restored open files.
-- Markdown tables, task lists, strikethrough, footnotes, heading anchors, and optional Rust code highlighting.
+- Markdown tables, task lists, strikethrough, footnotes, heading anchors, always-on diff colouring, and Rust keyword highlighting behind the `highlight` feature.
 - Local macOS `.app` bundle and repeatable zip packaging command.
 
 Known limitations:

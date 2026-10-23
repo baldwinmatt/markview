@@ -2336,6 +2336,51 @@ mod tests {
     }
 
     #[test]
+    fn task_markers_follow_gfm_position_and_literal_block_rules() {
+        let options = RenderOptions {
+            color: false,
+            width: 80,
+        };
+        for (markdown, checkbox, terminal) in [
+            (
+                "- [ ]\n",
+                "<input disabled=\"\" type=\"checkbox\"/>",
+                "- []\n",
+            ),
+            (
+                "- [x]\n",
+                "<input disabled=\"\" type=\"checkbox\" checked=\"\"/>",
+                "- [x]\n",
+            ),
+        ] {
+            assert!(render_html(markdown).contains(checkbox), "{markdown:?}");
+            assert_eq!(render(markdown, options), terminal);
+        }
+        // A task marker at EOF without a final newline stays literal.
+        let eof = render_html("- [ ]");
+        assert!(eof.contains("<li>[ ]</li>"));
+        assert!(!eof.contains("<input"));
+        assert_eq!(render("- [ ]", options), "- []\n");
+
+        for (source, escaped, terminal) in [
+            ("# h", "# h", "- [] # h\n"),
+            ("> q", "&gt; q", "- [] > q\n"),
+            ("1. a", "1. a", "- [] 1. a\n"),
+            ("---", "---", "- [] ---\n"),
+            ("```diff", "```diff", "- [] ``` diff\n"),
+        ] {
+            let markdown = format!("- [ ] {source}\n");
+            assert!(
+                render_html(&markdown).contains(&format!(
+                    "<ul>\n<li><input disabled=\"\" type=\"checkbox\"/>\n{escaped}</li>\n</ul>"
+                )),
+                "{markdown}"
+            );
+            assert_eq!(render(&markdown, options), terminal);
+        }
+    }
+
+    #[test]
     fn html_renderer_supports_task_lists() {
         let html = render_html("- [x] Done\n- [ ] Later");
 

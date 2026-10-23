@@ -41,6 +41,8 @@ preamble/body classifier without relying on hunk line counts. Rendering no longe
 scans the generated HTML for code blocks. The library owns the shared diff palette,
 layout rules, and print colour override used by the GUI shell.
 
+Task-marker parsing follows GFM since pulldown-cmark 0.13: empty markers depend on a final newline, and text after a marker stays inline.
+
 ## GUI Event Flow
 
 The macOS GUI binary is behind the `gui` Cargo feature. It uses `tao` for the window/event loop and `wry` for the system WebKit view.

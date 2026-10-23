@@ -1445,6 +1445,12 @@ fn app_shell_html(view: &AppView) -> String {
   --accent: #0f766e;
   --code-bg: #ebe6de;
   --quote-bg: #f1ede7;
+  --diff-add-bg: #dafbe1;
+  --diff-add-fg: #116329;
+  --diff-del-bg: #ffebe9;
+  --diff-del-fg: #82071e;
+  --diff-hunk-bg: #ddf4ff;
+  --diff-hunk-fg: #0550ae;
 }}
 @media (prefers-color-scheme: dark) {{
   :root {{
@@ -1457,6 +1463,12 @@ fn app_shell_html(view: &AppView) -> String {
     --accent: #5eead4;
     --code-bg: #25221f;
     --quote-bg: #211f1c;
+    --diff-add-bg: #033a16;
+    --diff-add-fg: #aff5b4;
+    --diff-del-bg: #67060c;
+    --diff-del-fg: #ffdcd7;
+    --diff-hunk-bg: #0c2d6b;
+    --diff-hunk-fg: #a5d6ff;
   }}
 }}
 :root[data-theme="light"] {{
@@ -1470,6 +1482,12 @@ fn app_shell_html(view: &AppView) -> String {
   --accent: #0f766e;
   --code-bg: #ebe6de;
   --quote-bg: #f1ede7;
+  --diff-add-bg: #dafbe1;
+  --diff-add-fg: #116329;
+  --diff-del-bg: #ffebe9;
+  --diff-del-fg: #82071e;
+  --diff-hunk-bg: #ddf4ff;
+  --diff-hunk-fg: #0550ae;
 }}
 :root[data-theme="dark"] {{
   color-scheme: dark;
@@ -1482,6 +1500,12 @@ fn app_shell_html(view: &AppView) -> String {
   --accent: #5eead4;
   --code-bg: #25221f;
   --quote-bg: #211f1c;
+  --diff-add-bg: #033a16;
+  --diff-add-fg: #aff5b4;
+  --diff-del-bg: #67060c;
+  --diff-del-fg: #ffdcd7;
+  --diff-hunk-bg: #0c2d6b;
+  --diff-hunk-fg: #a5d6ff;
 }}
 * {{ box-sizing: border-box; }}
 html {{
@@ -1863,6 +1887,12 @@ pre {{
   padding: 1rem;
 }}
 pre code {{ background: transparent; padding: 0; }}
+pre.diff code {{ display: block; width: max-content; min-width: 100%; }}
+.diff-line {{ display: inline-block; min-width: 100%; }}
+.diff-addition {{ background: var(--diff-add-bg); color: var(--diff-add-fg); }}
+.diff-deletion {{ background: var(--diff-del-bg); color: var(--diff-del-fg); }}
+.diff-hunk {{ background: var(--diff-hunk-bg); color: var(--diff-hunk-fg); }}
+.diff-header {{ color: var(--muted); font-weight: 700; }}
 .syntax-keyword {{ color: var(--accent); font-weight: 700; }}
 .syntax-comment {{ color: var(--muted); font-style: italic; }}
 table {{

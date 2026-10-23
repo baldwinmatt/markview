@@ -147,3 +147,20 @@ Every commit should be reviewed before starting the next task:
 5. Amend the original commit with the fixes before proceeding.
 
 Minor findings may be fixed immediately, explicitly deferred in the review file, or turned into follow-up work.
+
+### Diff blocks
+
+Use a fenced code block labeled `diff` (or `patch` / `dff`) to show changes
+with GitHub-style row colors in the GUI and exported HTML. Added lines (`+`)
+are green, removed lines (`-`) are red, and hunk headers (`@@`) are blue.
+File headers stay neutral. Colors follow the light or dark theme.
+
+````markdown
+```diff
+--- a/example.txt
++++ b/example.txt
+@@ -1 +1 @@
+-old text
++new text
+```
+````

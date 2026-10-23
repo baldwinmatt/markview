@@ -1151,10 +1151,7 @@ fn render_html_body(events: &[Event<'_>], headings: &[HeadingView]) -> String {
         .cloned()
         .map(|event| add_heading_id(event, &mut heading_ids));
     html::push_html(&mut body, events);
-    #[cfg(feature = "highlight")]
-    {
-        body = highlight_code_blocks(&body);
-    }
+    body = highlight_code_blocks(&body);
     escape_non_ascii_html(&body)
 }
 
@@ -1267,7 +1264,6 @@ fn slugify(title: &str) -> String {
     }
 }
 
-#[cfg(feature = "highlight")]
 fn highlight_code_blocks(markup: &str) -> String {
     let mut highlighted = String::with_capacity(markup.len());
     let mut rest = markup;
@@ -1287,10 +1283,20 @@ fn highlight_code_blocks(markup: &str) -> String {
         };
         let content_end = content_start + content_end;
         let code = &block[content_start..content_end];
-        highlighted.push_str(&block[..content_start]);
-        if matches!(language, "rust" | "rs") {
-            highlighted.push_str(&highlight_rust_code(code));
+        if matches!(language, "diff" | "patch" | "dff") {
+            highlighted.push_str(r#"<pre class="diff"><code class="language-"#);
+            highlighted.push_str(language);
+            highlighted.push_str(r#"">"#);
+            highlighted.push_str(&highlight_diff_code(code));
         } else {
+            highlighted.push_str(&block[..content_start]);
+            #[cfg(feature = "highlight")]
+            if matches!(language, "rust" | "rs") {
+                highlighted.push_str(&highlight_rust_code(code));
+            } else {
+                highlighted.push_str(code);
+            }
+            #[cfg(not(feature = "highlight"))]
             highlighted.push_str(code);
         }
         highlighted.push_str("</code></pre>");
@@ -1298,6 +1304,38 @@ fn highlight_code_blocks(markup: &str) -> String {
     }
 
     highlighted.push_str(rest);
+    highlighted
+}
+
+// The input is already HTML-escaped by pulldown-cmark. Preserve its text and newlines.
+fn highlight_diff_code(code: &str) -> String {
+    let mut highlighted = String::with_capacity(code.len());
+    for line in code.split_inclusive('\n') {
+        let (source, newline) = line
+            .strip_suffix('\n')
+            .map_or((line, ""), |source| (source, "\n"));
+        let class = if source.starts_with("diff ")
+            || source.starts_with("index ")
+            || source.starts_with("--- ")
+            || source.starts_with("+++ ")
+        {
+            "diff-header"
+        } else if source.starts_with("@@") {
+            "diff-hunk"
+        } else if source.starts_with('+') {
+            "diff-addition"
+        } else if source.starts_with('-') {
+            "diff-deletion"
+        } else {
+            "diff-context"
+        };
+        highlighted.push_str(r#"<span class="diff-line "#);
+        highlighted.push_str(class);
+        highlighted.push_str(r#"">"#);
+        highlighted.push_str(source);
+        highlighted.push_str("</span>");
+        highlighted.push_str(newline);
+    }
     highlighted
 }
 
@@ -1410,6 +1448,12 @@ fn render_html_document(document: &RenderedDocument) -> String {
   --accent: #0f766e;
   --code-bg: #ebe6de;
   --quote-bg: #f1ede7;
+  --diff-add-bg: #dafbe1;
+  --diff-add-fg: #116329;
+  --diff-del-bg: #ffebe9;
+  --diff-del-fg: #82071e;
+  --diff-hunk-bg: #ddf4ff;
+  --diff-hunk-fg: #0550ae;
 }}
 @media (prefers-color-scheme: dark) {{
   :root {{
@@ -1420,6 +1464,12 @@ fn render_html_document(document: &RenderedDocument) -> String {
     --accent: #5eead4;
     --code-bg: #25221f;
     --quote-bg: #211f1c;
+    --diff-add-bg: #033a16;
+    --diff-add-fg: #aff5b4;
+    --diff-del-bg: #67060c;
+    --diff-del-fg: #ffdcd7;
+    --diff-hunk-bg: #0c2d6b;
+    --diff-hunk-fg: #a5d6ff;
   }}
 }}
 * {{ box-sizing: border-box; }}
@@ -1466,6 +1516,12 @@ pre {{
   padding: 1rem;
 }}
 pre code {{ background: transparent; padding: 0; }}
+pre.diff code {{ display: block; width: max-content; min-width: 100%; }}
+.diff-line {{ display: inline-block; min-width: 100%; }}
+.diff-addition {{ background: var(--diff-add-bg); color: var(--diff-add-fg); }}
+.diff-deletion {{ background: var(--diff-del-bg); color: var(--diff-del-fg); }}
+.diff-hunk {{ background: var(--diff-hunk-bg); color: var(--diff-hunk-fg); }}
+.diff-header {{ color: var(--muted); font-weight: 700; }}
 .syntax-keyword {{ color: var(--accent); font-weight: 700; }}
 .syntax-comment {{ color: var(--muted); font-style: italic; }}
 table {{
@@ -2218,6 +2274,56 @@ mod tests {
 
         assert!(html.contains("Footnote text"));
         assert!(html.contains("footnote"));
+    }
+
+    #[test]
+    fn html_renderer_highlights_diff_rows_by_default() {
+        for language in ["diff", "patch", "dff"] {
+            let markdown = format!(
+                "```{language}\ndiff --git a/test.c b/test.c\nindex abc..def 100644\n--- a/test.c\n+++ b/test.c\n@@ -1,2 +1,2 @@\n context\n-old();\n+new(<value>);\n\n```"
+            );
+            let html = render_html(&markdown);
+            assert!(html.contains(&format!(
+                r#"<pre class="diff"><code class="language-{language}">"#
+            )));
+            for header in [
+                "diff --git a/test.c b/test.c",
+                "index abc..def 100644",
+                "--- a/test.c",
+                "+++ b/test.c",
+            ] {
+                assert!(html.contains(&format!(
+                    r#"<span class="diff-line diff-header">{header}</span>"#
+                )));
+            }
+            assert!(html.contains(r#"<span class="diff-line diff-hunk">@@ -1,2 +1,2 @@</span>"#));
+            assert!(html.contains(r#"<span class="diff-line diff-context"> context</span>"#));
+            assert!(html.contains(r#"<span class="diff-line diff-deletion">-old();</span>"#));
+            assert!(html
+                .contains(r#"<span class="diff-line diff-addition">+new(&lt;value&gt;);</span>"#));
+            assert!(html.contains("<span class=\"diff-line diff-context\"></span>\n</code>"));
+        }
+    }
+
+    #[test]
+    fn diff_highlighting_preserves_text_and_unrelated_blocks() {
+        let code = " context\n-removed\n+<script>&\n\n+last";
+        let escaped = " context\n-removed\n+&lt;script&gt;&amp;\n\n+last";
+        let highlighted = highlight_diff_code(escaped);
+        let mut plain = String::new();
+        let mut in_tag = false;
+        for ch in highlighted.chars() {
+            match ch {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                _ if !in_tag => plain.push(ch),
+                _ => {}
+            }
+        }
+        assert_eq!(plain, escaped);
+        let html = render_html(&format!("```text\n{code}\n```\n\n```\n+plain\n```"));
+        assert!(!html.contains("<span class=\"diff-line"));
+        assert!(html.contains("<pre><code>+plain\n</code></pre>"));
     }
 
     #[cfg(feature = "highlight")]

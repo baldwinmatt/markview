@@ -17,7 +17,6 @@ pub use watch::StoreWatcher;
 use std::collections::HashMap;
 use std::fmt::{self, Write as _};
 use std::fs;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read};
 use std::ops::Range;
 use std::path::Path;
@@ -62,18 +61,35 @@ pub fn random_hex() -> io::Result<String> {
         }))
 }
 
-fn revision(value: impl Hash) -> String {
-    let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+/// Revisions are FNV-1a/64 digests, printed as 16 lowercase hex digits.
+///
+/// `source_revision` and `start` are persisted in git-tracked store files and
+/// trusted by `locate`, so the algorithm is fixed here instead of borrowing
+/// `std::hash::DefaultHasher`, which may change between Rust releases.
+fn revision(parts: &[&[u8]]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in parts.iter().flat_map(|part| part.iter()) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
+/// Hashes the exact source bytes, before mojibake repair or link rewriting.
 pub fn source_revision(source: &str) -> String {
-    revision(source.as_bytes())
+    revision(&[source.as_bytes()])
 }
 
+/// Hashes, in order: the store path's bytes (the raw `OsStr` bytes on Unix),
+/// a `0x00` separator (a path cannot contain NUL), a presence byte (`0x00`
+/// for a missing file, `0x01` for an existing one), then the exact file bytes.
+/// A missing file and an empty file therefore have different revisions.
 fn store_revision(path: &Path, bytes: Option<&[u8]>) -> String {
-    revision((path, bytes))
+    revision(&[
+        path.as_os_str().as_encoded_bytes(),
+        &[0, u8::from(bytes.is_some())],
+        bytes.unwrap_or_default(),
+    ])
 }
 
 pub fn annotation_store_root(document: &Path) -> io::Result<std::path::PathBuf> {

@@ -34,7 +34,7 @@ impl TextProjection {
 
     fn from_prepared(source: &str, prepared: &str) -> Self {
         let mut projection = Self {
-            revision: super::revision(source.as_bytes()),
+            revision: super::source_revision(source),
             scalars: Vec::new(),
             display: Vec::new(),
             points: Vec::new(),

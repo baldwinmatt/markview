@@ -463,3 +463,53 @@ fn unsupported_platform_store_operations_report_a_clear_error() {
         message
     );
 }
+
+#[test]
+fn revisions_use_a_fixed_hash_with_known_answers() {
+    // Revisions are written into git-tracked store files, so the algorithm
+    // must not change between Rust releases. These are FNV-1a/64 vectors; the
+    // first four are the published ones.
+    for (source, expected) in [
+        ("", "cbf29ce484222325"),
+        ("a", "af63dc4c8601ec8c"),
+        ("foobar", "85944171f73967e8"),
+        ("hello", "a430d84680aabd0b"),
+        ("naïve 😀 – ok\r\n", "5ca6e7db9489a75c"),
+    ] {
+        assert_eq!(source_revision(source), expected, "{source:?}");
+        assert_eq!(TextProjection::new(source).revision, expected);
+    }
+    let path = Path::new("/docs/.markview/annotations/a.md");
+    let bytes = b"## a1 [open] document\n\nHi\n";
+    assert_eq!(store_revision(path, None), "54debf3b3bde8c14");
+    assert_eq!(store_revision(path, Some(b"")), "54dec03b3bde8dc7");
+    assert_eq!(store_revision(path, Some(bytes)), "0157a2338906b383");
+    assert_eq!(
+        store_revision(Path::new("/docs/.markview/annotations/b.md"), Some(bytes)),
+        "a9522d9f65517264"
+    );
+}
+
+#[test]
+fn stored_start_keeps_its_fast_path_after_reopening() {
+    // The quote is ambiguous, so only the persisted `source_revision` and
+    // `start` can place it. The revision literal is FNV-1a/64 of the source.
+    let dir = tempdir().unwrap();
+    let doc = dir.path().join("doc.md");
+    let source = "same same";
+    fs::write(&doc, source).unwrap();
+    let location = resolve(&doc).unwrap();
+    fs::create_dir_all(location.path.parent().unwrap()).unwrap();
+    fs::write(
+        &location.path,
+        concat!(
+            "## a1 [open] line 1\n",
+            "<!-- markview: source_revision=\"bf2fba57fca01dd7\" start=\"4\" -->\n\n",
+            "> same\n\nSecond one.\n"
+        ),
+    )
+    .unwrap();
+    let review = read(&location, &TextProjection::new(source)).unwrap();
+    assert_eq!(review.annotations[0].range, Some(4..8));
+    assert!(review.annotations[0].attached);
+}

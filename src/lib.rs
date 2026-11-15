@@ -1,3 +1,5 @@
+pub mod annotations;
+
 use std::path::{Path, PathBuf};
 
 use pulldown_cmark::{
@@ -405,11 +407,13 @@ pub enum CliError {
     TooManyInputs,
     MissingServeInput,
     LegacyServePortForm,
+    AnnotationUsage(&'static str),
 }
 
 impl std::fmt::Display for CliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::AnnotationUsage(message) => f.write_str(message),
             Self::MissingValue(flag) => write!(f, "missing value for {flag}"),
             Self::InvalidWidth(value) => write!(f, "invalid width: {value}"),
             Self::InvalidPort(value) => write!(f, "invalid port: {value}"),
@@ -433,6 +437,9 @@ pub struct Cli {
     pub options: RenderOptions,
     pub output: OutputFormat,
     pub serve: Option<u16>,
+    pub annotations: bool,
+    pub include_resolved: bool,
+    pub annotate: bool,
     pub recurse: bool,
     pub open: bool,
     pub daemon: bool,
@@ -457,6 +464,9 @@ impl Cli {
         let mut serve = None;
         let mut serve_port = None;
         let mut saw_serve = false;
+        let mut annotations = false;
+        let mut include_resolved = false;
+        let mut annotate = false;
         let mut recurse = false;
         let mut open = false;
         let mut daemon = false;
@@ -466,6 +476,9 @@ impl Cli {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "-h" | "--help" => help = true,
+                "--annotations" => annotations = true,
+                "--include-resolved" => include_resolved = true,
+                "--annotate" => annotate = true,
                 "--html" => output = OutputFormat::Html,
                 "--serve" => {
                     saw_serve = true;
@@ -523,7 +536,23 @@ impl Cli {
         if serve.is_some() && inputs.is_empty() && !help {
             return Err(CliError::MissingServeInput);
         }
-        if serve.is_none() && inputs.len() > 1 {
+        if annotate && !saw_serve {
+            return Err(CliError::AnnotationUsage("--annotate requires --serve"));
+        }
+        if include_resolved && !annotations {
+            return Err(CliError::AnnotationUsage(
+                "--include-resolved requires --annotations",
+            ));
+        }
+        if annotations && (saw_serve || output == OutputFormat::Html) {
+            return Err(CliError::AnnotationUsage(
+                "--annotations cannot be combined with --serve or --html",
+            ));
+        }
+        if annotations && inputs.is_empty() && !help {
+            return Err(CliError::MissingValue("--annotations"));
+        }
+        if serve.is_none() && !annotations && inputs.len() > 1 {
             return Err(CliError::TooManyInputs);
         }
 
@@ -535,6 +564,9 @@ impl Cli {
             options,
             output,
             serve,
+            annotations,
+            include_resolved,
+            annotate,
             recurse,
             open,
             daemon,
@@ -574,6 +606,7 @@ pub fn help() -> &'static str {
     "\
 Usage: markview [OPTIONS] [FILE]
        markview --serve [OPTIONS] <FILE>... | <DIR>
+       markview --annotations [--include-resolved] <FILE or DIR>...
 
 Renders FILE (or stdin) as Markdown in the terminal or as HTML, or serves
 Markdown over HTTP with live reload.
@@ -583,7 +616,12 @@ Render options:
   -w, --width <COLUMNS>  Wrap terminal text at COLUMNS (minimum 20, default 88)
       --no-color         Drop ANSI colors, keep bold text attributes
 
+Review options:
+      --annotations      List open comments for Markdown files or directories
+      --include-resolved Include resolved comments after open comments
+
 Serve options (all require --serve):
+      --annotate         Enable writing review comments from the browser
       --serve            Serve the given files, or the top-level Markdown files of a
                          directory, with navigation between documents
       --port <PORT>      Listen on PORT (default 7878); 0 picks any free port and prints it
@@ -1054,7 +1092,42 @@ pub struct AppView {
     pub active_html: String,
     pub active_source: String,
     pub headings: Vec<HeadingView>,
+    pub annotation: Option<AnnotationView>,
     pub preferences: GuiPreferences,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnnotationView {
+    pub key: String,
+    pub revision: String,
+    pub can_add: bool,
+    pub review: Result<annotations::Review, String>,
+}
+
+impl AnnotationView {
+    pub fn for_tab(tab: &DocumentTab) -> Option<Self> {
+        if tab.is_editing() {
+            return None;
+        }
+        let path = tab.path()?;
+        let projection = annotations::TextProjection::new(tab.document().source());
+        let location = annotations::resolve(path);
+        let key = location
+            .as_ref()
+            .map_or(path, |location| location.document.as_path())
+            .to_string_lossy()
+            .into_owned();
+        let review = location
+            .map_err(annotations::Error::from)
+            .and_then(|location| annotations::read(&location, &projection))
+            .map_err(|error| error.to_string());
+        Some(Self {
+            key,
+            revision: projection.revision,
+            can_add: !tab.is_dirty(),
+            review,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1110,15 +1183,43 @@ pub fn app_view_with_preferences(model: &AppModel, preferences: GuiPreferences) 
         headings: active_document
             .map(|document| document.headings().to_vec())
             .unwrap_or_default(),
+        annotation: active_tab.and_then(AnnotationView::for_tab),
         preferences,
     }
 }
 
+impl HtmlRenderer {
+    pub fn render_with_destinations(
+        &self,
+        document: &MarkdownDocument,
+        rewrite: impl FnMut(&str) -> Option<String>,
+    ) -> String {
+        render_html_document(&render_document_with_destinations(document, rewrite))
+    }
+}
+
 fn render_document_model(document: &MarkdownDocument) -> RenderedDocument {
+    render_document_with_destinations(document, |_| None)
+}
+
+fn render_document_with_destinations(
+    document: &MarkdownDocument,
+    mut rewrite: impl FnMut(&str) -> Option<String>,
+) -> RenderedDocument {
     let source = repair_utf8_mojibake(document.source());
     let title = repair_utf8_mojibake(document.title());
     let events = Parser::new_ext(&source, markdown_options())
         .map(sanitize_html_event)
+        .map(|mut event| {
+            if let Event::Start(Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. }) =
+                &mut event
+            {
+                if let Some(destination) = rewrite(dest_url) {
+                    *dest_url = destination.into();
+                }
+            }
+            event
+        })
         .collect::<Vec<_>>();
     let headings = extract_headings(&events);
     let html = render_html_body(&events, &headings);
@@ -1668,7 +1769,9 @@ fn escape_html(value: &str) -> String {
 fn escape_non_ascii_html(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
-        if ch.is_ascii() {
+        // HTML numeric references remap C1 control codes through Windows-1252.
+        // Keep their UTF-8 spelling so the DOM and text projection agree.
+        if ch.is_ascii() || ('\u{80}'..='\u{9f}').contains(&ch) {
             escaped.push(ch);
         } else {
             escaped.push_str("&#");

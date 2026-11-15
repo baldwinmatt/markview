@@ -1,6 +1,9 @@
+mod serve_annotations;
+
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::fd::{AsFd, OwnedFd};
@@ -11,6 +14,7 @@ use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
+use markview::annotations;
 use markview::{
     help, render, repair_utf8_mojibake, Cli, FrontendRenderer, HtmlRenderer, MarkdownDocument,
     OutputFormat,
@@ -39,15 +43,19 @@ fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
         return Ok(Some(help().to_owned()));
     }
 
+    if cli.annotations {
+        return list_annotations(&cli.inputs, cli.include_resolved).map(Some);
+    }
+
     if let Some(port) = cli.serve {
         if cli.inputs.is_empty() {
             return Err(markview::CliError::MissingServeInput.into());
         }
         let inputs = cli.inputs.iter().map(PathBuf::from).collect::<Vec<_>>();
         if cli.daemon {
-            serve_markdown_daemon(inputs, port, cli.recurse, cli.open)?;
+            serve_markdown_daemon(inputs, port, cli.recurse, cli.open, cli.annotate)?;
         } else {
-            serve_markdown(inputs, port, cli.recurse, cli.open)?;
+            serve_markdown(inputs, port, cli.recurse, cli.open, cli.annotate)?;
         }
         return Ok(None);
     }
@@ -74,12 +82,99 @@ fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
     }))
 }
 
+fn list_annotations(
+    inputs: &[String],
+    include_resolved: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut output = String::new();
+    let mut seen = std::collections::HashSet::new();
+    for input in inputs {
+        let path = Path::new(input);
+        let is_dir = path
+            .metadata()
+            .map_err(|error| format!("{input}: {error}"))?
+            .is_dir();
+        let paths = if is_dir {
+            collect_markdown_paths(path, true)?
+        } else {
+            vec![path.to_owned()]
+        };
+        let mut has_stores = false;
+        for file in paths {
+            if !is_markdown_path(&file) {
+                return Err(format!("input is not Markdown: {}", file.display()).into());
+            }
+            let location = annotations::resolve(&file)?;
+            if is_dir && annotations::snapshot(&location)?.is_none() {
+                continue;
+            }
+            has_stores = true;
+            if !seen.insert(location.document.clone()) {
+                continue;
+            }
+            let source = fs::read_to_string(&location.document)?;
+            let review = annotations::read(&location, &annotations::TextProjection::new(&source))?;
+            let _ = writeln!(output, "# Annotations: {}\nStore: {} (change `[open]` to `[resolved]` there once addressed)\n", file.display(), location.path.display());
+            let resolved = review
+                .annotations
+                .iter()
+                .filter(|record| record.status == annotations::Status::Resolved)
+                .count();
+            if resolved == review.annotations.len() {
+                let _ = writeln!(output, "No open annotations for {}.\n", file.display());
+            }
+            for record in review.annotations {
+                if record.status == annotations::Status::Resolved && !include_resolved {
+                    continue;
+                }
+                let _ = write!(output, "## a{} · ", record.id);
+                match record.lines {
+                    Some((first, last)) if first == last => {
+                        let _ = write!(output, "line {first}");
+                    }
+                    Some((first, last)) => {
+                        let _ = write!(output, "lines {first}-{last}");
+                    }
+                    None => output.push_str("document"),
+                }
+                if let Some(section) = record.section {
+                    let _ = write!(output, " · {section}");
+                }
+                if !record.attached {
+                    output.push_str(" · detached");
+                }
+                if record.status == annotations::Status::Resolved {
+                    output.push_str(" · resolved");
+                }
+                output.push('\n');
+                if let Some(quote) = record.quote {
+                    let _ = writeln!(output, "> {quote}");
+                }
+                let _ = writeln!(output, "\n{}\n", record.body);
+            }
+            if !include_resolved && resolved > 0 {
+                let label = if resolved == 1 {
+                    "annotation"
+                } else {
+                    "annotations"
+                };
+                let _ = writeln!(output, "{resolved} resolved {label} not shown.\n");
+            }
+        }
+        if !has_stores {
+            let _ = writeln!(output, "No open annotations for {input}.");
+        }
+    }
+    Ok(output)
+}
+
 #[derive(Debug)]
 struct ServeConfig {
     root: PathBuf,
     documents: Vec<ServedDocument>,
     default_document: PathBuf,
     port: u16,
+    review_token: Option<String>,
     mode: ServeMode,
     sidebar_nav: Option<NavDir>,
     /// Memoized `scan_assets()` result, invalidated by comparing each served
@@ -139,19 +234,11 @@ enum NavLayout {
 /// surrounding page shell (the nav's own class, the two-column wrapper) was
 /// only ever set at full-page-load time, so an in-place patch can't apply
 /// that change and a full page reload is needed instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ReloadKind {
+    Annotations(String),
     Content,
     Structure,
-}
-
-impl ReloadKind {
-    fn sse_event(self) -> &'static [u8] {
-        match self {
-            ReloadKind::Content => b"data: reload\n\n",
-            ReloadKind::Structure => b"data: rescan\n\n",
-        }
-    }
 }
 
 /// The active `ServeConfig`, swappable so the file watcher can replace it
@@ -203,8 +290,10 @@ fn serve_markdown(
     port: u16,
     recurse: bool,
     open: bool,
+    annotate: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = ServeConfig::from_inputs(inputs.clone(), port, recurse)?;
+    config.review_token = annotate.then(annotations::random_hex).transpose()?;
     #[cfg(unix)]
     let listener = if std::env::var_os("MARKVIEW_INHERITED_LISTENER").is_some() {
         let listener = TcpListener::from(io::stdin().as_fd().try_clone_to_owned()?);
@@ -223,6 +312,7 @@ fn serve_markdown(
     let clients = Arc::new(Mutex::new(Vec::new()));
     let shared: SharedConfig = Arc::new(RwLock::new(Arc::new(config)));
     let _watcher = watch_root(shared.clone(), inputs, bound_port, recurse, clients.clone())?;
+    serve_annotations::watch_stores(shared.clone(), clients.clone())?;
 
     println!(
         "Serving on http://localhost:{} — press Ctrl+C to stop",
@@ -293,6 +383,7 @@ fn serve_markdown_daemon(
     port: u16,
     recurse: bool,
     open: bool,
+    annotate: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let probe = bind_serve_listener(port)?;
     // Port 0 asks the OS for any free port; the child needs the concrete one.
@@ -306,6 +397,9 @@ fn serve_markdown_daemon(
 
     let mut command = Command::new(current_exe);
     command.arg("--serve");
+    if annotate {
+        command.arg("--annotate");
+    }
     for input in &inputs {
         command.arg(input);
     }
@@ -456,6 +550,7 @@ impl ServeConfig {
             documents: build.documents,
             default_document: build.default_document,
             port,
+            review_token: None,
             mode: build.mode,
             sidebar_nav,
             asset_cache: Mutex::new(None),
@@ -530,6 +625,9 @@ impl ServeConfig {
             }
             let relative = canonical.strip_prefix(&root).unwrap_or(&canonical);
             let route_path = relative_to_route(relative);
+            if serve_annotations::reserved(&route_path) {
+                continue;
+            }
             if documents
                 .iter()
                 .any(|document: &ServedDocument| document.source_path == canonical)
@@ -624,7 +722,9 @@ impl ServeConfig {
         if repeated.chars().any(|ch| ch == '\0' || ch.is_control()) {
             return None;
         }
-        if path_resolves_outside_root(&self.root, &repeated) {
+        if serve_annotations::reserved(&repeated)
+            || path_resolves_outside_root(&self.root, &repeated)
+        {
             return None;
         }
 
@@ -637,7 +737,7 @@ impl ServeConfig {
         if !canonical.starts_with(&self.root) {
             return None;
         }
-        route_from_root(&self.root, &candidate)
+        route_from_root(&self.root, &candidate).filter(|route| !serve_annotations::reserved(route))
     }
 
     /// Document mtimes, in `self.documents` order — the signature the asset
@@ -710,7 +810,14 @@ impl ServeConfig {
                 let Ok(canonical) = candidate.canonicalize() else {
                     continue;
                 };
-                if !canonical.starts_with(&self.root) || !canonical.is_file() {
+                if !canonical.starts_with(&self.root)
+                    || !canonical.is_file()
+                    || canonical.strip_prefix(&self.root).is_ok_and(|relative| {
+                        relative
+                            .components()
+                            .any(|part| part.as_os_str() == ".markview")
+                    })
+                {
                     continue;
                 }
                 let Some(route_path) = route_from_root(&self.root, &canonical) else {
@@ -742,12 +849,14 @@ impl ServeConfig {
 }
 
 fn document_for_path(root: &Path, canonical: PathBuf) -> io::Result<ServedDocument> {
-    let route_path = route_from_root(root, &canonical).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "document does not resolve under serve root",
-        )
-    })?;
+    let route_path = route_from_root(root, &canonical)
+        .filter(|route| !serve_annotations::reserved(route))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "document does not resolve under serve root",
+            )
+        })?;
     let source = fs::read_to_string(&canonical)?;
     let title = first_heading_title(&source).unwrap_or_else(|| {
         canonical
@@ -1107,6 +1216,12 @@ fn handle_fs_events(
             EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
         );
         for event_path in &event.paths {
+            if event_path
+                .components()
+                .any(|part| part.as_os_str() == ".markview")
+            {
+                continue;
+            }
             // Recursive backends may report only the new directory when files
             // are created before its watch is installed. Rescan the tree on
             // structural directory events, including removal/rename of known
@@ -1176,7 +1291,8 @@ fn rescan_and_reload(
     previous: Arc<ServeConfig>,
 ) {
     let reload_kind = match ServeConfig::from_inputs(inputs, port, recurse) {
-        Ok(fresh) => {
+        Ok(mut fresh) => {
+            fresh.review_token.clone_from(&previous.review_token);
             let reload_kind = if nav_layout(&previous) == nav_layout(&fresh) {
                 ReloadKind::Content
             } else {
@@ -1194,7 +1310,9 @@ fn rescan_and_reload(
 }
 
 fn broadcast_reload(clients: &Clients, reload_kind: ReloadKind) {
-    retain_clients(clients, |(_, client)| client.send(reload_kind).is_ok());
+    retain_clients(clients, |(_, client)| {
+        client.send(reload_kind.clone()).is_ok()
+    });
 }
 
 fn is_reload_event(kind: &EventKind) -> bool {
@@ -1209,15 +1327,25 @@ fn handle_connection(
     config: &ServeConfig,
     clients: Clients,
 ) -> io::Result<()> {
-    let mut request = String::new();
-    {
-        let mut reader = BufReader::new(stream.try_clone()?);
-        reader.read_line(&mut request)?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let request = match serve_annotations::HttpRequest::read(&mut reader, deadline) {
+        Ok(request) => request,
+        Err(_) => {
+            return write_response(
+                &mut stream,
+                "400 Bad Request",
+                "text/plain; charset=utf-8",
+                "Malformed request",
+                false,
+            )
+        }
+    };
+    let method = request.method.as_str();
+    let request_path = request.target.as_str();
+    if serve_annotations::reserved(request_path) {
+        return serve_annotations::handle(&mut stream, &mut reader, config, &request, deadline);
     }
-
-    let mut parts = request.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let request_path = parts.next().unwrap_or("/");
     if !matches!(method, "GET" | "HEAD") {
         return write_response(
             &mut stream,
@@ -1299,14 +1427,23 @@ fn serve_document(
     document: &ServedDocument,
     head_only: bool,
 ) -> io::Result<()> {
-    match render_file(config, document) {
-        Ok(html) => write_response(
-            stream,
-            "200 OK",
-            "text/html; charset=utf-8",
-            &html,
-            head_only,
-        ),
+    let nonce = config
+        .review_token
+        .as_ref()
+        .map(|_| annotations::random_hex())
+        .transpose()?;
+    match render_file(config, document, nonce.as_deref()) {
+        Ok(html) => {
+            let policy = nonce.map(|nonce| format!("Content-Security-Policy: default-src 'self'; script-src 'nonce-{nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' https: http: data:; object-src 'none'; base-uri 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'none'\r\n"));
+            write_response_headers(
+                &mut *stream,
+                "200 OK",
+                "text/html; charset=utf-8",
+                html.as_bytes(),
+                head_only,
+                policy.as_deref().unwrap_or(""),
+            )
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => write_404(stream, head_only),
         Err(error) => write_response(
             stream,
@@ -1367,7 +1504,11 @@ fn serve_events(mut stream: TcpStream, clients: Clients) -> io::Result<()> {
     // is only ever discovered on the next *write*.
     loop {
         match rx.recv_timeout(EVENTS_KEEPALIVE) {
-            Ok(kind) => stream.write_all(kind.sse_event())?,
+            Ok(ReloadKind::Annotations(route)) => {
+                write!(stream, "event: annotations\ndata: {route}\n\n")?
+            }
+            Ok(ReloadKind::Content) => stream.write_all(b"data: reload\n\n")?,
+            Ok(ReloadKind::Structure) => stream.write_all(b"data: rescan\n\n")?,
             Err(mpsc::RecvTimeoutError::Timeout) => stream.write_all(b": keepalive\n\n")?,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -1377,7 +1518,11 @@ fn serve_events(mut stream: TcpStream, clients: Clients) -> io::Result<()> {
     Ok(())
 }
 
-fn render_file(config: &ServeConfig, served: &ServedDocument) -> io::Result<String> {
+fn render_file(
+    config: &ServeConfig,
+    served: &ServedDocument,
+    nonce: Option<&str>,
+) -> io::Result<String> {
     if validated_served_path(&config.root, &served.source_path).is_none() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -1390,203 +1535,23 @@ fn render_file(config: &ServeConfig, served: &ServedDocument) -> io::Result<Stri
     // `scan_assets()` is otherwise a full document-mtime signature check
     // (and, on a miss, a directory walk) for every single reference.
     let assets = config.scan_assets();
-    let markdown = rewrite_markdown_links(config, served, &markdown, &assets);
+    let revision = annotations::source_revision(&markdown);
     let document = MarkdownDocument::with_title(markdown, title);
     let modified_at = modified_timestamp_millis(&served.source_path);
     Ok(inject_serve_shell(
         config,
         &served.route_path,
         modified_at,
-        &HtmlRenderer.render_document(&document),
+        &HtmlRenderer.render_with_destinations(&document, |destination| {
+            if serve_annotations::executable_url(destination) {
+                Some("#".to_owned())
+            } else {
+                rewritten_reference(config, served, destination, &assets)
+            }
+        }),
+        &revision,
+        nonce,
     ))
-}
-
-fn rewrite_markdown_links(
-    config: &ServeConfig,
-    served: &ServedDocument,
-    markdown: &str,
-    assets: &[ServedAsset],
-) -> String {
-    let mut rewritten = String::new();
-    let mut fence: Option<(char, usize)> = None;
-
-    for line in markdown.split_inclusive('\n') {
-        let line_without_newline = line.trim_end_matches(['\r', '\n']);
-        let newline = &line[line_without_newline.len()..];
-        let trimmed = line_without_newline.trim_start();
-
-        if let Some(marker) = fence_marker(trimmed) {
-            match fence {
-                Some((open_ch, open_len)) if marker.0 == open_ch && marker.1 >= open_len => {
-                    fence = None;
-                }
-                None => fence = Some(marker),
-                _ => {}
-            }
-            rewritten.push_str(line);
-            continue;
-        }
-        if fence.is_some() || line_without_newline.starts_with("    ") {
-            rewritten.push_str(line);
-            continue;
-        }
-
-        rewritten.push_str(&rewrite_reference_definition(
-            config,
-            served,
-            &rewrite_inline_markdown_links(config, served, line_without_newline, assets),
-            assets,
-        ));
-        rewritten.push_str(newline);
-    }
-
-    rewritten
-}
-
-/// Returns the fence character and run length for a code-fence marker line
-/// (e.g. `(` `` ` ``, 4)` for ` ```` `). Per CommonMark, a fence is only closed
-/// by a line using the *same* character with a run at least as long as the
-/// opening fence, so callers must compare against the currently open fence
-/// rather than treating every fence-looking line as a toggle.
-fn fence_marker(trimmed: &str) -> Option<(char, usize)> {
-    let ch = trimmed.chars().next()?;
-    if ch != '`' && ch != '~' {
-        return None;
-    }
-    let len = trimmed
-        .chars()
-        .take_while(|&candidate| candidate == ch)
-        .count();
-    (len >= 3).then_some((ch, len))
-}
-
-fn rewrite_inline_markdown_links(
-    config: &ServeConfig,
-    served: &ServedDocument,
-    line: &str,
-    assets: &[ServedAsset],
-) -> String {
-    let mut output = String::new();
-    let mut index = 0;
-    let mut in_code = false;
-
-    while index < line.len() {
-        let ch = line[index..].chars().next().expect("valid char boundary");
-        let ch_len = ch.len_utf8();
-
-        if ch == '`' {
-            in_code = !in_code;
-            output.push('`');
-            index += ch_len;
-            continue;
-        }
-        if in_code || ch != ']' || !line[index + ch_len..].starts_with('(') {
-            output.push(ch);
-            index += ch_len;
-            continue;
-        }
-
-        let destination_start = index + ch_len + 1;
-        let Some(destination_end) = find_link_destination_end(line, destination_start) else {
-            output.push(ch);
-            index += ch_len;
-            continue;
-        };
-        let content = &line[destination_start..destination_end];
-        let (destination, title) = split_destination_and_title(content);
-        output.push_str("](");
-        if let Some(target) = rewritten_reference(config, served, destination, assets) {
-            output.push_str(&target);
-        } else {
-            output.push_str(destination);
-        }
-        output.push_str(title);
-        output.push(')');
-        index = destination_end + 1;
-    }
-
-    output
-}
-
-fn rewrite_reference_definition(
-    config: &ServeConfig,
-    served: &ServedDocument,
-    line: &str,
-    assets: &[ServedAsset],
-) -> String {
-    let Some((label, rest)) = line.split_once("]:") else {
-        return line.to_owned();
-    };
-    if !label.starts_with('[') || label.starts_with("[^") {
-        return line.to_owned();
-    }
-    let leading = rest.len() - rest.trim_start().len();
-    let rest_trimmed = rest.trim_start();
-    let destination_end = rest_trimmed
-        .find(char::is_whitespace)
-        .unwrap_or(rest_trimmed.len());
-    let destination = &rest_trimmed[..destination_end];
-    let Some(target) = rewritten_reference(config, served, destination, assets) else {
-        return line.to_owned();
-    };
-    format!(
-        "{}]:{}{}{}",
-        label,
-        " ".repeat(leading),
-        target,
-        &rest_trimmed[destination_end..]
-    )
-}
-
-fn find_link_destination_end(line: &str, start: usize) -> Option<usize> {
-    let mut escaped = false;
-    let mut quote: Option<char> = None;
-    for (offset, ch) in line[start..].char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' {
-            escaped = true;
-            continue;
-        }
-        if let Some(open) = quote {
-            if ch == open {
-                quote = None;
-            }
-            continue;
-        }
-        if ch == '"' || ch == '\'' {
-            quote = Some(ch);
-            continue;
-        }
-        if ch == ')' {
-            return Some(start + offset);
-        }
-    }
-    None
-}
-
-/// Splits a link's `(destination title)` content on the first unescaped
-/// whitespace, so a title (e.g. `"See (details)"`) — including any parens it
-/// contains — is kept intact and untouched rather than treated as part of the
-/// destination path.
-fn split_destination_and_title(content: &str) -> (&str, &str) {
-    let mut escaped = false;
-    for (offset, ch) in content.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' {
-            escaped = true;
-            continue;
-        }
-        if ch.is_whitespace() {
-            return (&content[..offset], &content[offset..]);
-        }
-    }
-    (content, "")
 }
 
 fn rewritten_reference(
@@ -1804,6 +1769,8 @@ fn inject_serve_shell(
     active_route: &str,
     modified_at: Option<u128>,
     html: &str,
+    revision: &str,
+    nonce: Option<&str>,
 ) -> String {
     let nav = render_nav(config, active_route);
     let modified_attr = modified_at
@@ -1843,19 +1810,29 @@ fn inject_serve_shell(
   updateModifiedTimes();
   updateRefreshTime();
   const events = new EventSource('/events');
+  events.addEventListener('annotations', (event) => {
+    if (event.data === window.markviewReviewRoute) window.markviewReviewRefresh();
+  });
+  let refresh = 0;
   events.onmessage = async (event) => {
     if (event.data === 'rescan') {
       location.reload();
       return;
     }
     if (event.data !== 'reload') return;
+    const sequence = ++refresh;
     const savedY = window.scrollY;
     const response = await fetch(location.pathname, { cache: 'no-store' });
     const text = await response.text();
     const next = new DOMParser().parseFromString(text, 'text/html');
     const currentMain = document.querySelector('main');
     const nextMain = next.querySelector('main');
-    if (currentMain && nextMain) currentMain.innerHTML = nextMain.innerHTML;
+    if (sequence !== refresh || !response.ok) return;
+    if (currentMain && nextMain) {
+      currentMain.innerHTML = nextMain.innerHTML;
+      currentMain.dataset.sourceRevision = nextMain.dataset.sourceRevision;
+      window.markviewReviewRefresh();
+    }
     const currentNav = document.querySelector('[data-markview-nav]');
     const nextNav = next.querySelector('[data-markview-nav]');
     if (currentNav && nextNav) {
@@ -2078,7 +2055,21 @@ fn inject_serve_shell(
             .replacen("</main>", "</main></div>", 1),
         NavLayout::Empty | NavLayout::Tabs => html.replacen("<main>", &format!("{nav}\n<main>"), 1),
     };
-    html.replace("</body>", &format!("{footer}\n{script}\n</body>"))
+    let html = html.replacen(
+        "<main>",
+        &format!(r#"<main data-source-revision="{revision}">"#),
+        1,
+    );
+    let review = serve_annotations::script(active_route, config.review_token.as_deref());
+    let nonce_attr = nonce.map_or(String::new(), |nonce| format!(r#" nonce="{nonce}""#));
+    let script = script.replacen("<script>", &format!("<script{nonce_attr}>"), 1);
+    html.replace(
+        "</body>",
+        &format!(
+            "{footer}\n<style>{}</style>\n<script{nonce_attr}>{review}</script>\n{script}\n</body>",
+            annotations::REVIEW_STYLE
+        ),
+    )
 }
 
 /// Low-level "what's this file's mtime" primitive shared by every caller
@@ -2148,9 +2139,20 @@ fn write_bytes_response(
     body: &[u8],
     head_only: bool,
 ) -> io::Result<()> {
+    write_response_headers(stream, status, content_type, body, head_only, "")
+}
+
+fn write_response_headers(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+    head_only: bool,
+    headers: &str,
+) -> io::Result<()> {
     write!(
         stream,
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nX-Content-Type-Options: nosniff\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nX-Content-Type-Options: nosniff\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n",
         body.len()
     )?;
     if !head_only {

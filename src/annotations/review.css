@@ -1,0 +1,72 @@
+.markview-review[hidden], .markview-review [hidden], .markview-review-selection[hidden] {
+  display: none !important;
+}
+.markview-review {
+  color: var(--fg, #222);
+  font: 0.9rem/1.45 system-ui, sans-serif;
+  margin: 1rem 0;
+  min-width: 0;
+}
+body > .markview-review {
+  box-sizing: border-box;
+  width: min(860px, calc(100vw - 48px));
+  margin: 1.5rem auto;
+  padding: 1rem;
+  background: var(--code-bg, #eee);
+  border: 1px solid var(--rule, #8886);
+  border-radius: 8px;
+}
+.markview-review-toolbar, .markview-review-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+}
+.markview-review button, .markview-review-selection {
+  border: 1px solid var(--rule, #8886);
+  background: var(--bg, white);
+  color: var(--fg, #222);
+  border-radius: 5px;
+  padding: 0.25em 0.55em;
+  font: inherit;
+  cursor: pointer;
+}
+.markview-review button:disabled { opacity: 0.55; cursor: default; }
+.markview-review-card {
+  border-top: 1px solid var(--rule, #8886);
+  margin-top: 0.75rem;
+  padding-top: 0.65rem;
+  overflow-wrap: anywhere;
+}
+.markview-review-label { color: var(--muted, #666); }
+.markview-review blockquote {
+  margin: 0.4rem 0;
+  white-space: pre-wrap;
+  border-left: 3px solid #9675d5;
+  padding: 0 0.5rem;
+  overflow-wrap: anywhere;
+}
+.markview-review-body { white-space: pre-wrap; margin: 0.4rem 0; }
+.markview-review-message { margin: 0.45rem 0; }
+.markview-review-composer textarea {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 5rem;
+  color: inherit;
+  background: var(--bg, white);
+  border: 1px solid var(--rule, #8886);
+  border-radius: 4px;
+  padding: 0.4rem;
+  margin: 0.4rem 0;
+  font: inherit;
+  resize: vertical;
+}
+.markview-review-selection { position: fixed; z-index: 20; }
+::highlight(markview-annotations) { background: #a16ad961; text-decoration: underline #9563ca; }
+.markview-review-overlay { position: fixed; inset: 0; pointer-events: none; z-index: 4; }
+.markview-review-overlay > div { position: fixed; background: #a16ad941; border-bottom: 1px solid #9563ca; }
+@media print {
+  .markview-review, .markview-review-selection, .markview-review-overlay { display: none !important; }
+  ::highlight(markview-annotations) { background: transparent; text-decoration: none; }
+}

@@ -100,6 +100,102 @@ fn reports_invalid_width() {
 }
 
 #[test]
+fn annotations_cli_lists_open_detached_and_resolved_for_files_and_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let docs = dir.path().join("docs");
+    let store = dir.path().join(".markview/annotations/docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::create_dir_all(&store).unwrap();
+    let file = docs.join("spec.md");
+    let closed = docs.join("closed.md");
+    std::fs::write(&file, "# Routing\n\n\nFresh **source**.\n").unwrap();
+    std::fs::write(&closed, "# Closed").unwrap();
+    std::fs::write(
+        store.join("spec.md"),
+        concat!(
+            "## a2 [open] line 9\n\n> gone\n\nDetached body\n\n",
+            "## a3 [open] document\n\nDocument body\n\n",
+            "## a1 [open] line 3\n\n> Fresh source\n\nOpen body\n\n",
+            "## a4 [resolved] document\n\nClosed body\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        store.join("closed.md"),
+        "## a1 [resolved] document\n\nClosed only\n",
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("markview").unwrap();
+    cmd.arg("--annotations")
+        .arg(&docs)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("## a1 · line 4 · Routing"))
+        .stdout(predicate::str::contains("## a2 · line 9 · detached"))
+        .stdout(predicate::str::contains("## a3 · document"))
+        .stdout(predicate::str::contains("No open annotations for "))
+        .stdout(predicate::str::contains("1 resolved annotation not shown"))
+        .stdout(predicate::str::contains("Closed body").not());
+
+    let mut cmd = Command::cargo_bin("markview").unwrap();
+    let output = cmd
+        .args(["--annotations", "--include-resolved"])
+        .arg(&file)
+        .arg(&closed)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let out = String::from_utf8(output.stdout).unwrap();
+    assert!(out.find("Open body").unwrap() < out.find("Detached body").unwrap());
+    assert!(out.find("Detached body").unwrap() < out.find("Closed body").unwrap());
+    assert!(out.contains("## a4 · document · resolved"));
+    assert!(out.contains("Closed only"));
+    assert!(!out.contains("not shown"));
+
+    for flag in ["--html", "--no-color"] {
+        Command::cargo_bin("markview")
+            .unwrap()
+            .arg(flag)
+            .arg(&file)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Open body").not());
+    }
+}
+
+#[test]
+fn annotations_cli_validates_arguments() {
+    for (args, error) in [
+        (&["--include-resolved"][..], "requires --annotations"),
+        (&["--annotations", "--html", "one.md"], "cannot be combined"),
+        (
+            &["--annotations", "--serve", "one.md"],
+            "cannot be combined",
+        ),
+        (&["--annotations"], "missing value"),
+        (&["--annotate", "one.md"], "requires --serve"),
+    ] {
+        Command::cargo_bin("markview")
+            .unwrap()
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(error));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let invalid = dir.path().join("plain.txt");
+    std::fs::write(&invalid, "not Markdown").unwrap();
+    Command::cargo_bin("markview")
+        .unwrap()
+        .arg("--annotations")
+        .arg(invalid)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("input is not Markdown"));
+}
+
+#[test]
 fn serve_mode_returns_rendered_html() {
     let dir = tempfile::tempdir().expect("temp dir");
     let file = dir.path().join("README.md");
@@ -1620,6 +1716,151 @@ fn serve_mode_does_not_rewrite_footnote_definitions_as_link_references() {
     server.stop();
 }
 
+#[test]
+fn serve_annotations_enforces_http_boundaries_and_keeps_stores_in_sync() {
+    use markview::annotations::{source_revision, FORM_CAP};
+    let dir = tempfile::tempdir().unwrap();
+    let docs = dir.path().join("docs");
+    std::fs::create_dir(&docs).unwrap();
+    let document = docs.join("review.md");
+    let source = "😀 **text**";
+    std::fs::write(&document, source).unwrap();
+    std::fs::write(dir.path().join(".git"), "gitdir: elsewhere").unwrap();
+    let reserved = docs.join("_markview");
+    std::fs::create_dir(&reserved).unwrap();
+    std::fs::write(reserved.join("blocked.md"), "# Reserved").unwrap();
+
+    let server =
+        ServeProcess::try_start_with_env(&[&docs], 0, false, true, false, None, true).unwrap();
+    let port = server.port;
+    let host = format!("localhost:{port}");
+    let page = http_get(port, "/");
+    let token = page
+        .split("const token = \"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    let nonce = page
+        .split("nonce-")
+        .nth(1)
+        .unwrap()
+        .split('\'')
+        .next()
+        .unwrap();
+    assert!(page.contains(&format!("nonce=\"{nonce}\"")));
+    assert!(!http_get(port, "/").contains(&format!("nonce=\"{nonce}\"")));
+    assert!(http_get(port, "/_markview/blocked.md").starts_with("HTTP/1.1 403"));
+    let route = "/_markview/annotations?doc=%2Freview.md";
+    let get = |method: &str, endpoint: &str, host: &str| {
+        raw_http(
+            port,
+            &format!("{method} {endpoint} HTTP/1.1\r\nHost: {host}\r\n\r\n"),
+        )
+    };
+    assert!(get("GET", route, "evil.example").starts_with("HTTP/1.1 403"));
+    assert!(get("OPTIONS", route, &host).starts_with("HTTP/1.1 405"));
+    assert!(get("GET", "/_markview/blocked.md", &host).starts_with("HTTP/1.1 404"));
+    assert!(
+        get("GET", "/_markview/annotations?doc=/../outside.md", &host).starts_with("HTTP/1.1 404")
+    );
+    let head = get("HEAD", route, &host);
+    assert!(head.starts_with("HTTP/1.1 200"));
+    assert!(head.ends_with("\r\n\r\n"));
+    assert!(!head.contains("Access-Control-Allow"));
+
+    let post = |token: &str, form: &str| {
+        raw_http(port, &format!(
+        "POST /_markview/annotations HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/x-www-form-urlencoded\r\nX-Markview-Token: {token}\r\nContent-Length: {}\r\n\r\n{form}",
+        form.len()
+    ))
+    };
+    let form = format!("op=add&doc=%2Freview.md&body=First&quote=%F0%9F%98%80+text&start=0&end=5&source_revision={}", source_revision(source));
+    assert!(post("guessed", &form).starts_with("HTTP/1.1 403"));
+    assert!(post(token, "op=add&doc=/review.md&body=%ZZ").starts_with("HTTP/1.1 400"));
+    let store_path = dir.path().join(".markview/annotations/docs/review.md");
+    assert!(!store_path.exists());
+    let oversized = format!("POST /_markview/annotations HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/x-www-form-urlencoded\r\nX-Markview-Token: {token}\r\nContent-Length: {}\r\n\r\n", FORM_CAP + 1);
+    assert!(raw_http(port, &oversized).starts_with("HTTP/1.1 400"));
+
+    let mut events = open_reload_stream(port);
+    let first = post(token, &form);
+    assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+    assert!(first.contains("\"range\":[0,5]"));
+    let event = read_until(&mut events, "data: /review.md", Duration::from_secs(8));
+    assert!(event.contains("event: annotations"), "{event}");
+    let revision = first
+        .split("\"store_revision\":\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+
+    let large = format!(
+        "op=add&doc=/review.md&body={}",
+        "%F0%9F%98%80".repeat(10_000)
+    );
+    assert!(post(token, &large).starts_with("HTTP/1.1 200"));
+    assert!(post(
+        token,
+        &format!("op=delete&doc=/review.md&id=a1&store_revision={revision}")
+    )
+    .starts_with("HTTP/1.1 409"));
+    assert!(get("GET", route, &host).contains("First"));
+
+    let read_only = ServeProcess::start(&document);
+    let read_only_host = format!("127.0.0.1:{}", read_only.port);
+    let response = raw_http(
+        read_only.port,
+        &format!("GET {route} HTTP/1.1\r\nHost: {read_only_host}\r\n\r\n"),
+    );
+    assert!(response.contains("First"));
+    let response = raw_http(
+        read_only.port,
+        &format!("POST /_markview/annotations HTTP/1.1\r\nHost: {read_only_host}\r\n\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 405"));
+}
+
+#[test]
+fn serve_annotations_rejects_a_body_that_exceeds_the_read_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = dir.path().join("review.md");
+    std::fs::write(&doc, "# Test").unwrap();
+    let server =
+        ServeProcess::try_start_with_env(&[&doc], 0, false, false, false, None, true).unwrap();
+    let page = http_get(server.port, "/");
+    let token = page
+        .split("const token = \"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(6)))
+        .unwrap();
+    write!(stream, "POST /_markview/annotations HTTP/1.1\r\nHost: localhost:{}\r\nContent-Type: application/x-www-form-urlencoded\r\nX-Markview-Token: {token}\r\nContent-Length: 20\r\n\r\nop=add", server.port).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 400"));
+    assert!(!dir.path().join(".markview").exists());
+}
+
+fn raw_http(port: u16, request: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(8)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
+}
+
 struct ServeProcess {
     child: Child,
     port: u16,
@@ -1676,7 +1917,8 @@ impl ServeProcess {
     ) -> Self {
         for attempt in 0..5 {
             let port = if attempt == 0 { port } else { unused_port() };
-            match Self::try_start_with_env(inputs, port, log_disconnects, recurse, open, cwd) {
+            match Self::try_start_with_env(inputs, port, log_disconnects, recurse, open, cwd, false)
+            {
                 Ok(server) => return server,
                 Err(message) if attempt < 4 && message.contains("already in use") => continue,
                 Err(message) => panic!("{message}"),
@@ -1692,9 +1934,13 @@ impl ServeProcess {
         recurse: bool,
         open: bool,
         cwd: Option<&std::path::Path>,
+        annotate: bool,
     ) -> Result<Self, String> {
         let mut cmd = std::process::Command::new(cargo_bin("markview"));
         cmd.arg("--serve");
+        if annotate {
+            cmd.arg("--annotate");
+        }
         for input in inputs {
             cmd.arg(input);
         }

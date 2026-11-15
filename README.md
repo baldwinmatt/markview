@@ -61,16 +61,53 @@ markview --serve --open --daemon docs/       # background server, browser opened
 | `--serve` | Serve the given files, or a directory's Markdown files, over HTTP with navigation between documents. |
 | `--port <PORT>` | Listen on `PORT` (default 7878). `--port 0` picks any free port and prints it, which suits scripts and agents running several servers. Port values use ASCII decimal digits without a sign or leading zeros. The old `--serve 8080 notes.md` positional form is rejected. |
 | `--recurse` | Discover Markdown files at any depth. Takes a single directory; hidden and symlinked directories are skipped. |
+| `--annotate` | Enable adding and changing review comments in the browser. |
 | `--open` | Open the default browser once the server is ready. |
 | `--daemon` | Run in the background and return after the child is ready, printing the PID and URL. Logs go to `.markview-serve-<PORT>.log` in the current directory. |
 
-`--port`, `--recurse`, `--open`, and `--daemon` require `--serve`.
+`--port`, `--recurse`, `--open`, `--daemon`, and `--annotate` require `--serve`.
 
 The server renders Markdown as HTML and live-reloads open browser tabs whenever a served file changes (a file watcher feeds a `/events` server-sent-events stream). It serves the listed documents and assets allowlisted by relative Markdown image/link destinations (`![]()` and `[]()`, including reference-style links). Referenced assets inside hidden directories are allowed. Raw HTML `<img src>` and absolute destinations do not add assets; those files return 404 unless independently allowlisted. `/favicon.ico` has a separate local-file/built-in fallback. Other files return 404. It binds to `127.0.0.1`; to view it from another machine, forward the port over SSH first, e.g. `ssh -L 8080:localhost:8080 user@host`.
 
 For directory collections, `/` chooses the top-level `README.md`, then `index.md` (case-insensitive), then the first relative Markdown path sorted by byte order. Explicit file sets use their first FILE argument. A one-document directory has an empty navigation area. Hidden files/directories and symlinked directories are excluded from document discovery, while aliases of already discovered files are silently dropped. Explicit file sets reject duplicate/aliased inputs.
 
 On daemon startup failure, read the log path printed by the launcher with `cat`, report that underlying error, and remove the failed log. Daemon children retain their concrete `--port` in process arguments; foreground processes may omit it or show `0`, so read their startup banner for the actual port. Unix daemons inherit the bound listener, keeping the selected port reserved throughout startup.
+
+### Review comments
+
+```sh
+markview --serve --annotate --open notes.md
+markview --annotations notes.md docs/
+markview --annotations --include-resolved notes.md
+```
+
+Select rendered text and click **Comment**, or choose **Comment on document**.
+Use Cmd/Ctrl+Enter to save a draft and Escape to cancel it. Choose **Edit**,
+**Resolve**, **Reopen**, or **Delete** on a card. Existing comments are available
+for read-only review with `--serve` alone. In macOS Preview, comments share
+the table-of-contents sidebar. Use **View → Add Comment** (Cmd+Shift+K) on
+a selection. Save a dirty or untitled tab before adding a comment.
+
+The browser and GUI update when the shared Markdown store changes. A comment
+whose text is missing or ambiguous stays visible as **Detached** with its
+last-known lines. It reattaches when Markview finds a unique match again.
+
+Markview canonicalizes the document path and picks the nearest ancestor
+with a `.markview/annotations/` directory. Otherwise it uses the nearest
+ancestor with a `.git` entry, or the document's own directory outside Git.
+Paths mirror the source tree below that root. For example, repository file
+`docs/notes.md` maps to `.markview/annotations/docs/notes.md`. Commit
+`.markview/` to share the Markdown comments, or add `.markview/` to
+`.gitignore` for local review. Exclude the generated `*.markview-lock` files
+if you commit comments.
+
+Agents can run `markview --annotations <FILE or DIR>...` to see open comments
+and current lines. After addressing a comment, change its header from
+`[open]` to `[resolved]` in the store. Markview locks its own writes and
+compares the on-disk file immediately before committing. A direct edit can
+still race between that comparison and the final rename or removal. Re-read
+the store immediately before editing it and verify the intended change after
+saving.
 
 ### Diff blocks
 
@@ -114,7 +151,7 @@ The GUI renders Markdown through the system WebKit view and includes:
 - Relative links to Markdown files open in a new tab, resolved beside the linking document. Links from unsaved untitled documents show an error instead.
 - External `http` and `https` links ask for confirmation (Cancel or Open in Browser) before opening in the default browser.
 - Markdown document registration for bundled `.app` builds.
-- A table-of-contents sidebar generated from document headings.
+- A sidebar with the table of contents and review comments for file-backed Preview tabs.
 - Auto-refresh for file-backed tabs when files change on disk, with a modified indicator when auto-refresh is disabled or a tab has unsaved edits.
 - Scroll preservation when switching tabs or refreshing content.
 - Drag-and-drop opening for `.md`, `.markdown`, and `.mdown` files.

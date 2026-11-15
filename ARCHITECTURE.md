@@ -85,6 +85,36 @@ GUI settings are stored in a local text config:
 
 Stored values include theme, sidebar visibility, auto-refresh, window size, recent files, last open files, and the active file. Paths are escaped with the library preference serializer so the file stays simple and portable.
 
+## Document annotations
+
+`src/annotations/` owns the Markdown codec, canonical store resolver,
+rendered-text projection, anchors, and mutations. The projection counts
+non-whitespace Unicode scalars from the Markdown renderer's prepared input
+and tracks source lines and headings. Serve rewrites destinations on parser
+events so link routing cannot change the selection offsets. Source and store
+revisions let each frontend reject stale ranges or mutations.
+
+The store resolver selects the closest existing store, then the closest
+Git root, then the document directory. Reads open existing files without
+creating directories. Writes traverse directory handles without following
+symlinks and hold a persistent per-document lock through validation and
+atomic replacement or removal. Direct Markdown edits use the final
+snapshot comparison described in the README.
+
+The review script converts Rust's ranges to DOM ranges, handles draft
+storage and UI actions, and never resolves anchors itself. The browser
+adapter uses the loopback-only annotation endpoint, and the WebView
+adapter sends form-encoded IPC addressed to a tab. The GUI renders the
+current annotation state into `AppView` and sends annotation-only changes as
+a smaller update. Both frontends use the same directory watch planner to
+observe creation, replacement, deletion, and changes in store precedence.
+Source changes still follow each shell's normal refresh path.
+
+Browser writes require `--annotate`, a matching loopback Host and the
+server's random token. Token-bearing pages use a per-response script
+nonce and Content Security Policy. The shared form parser checks encoded
+size, decoded scalar counts and allowed fields.
+
 ## Packaging
 
 Local macOS packaging keeps Cargo as the build path:

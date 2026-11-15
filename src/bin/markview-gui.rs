@@ -12,9 +12,10 @@ use std::sync::{mpsc, Arc, Mutex};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
 
+use markview::annotations;
 use markview::{
-    app_view_with_preferences, AppModel, AppView, FrontendRenderer, GuiPreferences, HtmlRenderer,
-    DIFF_DARK_VARIABLES, DIFF_LIGHT_VARIABLES, DIFF_PRINT_RULES, DIFF_RULES,
+    app_view_with_preferences, AnnotationView, AppModel, AppView, FrontendRenderer, GuiPreferences,
+    HtmlRenderer, DIFF_DARK_VARIABLES, DIFF_LIGHT_VARIABLES, DIFF_PRINT_RULES, DIFF_RULES,
 };
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tao::event::{Event, WindowEvent};
@@ -103,7 +104,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let spelling = SpellingWorker::new(proxy.clone());
 
     install_application_menu(proxy.clone());
-    watcher.sync(model.watched_directories())?;
+    watcher.sync(&model)?;
 
     let window = WindowBuilder::new()
         .with_title(window_title(&model))
@@ -233,7 +234,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .set_description(&error)
                         .show();
                 }
-                if let Err(error) = watcher.sync(model.watched_directories()) {
+                if let Err(error) = watcher.sync(&model) {
                     eprintln!("markview-gui: failed to watch linked document: {error}");
                 }
                 sync_persisted_view(&preferences_path, &mut preferences, &model, &webview, &window);
@@ -447,7 +448,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 sync_persisted_view(&preferences_path, &mut preferences, &model, &webview, &window);
             }
+            Event::UserEvent(UserEvent::AddComment) => {
+                let _ = webview.evaluate_script("window.markview.addComment()");
+            }
+            Event::UserEvent(UserEvent::AnnotationRequest(id, form)) => {
+                let tab = model.tab(id).cloned();
+                let proxy = proxy.clone();
+                std::thread::spawn(move || {
+                    let error = apply_annotation(tab.as_ref(), &form).err().map(|error| error.to_string());
+                    let _ = proxy.send_event(UserEvent::AnnotationResult(id, error));
+                });
+            }
+            Event::UserEvent(UserEvent::AnnotationResult(id, error)) => {
+                if model.active_tab_id() == Some(id) {
+                    sync_annotations(&webview, &model);
+                }
+                let error = error.as_deref().map_or("null".to_owned(), annotations::json_string);
+                let _ = webview.evaluate_script(&format!("receiveAnnotation({id}, {error});"));
+            }
+            Event::UserEvent(UserEvent::StoreEvent(event)) => {
+                let changed = watcher.stores.changed(&[event]);
+                if model.active_tab().and_then(|tab| tab.path()).is_some_and(|path| changed.contains(&normalize_path(path.to_owned()))) {
+                    sync_annotations(&webview, &model);
+                }
+            }
             Event::UserEvent(UserEvent::FilesChanged(paths)) => {
+                let tracked = model.tabs().iter().filter_map(|tab| tab.path())
+                    .any(|path| paths.contains(&normalize_path(path.to_owned())));
+                if !tracked { return; }
                 if preferences.auto_refresh {
                     if let Err(error) = model
                         .refresh_changed_paths(paths.iter().map(PathBuf::as_path), |path| {
@@ -612,6 +640,7 @@ fn ipc_event(body: &str) -> Option<UserEvent> {
         "find" => UserEvent::FindRequested,
         "quit" => UserEvent::QuitRequested,
         "toggle-sidebar" => UserEvent::ToggleSidebar,
+        "add-comment" => UserEvent::AddComment,
         "toggle-auto-refresh" => UserEvent::ToggleAutoRefresh,
         "cycle-theme" => UserEvent::CycleTheme,
         "toggle-edit" => UserEvent::ToggleActiveEdit,
@@ -620,12 +649,19 @@ fn ipc_event(body: &str) -> Option<UserEvent> {
             let (kind, rest) = body.split_once(':')?;
             match kind {
                 "recent" => UserEvent::OpenRecent(PathBuf::from(rest)),
-                "spell" | "edit" | "link" => {
+                "spell" | "edit" | "link" | "annotation" => {
                     let (id, text) = rest.split_once(':')?;
                     let id = id.parse().ok()?;
                     match kind {
                         "spell" => UserEvent::CheckSpelling(id, text.parse().ok()?),
                         "edit" => UserEvent::EditChanged(id, text.to_owned()),
+                        "annotation" if text.len() <= annotations::FORM_CAP => {
+                            UserEvent::AnnotationRequest(id, text.to_owned())
+                        }
+                        "annotation" => UserEvent::AnnotationResult(
+                            id,
+                            Some("Annotation form too large.".to_owned()),
+                        ),
                         _ => UserEvent::OpenDocumentLink(id, text.to_owned()),
                     }
                 }
@@ -778,7 +814,7 @@ fn open_path(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let source = fs::read_to_string(&path)?;
     model.open_file(normalize_path(path), source);
-    watcher.sync(model.watched_directories())?;
+    watcher.sync(model)?;
     Ok(())
 }
 
@@ -927,7 +963,7 @@ fn save_active(
 }
 
 fn sync_watcher(watcher: &mut FileWatcher, model: &AppModel) {
-    if let Err(error) = watcher.sync(model.watched_directories()) {
+    if let Err(error) = watcher.sync(model) {
         eprintln!("markview-gui: {error}");
     }
 }
@@ -1056,6 +1092,10 @@ enum UserEvent {
     ExportHtmlRequested,
     ExportTabHtml(u64),
     FilesChanged(Vec<PathBuf>),
+    StoreEvent(notify::Event),
+    AddComment,
+    AnnotationRequest(u64, String),
+    AnnotationResult(u64, Option<String>),
     ToggleActiveEdit,
     EditTab(u64),
     CopyTabPath(u64),
@@ -1121,6 +1161,11 @@ fn install_application_menu(proxy: EventLoopProxy<UserEvent>) {
             #[unsafe(method(markviewFind))]
             fn find(&self) {
                 self.send(UserEvent::FindRequested);
+            }
+
+            #[unsafe(method(markviewAddComment))]
+            fn add_comment(&self) {
+                self.send(UserEvent::AddComment);
             }
 
             #[unsafe(method(markviewToggleSidebar))]
@@ -1313,6 +1358,13 @@ fn install_application_menu(proxy: EventLoopProxy<UserEvent>) {
         sel!(markviewToggleAutoRefresh),
         "",
     );
+    menu_item(
+        &view_menu,
+        &command_target,
+        "Add Comment",
+        sel!(markviewAddComment),
+        "K",
+    );
     view_item.setSubmenu(Some(&view_menu));
     main_menu.addItem(&view_item);
 
@@ -1343,10 +1395,17 @@ fn install_application_menu(_proxy: EventLoopProxy<UserEvent>) {}
 struct FileWatcher {
     watcher: RecommendedWatcher,
     watched_directories: HashSet<PathBuf>,
+    stores: annotations::StoreWatcher,
 }
 
 impl FileWatcher {
     fn new(proxy: EventLoopProxy<UserEvent>) -> notify::Result<Self> {
+        let store_proxy = proxy.clone();
+        let stores = annotations::StoreWatcher::new(move |result| {
+            if let Ok(event) = result {
+                let _ = store_proxy.send_event(UserEvent::StoreEvent(event));
+            }
+        })?;
         let watcher = RecommendedWatcher::new(
             move |result: notify::Result<notify::Event>| {
                 if let Ok(event) = result {
@@ -1362,14 +1421,20 @@ impl FileWatcher {
         Ok(Self {
             watcher,
             watched_directories: HashSet::new(),
+            stores,
         })
     }
 
-    fn sync<I>(&mut self, directories: I) -> notify::Result<()>
-    where
-        I: IntoIterator<Item = PathBuf>,
-    {
-        let next = directories
+    fn sync(&mut self, model: &AppModel) -> notify::Result<()> {
+        self.stores.sync(
+            model
+                .tabs()
+                .iter()
+                .filter_map(|tab| tab.path())
+                .map(|path| normalize_path(path.to_owned())),
+        );
+        let next = model
+            .watched_directories()
             .into_iter()
             .map(normalize_path)
             .collect::<HashSet<_>>();
@@ -1384,6 +1449,47 @@ impl FileWatcher {
 
         self.watched_directories = next;
         Ok(())
+    }
+}
+
+fn apply_annotation(
+    tab: Option<&markview::DocumentTab>,
+    form: &str,
+) -> Result<(), annotations::Error> {
+    use annotations::{Error, Operation};
+    let tab = tab
+        .filter(|tab| !tab.is_editing())
+        .ok_or(Error::Invalid("comments are available in Preview"))?;
+    let path = tab
+        .path()
+        .ok_or(Error::Invalid("save this document to comment"))?;
+    let request = annotations::Request::parse(form.as_bytes())?;
+    if request.doc.is_some() {
+        return Err(Error::Invalid("document is identified by the tab"));
+    }
+    if let Operation::Add { selection, .. } = &request.operation {
+        if tab.is_dirty() {
+            return Err(Error::Invalid("save this document to comment"));
+        }
+        if selection.as_ref().is_some_and(|selected| {
+            selected.revision() != annotations::source_revision(tab.document().source())
+        }) {
+            return Err(Error::Conflict(
+                "the preview changed, select the text again",
+            ));
+        }
+    }
+    let location = annotations::resolve(path)?;
+    annotations::mutate(&location, request.operation)?;
+    Ok(())
+}
+
+fn sync_annotations(webview: &AppWebView, model: &AppModel) {
+    if let Some(id) = model.active_tab_id() {
+        let review = model.active_tab().and_then(AnnotationView::for_tab);
+        let payload = annotation_js(review.as_ref());
+        let _ =
+            webview.evaluate_script(&format!("window.markview.setAnnotations({id}, {payload});"));
     }
 }
 
@@ -2008,6 +2114,7 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
   }}
 }}
 </style>
+<style>{review_style}</style>
 </head>
 <body>
 <header class="toolbar">
@@ -2092,12 +2199,29 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
 <div class="context-menu hidden" id="tab-context-menu" role="menu"></div>
 <div class="scroll-root" id="scroll-root">
   <div class="content-shell">
-    <aside class="toc" id="toc"></aside>
+    <aside class="toc" id="toc"><div id="toc-headings"></div><div id="review-mount"></div></aside>
     <main id="document"></main>
   </div>
 </div>
 <script>
 {editor_script}
+{review_script}
+const annotationRequests = new Map();
+const review = createMarkviewReview(document.getElementById('document'), document.getElementById('review-mount'), form => new Promise((resolve, reject) => {{
+  const id = window.markview.state.activeTabId;
+  annotationRequests.set(id, {{resolve, reject}});
+  window.ipc.postMessage(`annotation:${{id}}:${{form}}`);
+}}), () => {{
+  document.getElementById('toc').classList.remove('hidden');
+  document.querySelector('.content-shell').classList.remove('sidebar-hidden');
+}});
+function receiveAnnotation(id, error) {{
+  const request = annotationRequests.get(id);
+  if (!request) return;
+  annotationRequests.delete(id);
+  if (error) request.reject(new Error(error));
+  else request.resolve();
+}}
 function setTip(el, tip) {{
   el.title = tip;
   el.dataset.tooltip = tip;
@@ -2138,6 +2262,20 @@ window.markview = {{
       // Reading positions are optional if session storage is unavailable.
     }}
   }},
+  setAnnotations(id, annotation) {{
+    if (id !== this.state.activeTabId || annotation?.revision !== this.state.annotation?.revision) return;
+    this.state.annotation = annotation;
+    this.showAnnotations();
+  }},
+  showAnnotations() {{
+    const annotation = this.state.annotation;
+    review.show(annotation?.key || null, annotation?.revision || null, Boolean(annotation), Boolean(annotation?.canAdd));
+    if (annotation?.data) review.update(annotation.data);
+    else if (annotation?.error) review.unavailable(annotation.error);
+  }},
+  addComment() {{
+    if (this.state.annotation?.canAdd) review.addSelection();
+  }},
   setState(next) {{
     const scroller = document.getElementById('scroll-root');
     this.rememberPosition();
@@ -2151,6 +2289,7 @@ window.markview = {{
     const tabs = document.getElementById('tabs');
     const pane = document.getElementById('document');
     const toc = document.getElementById('toc');
+    const tocHeadings = document.getElementById('toc-headings');
     const shell = document.querySelector('.content-shell');
     const recent = document.getElementById('recent-files');
     document.documentElement.dataset.theme = next.preferences.theme === 'system' ? '' : next.preferences.theme;
@@ -2263,14 +2402,14 @@ window.markview = {{
           renderedHeadings[index].id = heading.id;
         }}
       }});
-      toc.replaceChildren();
+      tocHeadings.replaceChildren();
       toc.classList.toggle('hidden', !next.preferences.sidebarVisible);
       shell.classList.toggle('sidebar-hidden', !next.preferences.sidebarVisible);
       if (next.headings.length === 0) {{
         const empty = document.createElement('div');
         empty.className = 'toc-empty';
         empty.textContent = 'No headings';
-        toc.appendChild(empty);
+        tocHeadings.appendChild(empty);
       }} else {{
         const list = document.createElement('div');
         list.className = 'toc-list';
@@ -2288,10 +2427,11 @@ window.markview = {{
           }};
           list.appendChild(item);
         }}
-        toc.appendChild(list);
+        tocHeadings.appendChild(list);
       }}
     }}
     this.applyFind();
+    this.showAnnotations();
     const restoreY = isEditingActive ? 0 : (this.scrollPositions.get(next.activeTabId) || 0);
     requestAnimationFrame(() => {{
       scroller.scrollTop = restoreY;
@@ -2310,6 +2450,7 @@ window.markview = {{
     const query = this.findQuery.trim();
     if (query.length === 0) {{
       count.textContent = '';
+      review.repaint();
       return;
     }}
     this.findHits = highlightText(pane, query);
@@ -2318,6 +2459,7 @@ window.markview = {{
       this.activateFindHit(0);
     }}
     count.textContent = this.findHits.length === 0 ? '0/0' : `1/${{this.findHits.length}}`;
+    review.repaint();
   }},
   activateFindHit(index) {{
     if (this.findHits.length === 0) {{
@@ -2511,6 +2653,9 @@ window.addEventListener('keydown', event => {{
       event.preventDefault();
       window.ipc.postMessage(`close:${{window.markview.state.activeTabId}}`);
     }}
+  }} else if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === 'k') {{
+    event.preventDefault();
+    window.markview.addComment();
   }} else if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === 'e') {{
     event.preventDefault();
     window.ipc.postMessage('export-html');
@@ -2525,7 +2670,9 @@ window.markview.setState({state});
 </html>
 "#,
         state = view_js(view),
-        editor_script = include_str!("markview_gui_support/editor.js")
+        editor_script = include_str!("markview_gui_support/editor.js"),
+        review_style = annotations::REVIEW_STYLE,
+        review_script = annotations::REVIEW_SCRIPT,
     )
 }
 
@@ -2574,13 +2721,30 @@ fn view_js(view: &AppView) -> String {
         .collect::<Vec<_>>()
         .join(",");
 
+    let annotation = annotation_js(view.annotation.as_ref());
     format!(
-        "{{tabs:[{tabs}],activeTabId:{active_tab_id},activeHtml:{},activeSource:{},headings:[{headings}],preferences:{{theme:{},sidebarVisible:{},autoRefresh:{},recentFiles:[{recent_files}]}}}}",
+        "{{tabs:[{tabs}],annotation:{annotation},activeTabId:{active_tab_id},activeHtml:{},activeSource:{},headings:[{headings}],preferences:{{theme:{},sidebarVisible:{},autoRefresh:{},recentFiles:[{recent_files}]}}}}",
         js_string(&view.active_html),
         js_string(&view.active_source),
         js_string(view.preferences.theme.as_str()),
         view.preferences.sidebar_visible,
         view.preferences.auto_refresh
+    )
+}
+
+fn annotation_js(view: Option<&AnnotationView>) -> String {
+    let Some(view) = view else {
+        return "null".to_owned();
+    };
+    let response = match &view.review {
+        Ok(review) => format!("data:{}", review.json()),
+        Err(error) => format!("error:{}", annotations::json_string(error)),
+    };
+    format!(
+        "{{key:{},revision:{},canAdd:{},{response}}}",
+        annotations::json_string(&view.key),
+        annotations::json_string(&view.revision),
+        view.can_add
     )
 }
 
@@ -2658,6 +2822,57 @@ mod tests {
         ] {
             assert!(ipc_event(message).is_none(), "{message}");
         }
+    }
+
+    #[test]
+    fn annotations_guard_addressed_tab_and_resolve_against_dirty_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.md");
+        let source = "# Title\n\ntext";
+        fs::write(&path, source).unwrap();
+        let mut model = AppModel::new();
+        let file = model.open_file(path.clone(), source.to_owned());
+        let untitled = model.open_untitled("Draft", source.to_owned());
+        let add = "op=add&body=Document+comment";
+        assert!(apply_annotation(model.tab(untitled), add).is_err());
+        assert!(app_view_with_preferences(&model, GuiPreferences::default())
+            .annotation
+            .is_none());
+        assert!(
+            matches!(ipc_event("annotation:4:op=add&body=some%3Atext"), Some(UserEvent::AnnotationRequest(4, form)) if form == "op=add&body=some%3Atext")
+        );
+        assert!(matches!(
+            ipc_event(&format!(
+                "annotation:4:{}",
+                "x".repeat(annotations::FORM_CAP + 1)
+            )),
+            Some(UserEvent::AnnotationResult(4, Some(_)))
+        ));
+        let form = format!(
+            "op=add&body=%3C%2Fscript%3E&quote=text&start=5&end=9&source_revision={}",
+            annotations::source_revision(source)
+        );
+        apply_annotation(model.tab(file), &form).unwrap();
+        model.select(file);
+        let initial = app_view_with_preferences(&model, GuiPreferences::default());
+        assert!(view_js(&initial).contains(r"\u003c/script\u003e"));
+        assert!(apply_annotation(model.tab(file), "op=add&doc=elsewhere&body=blocked").is_err());
+
+        model.toggle_editing(file);
+        model.update_source(file, "# Title\n\n\ntext".to_owned());
+        assert!(AnnotationView::for_tab(model.tab(file).unwrap()).is_none());
+        model.toggle_editing(file);
+        assert!(apply_annotation(model.tab(file), add).is_err());
+        let view = AnnotationView::for_tab(model.tab(file).unwrap()).unwrap();
+        assert!(!view.can_add);
+        assert_eq!(view.review.unwrap().annotations[0].lines, Some((4, 4)));
+        assert_eq!(fs::read_to_string(&path).unwrap(), source);
+
+        model.mark_saved(file);
+        assert!(matches!(
+            apply_annotation(model.tab(file), &form),
+            Err(annotations::Error::Conflict(_))
+        ));
     }
 
     #[test]

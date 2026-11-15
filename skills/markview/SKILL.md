@@ -1,6 +1,6 @@
 ---
 name: markview
-description: Serve a directory of Markdown as a browsable local website with live reload, using the markview CLI. Use when the user wants to preview, browse, or read docs, notes, or a Markdown tree in a browser, or asks to serve, host, or view Markdown files.
+description: Serve a directory of Markdown as a browsable local website with live reload, using the markview CLI. Use when the user wants to preview, browse, or read docs, notes, or a Markdown tree in a browser, or asks to serve, host, view, or review Markdown files.
 ---
 
 Serve the target with `markview --serve`, then hand the user a URL that returns 200.
@@ -27,7 +27,7 @@ For an unpushed local checkout, install that checkout with `cargo install --path
 ps -eo pid,args | grep '[m]arkview.* --serve'
 ```
 
-Each line shows a server's PID and target. Daemon children include a concrete `--port` in their arguments; a foreground server may omit it or show `0`, so use its startup banner for the actual port. An instance already serving the same target with the same `--recurse` setting is the one to reuse: skip to step 4 with its port. Leave unrelated instances running.
+Each line shows a server's PID and target. Daemon children include a concrete `--port` in their arguments; a foreground server may omit it or show `0`, so use its startup banner for the actual port. An instance already serving the same target with the same `--recurse` and `--annotate` settings is the one to reuse: skip to step 4 with its port. Leave unrelated instances running.
 
 ## 3. Serve
 
@@ -50,6 +50,7 @@ mkdir -p /tmp/.markview && cd /tmp/.markview && markview --serve --recurse --dae
 
 The command prints the PID, the URL with the port it chose, and the log path. Record all three.
 
+- Add `--annotate` when the user wants to leave review comments.
 - Add `--open` when the user is at this machine and wants the browser launched.
 - On daemon failure, the launcher points to `.markview-serve-<PORT>.log`; the real startup error is in that log. Run `cat <LOG_PATH>`, report its contents, then delete that failed log with `rm <LOG_PATH>`. Do not delete logs for running servers.
 - Report errors such as a discovered symlink escaping the root, case-colliding document routes, or a bad path verbatim. Explicit file sets reject duplicate/aliased files; directory discovery silently drops aliases of files already discovered.
@@ -67,7 +68,17 @@ Done when `/` returns `200`. Then give the user the URL, the PID, and `kill <PID
 - For a directory, `/` selects the top-level `README.md`, else top-level `index.md` (both matched case-insensitively), else the first Markdown relative path in alphabetical byte order. For explicit files, `/` serves the first FILE argument.
 - A directory containing one document has an empty navigation area; larger collections list their discovered documents.
 - Discovery covers `.md`, `.markdown`, and `.mdown`. Hidden files/directories and symlinked directories are skipped for document discovery.
-- Asset discovery scans only relative Markdown `![]()` and `[]()` destinations, including reference-style Markdown links. Assets must resolve under the root; referenced assets inside hidden directories are allowed. Raw HTML such as `<img src>` and absolute destinations do not add assets to the allowlist, so those files return 404 unless independently allowlisted. The favicon route has its own local-file/built-in fallback.
+- Asset discovery scans only relative Markdown `![]()` and `[]()` destinations, including reference-style Markdown links. Assets must resolve under the root; referenced assets inside hidden directories are allowed outside the annotation store. Raw HTML such as `<img src>` and absolute destinations do not add assets to the allowlist, so those files return 404 unless independently allowlisted. The favicon route has its own local-file/built-in fallback.
 - Only served documents and allowlisted assets are accessible; other files return 404.
 - Edits, additions, and removals on disk reach open browser tabs automatically, so a running server needs no restart.
 - The server binds to `127.0.0.1`. For a remote host, the user forwards the port first: `ssh -L <PORT>:localhost:<PORT> user@host`.
+
+
+## Address review comments
+
+Run `markview --annotations <FILE or DIR>...` for open comments, current
+line labels and the store paths. Use `--include-resolved` to include completed
+comments. Read the source and address the requested changes. Re-read each
+store immediately before editing, change the addressed section header from
+`[open]` to `[resolved]`, and verify the status after saving. Preserve
+unrelated sections and any user-written preamble.

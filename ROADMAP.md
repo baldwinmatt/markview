@@ -125,6 +125,13 @@ Markview is a small, fast, local-first Markdown viewer written in Rust. The proj
 - **Runtime verification:** Installed `/Applications/Markview.app` reproduced the local-link failure twice with neighboring disposable `source.md` / `guide.md` files. A separate current-source debug bundle at `target/bug002/Markview Link Test.app` on macOS 27.0 (26A428) opened the correct file in a new tab, repeated successfully after Markdown heading navigation, and kept the shell URL intact. **Cancel** dismissed the warning and added no Chrome tab; **Open in Browser** opened `https://example.com/` in the default browser, Google Chrome.
 - **Automated verification:** Relative-link opening and external cancellation tests were observed failing before their implementation and passing afterward. Regression coverage also checks source-tab routing when another tab is active, encoded paths, parent directories, unsaved-source preservation, external approval, and failures without document replacement. All 165 GUI-feature tests pass. GUI build, GUI clippy across all targets with warnings denied, and modified-file formatting pass. Repository-wide formatting still reports pre-existing differences in `src/main.rs` and `tests/cli.rs`.
 
+### FEAT-004: Persistent document annotations
+
+- **Status** — Implemented in the CLI, browser, and macOS Preview. Runtime verification is tracked in the build tickets.
+- **Requested behavior** — Review rendered Markdown in the browser and macOS Preview, share comments through a Markdown store, and let agents list open comments with current source lines.
+- [Build tickets and acceptance criteria](ANNOTATIONS_TICKETS.md)
+- [Annotation specification](ANNOTATIONS_SPEC.md)
+
 ## Review Workflow
 
 Every commit should be reviewed before starting the next task:

@@ -7,78 +7,24 @@ use std::path::{Path, PathBuf};
 
 use super::{random_hex, Error};
 
-#[cfg(target_os = "macos")]
-mod flags {
-    pub const NOFOLLOW: i32 = 0x100;
-    pub const DIRECTORY: i32 = 0x100000;
-    pub const CLOEXEC: i32 = 0x1000000;
-    pub const NONBLOCK: i32 = 4;
-    pub const CREATE: i32 = 0x200;
-    pub const EXCL: i32 = 0x800;
-}
-#[cfg(any(target_os = "linux", target_os = "android"))]
-mod flags {
-    #[cfg(any(
-        target_arch = "arm",
-        target_arch = "aarch64",
-        target_arch = "powerpc",
-        target_arch = "powerpc64"
-    ))]
-    pub const DIRECTORY: i32 = 0x4000;
-    #[cfg(any(
-        target_arch = "arm",
-        target_arch = "aarch64",
-        target_arch = "powerpc",
-        target_arch = "powerpc64"
-    ))]
-    pub const NOFOLLOW: i32 = 0x8000;
-    #[cfg(not(any(
-        target_arch = "arm",
-        target_arch = "aarch64",
-        target_arch = "powerpc",
-        target_arch = "powerpc64"
-    )))]
-    pub const DIRECTORY: i32 = 0o200000;
-    #[cfg(not(any(
-        target_arch = "arm",
-        target_arch = "aarch64",
-        target_arch = "powerpc",
-        target_arch = "powerpc64"
-    )))]
-    pub const NOFOLLOW: i32 = 0o400000;
-    pub const CLOEXEC: i32 = 0o2000000;
-    pub const NONBLOCK: i32 = 0o4000;
-    pub const CREATE: i32 = 0o100;
-    pub const EXCL: i32 = 0o200;
-}
-
-// POSIX operations used for confined writes. Keep the existing dependency set.
-extern "C" {
-    fn openat(fd: i32, path: *const std::ffi::c_char, flags: i32, ...) -> i32;
-    fn mkdirat(fd: i32, path: *const std::ffi::c_char, mode: u32) -> i32;
-    fn renameat(
-        from: i32,
-        old: *const std::ffi::c_char,
-        to: i32,
-        new: *const std::ffi::c_char,
-    ) -> i32;
-    fn unlinkat(fd: i32, path: *const std::ffi::c_char, flags: i32) -> i32;
-    fn flock(fd: i32, operation: i32) -> i32;
-}
+// Every flag comes from libc: the values differ per architecture, and a wrong
+// `O_NOFOLLOW` would silently let a confined write follow a symlink.
+const DIRECTORY_MODE: libc::mode_t = 0o777;
+const FILE_MODE: libc::c_uint = 0o600;
 
 fn name(value: &OsStr) -> io::Result<CString> {
     CString::new(value.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid path component"))
 }
 
-fn open_at(parent: &File, entry: &OsStr, mode: i32) -> io::Result<File> {
+fn open_at(parent: &File, entry: &OsStr, flags: libc::c_int) -> io::Result<File> {
     let entry = name(entry)?;
     let fd = unsafe {
-        openat(
+        libc::openat(
             parent.as_raw_fd(),
             entry.as_ptr(),
-            mode | flags::NOFOLLOW | flags::CLOEXEC | flags::NONBLOCK,
-            0o600i32,
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            FILE_MODE,
         )
     };
     if fd < 0 {
@@ -96,7 +42,7 @@ fn path_error(action: &str, name: &str, error: io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("{action} {name}: {error}"))
 }
 
-fn check(result: i32) -> io::Result<()> {
+fn check(result: libc::c_int) -> io::Result<()> {
     if result < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -105,14 +51,16 @@ fn check(result: i32) -> io::Result<()> {
 }
 
 fn directory(parent: &File, entry: &OsStr, create: bool) -> io::Result<Option<File>> {
-    match open_at(parent, entry, flags::DIRECTORY) {
+    match open_at(parent, entry, libc::O_DIRECTORY) {
         Ok(file) => Ok(Some(file)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             if !create {
                 return Ok(None);
             }
             let entry_name = name(entry)?;
-            match check(unsafe { mkdirat(parent.as_raw_fd(), entry_name.as_ptr(), 0o777) }) {
+            match check(unsafe {
+                libc::mkdirat(parent.as_raw_fd(), entry_name.as_ptr(), DIRECTORY_MODE)
+            }) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => {
@@ -123,7 +71,7 @@ fn directory(parent: &File, entry: &OsStr, create: bool) -> io::Result<Option<Fi
                     ))
                 }
             }
-            open_at(parent, entry, flags::DIRECTORY).map(Some)
+            open_at(parent, entry, libc::O_DIRECTORY).map(Some)
         }
         Err(error) => Err(error),
     }
@@ -136,7 +84,7 @@ fn canonical_directory(path: &Path) -> io::Result<File> {
         .expect("absolute canonical directory")
         .iter()
     {
-        dir = open_at(&dir, part, flags::DIRECTORY)?;
+        dir = open_at(&dir, part, libc::O_DIRECTORY)?;
     }
     Ok(dir)
 }
@@ -228,11 +176,15 @@ impl Parent {
     pub fn lock(&self) -> io::Result<File> {
         let mut filename = self.filename.clone();
         filename.push(".markview-lock");
-        let file = match open_at(&self.dir, &filename, 2) {
+        let file = match open_at(&self.dir, &filename, libc::O_RDWR) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                match open_at(&self.dir, &filename, flags::CREATE | flags::EXCL | 2) {
+                match open_at(
+                    &self.dir,
+                    &filename,
+                    libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                ) {
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        open_at(&self.dir, &filename, 2)
+                        open_at(&self.dir, &filename, libc::O_RDWR)
                     }
                     result => result,
                 }
@@ -241,7 +193,7 @@ impl Parent {
         }?;
         let file = regular(file)?;
         loop {
-            match check(unsafe { flock(file.as_raw_fd(), 2) }) {
+            match check(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }) {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 result => return result.map(|()| file),
             }
@@ -249,7 +201,7 @@ impl Parent {
     }
 
     pub fn read(&self) -> io::Result<Option<Vec<u8>>> {
-        let mut file = match open_at(&self.dir, &self.filename, 0) {
+        let mut file = match open_at(&self.dir, &self.filename, libc::O_RDONLY) {
             Ok(file) => regular(file)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
@@ -271,25 +223,25 @@ impl Parent {
         let fd = self.dir.as_raw_fd();
         let Some(content) = content else {
             self.unchanged(snapshot)?;
-            return Ok(check(unsafe { unlinkat(fd, filename.as_ptr(), 0) })?);
+            return Ok(check(unsafe { libc::unlinkat(fd, filename.as_ptr(), 0) })?);
         };
         let temp = format!(".markview-{}.tmp", random_hex()?);
         let temp_name = name(OsStr::new(&temp))?;
         let mut file = open_at(
             &self.dir,
             OsStr::new(&temp),
-            flags::CREATE | flags::EXCL | 1,
+            libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY,
         )?;
         let result = (|| {
             file.write_all(content.as_bytes())?;
             file.sync_all()?;
             self.unchanged(snapshot)?;
-            check(unsafe { renameat(fd, temp_name.as_ptr(), fd, filename.as_ptr()) })
+            check(unsafe { libc::renameat(fd, temp_name.as_ptr(), fd, filename.as_ptr()) })
                 .map_err(|error| path_error("replace", &self.filename.to_string_lossy(), error))?;
             Ok(())
         })();
         if result.is_err() {
-            let _ = unsafe { unlinkat(fd, temp_name.as_ptr(), 0) };
+            let _ = unsafe { libc::unlinkat(fd, temp_name.as_ptr(), 0) };
         }
         result
     }
@@ -300,7 +252,7 @@ pub fn read_source(location: &Location) -> io::Result<String> {
     let mut file = regular(open_at(
         &parent,
         location.document.file_name().expect("source filename"),
-        0,
+        libc::O_RDONLY,
     )?)?;
     let mut source = String::new();
     file.read_to_string(&mut source)?;

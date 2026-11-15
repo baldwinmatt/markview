@@ -8,7 +8,6 @@ license = "MIT"
 [features]
 default = []
 gui = [
-    "dep:libc",
     "dep:objc2",
     "dep:objc2-app-kit",
     "dep:objc2-foundation",
@@ -20,7 +19,7 @@ gui = [
 highlight = []
 
 [dependencies]
-libc = { version = "0.2", optional = true }
+libc = "0.2"
 notify = { version = "8" }
 objc2 = { version = "0.6", optional = true }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSSpellChecker", "NSPasteboard"], optional = true }

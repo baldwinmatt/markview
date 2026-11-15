@@ -1,6 +1,12 @@
+#[cfg(unix)]
+mod paths;
+#[cfg(not(unix))]
+#[path = "unsupported.rs"]
 mod paths;
 mod projection;
 mod store;
+#[cfg(all(test, unix))]
+mod unsupported;
 mod watch;
 
 pub use paths::{read_source, resolve, Location};
@@ -517,5 +523,5 @@ fn utc_now() -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;

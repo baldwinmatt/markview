@@ -414,3 +414,52 @@ fn watch_plan_reports_creation_replacement_deletion_and_ancestor_switch() {
     fs::remove_dir_all(root.join(".markview")).unwrap();
     assert_eq!(changed(&mut watcher, root.join(".markview")), [doc]);
 }
+
+#[test]
+fn store_file_operations_use_libc_instead_of_hand_declared_flags() {
+    // Hand-copied `O_*` values are wrong on some architectures, which silently
+    // turns `O_NOFOLLOW` into a different flag. Every flag must come from libc.
+    let source = include_str!("paths.rs");
+    for flag in [
+        "O_NOFOLLOW",
+        "O_DIRECTORY",
+        "O_CREAT",
+        "O_EXCL",
+        "O_CLOEXEC",
+        "O_NONBLOCK",
+    ] {
+        assert!(source.contains(&format!("libc::{flag}")), "{flag}");
+    }
+    assert!(
+        !source.contains("extern \"C\""),
+        "hand-declared C functions"
+    );
+    assert!(
+        !source.contains("target_arch"),
+        "per-architecture constants"
+    );
+    let literal = source.lines().find(|line| {
+        let line = line.trim_start();
+        (line.starts_with("pub const") || line.starts_with("const")) && line.contains("i32 =")
+    });
+    assert_eq!(literal, None, "hand-defined open flag");
+}
+
+#[test]
+fn unsupported_platform_store_operations_report_a_clear_error() {
+    let message = "annotations are unsupported on this platform";
+    let error = unsupported::resolve(Path::new("doc.md")).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    assert_eq!(error.to_string(), message);
+    let location = unsupported::Location {
+        document: "doc.md".into(),
+        root: ".".into(),
+        path: ".markview/annotations/doc.md".into(),
+        relative: "doc.md".into(),
+    };
+    assert_eq!(location.parent(true).err().unwrap().to_string(), message);
+    assert_eq!(
+        unsupported::read_source(&location).unwrap_err().to_string(),
+        message
+    );
+}

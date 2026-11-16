@@ -1,8 +1,11 @@
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
+use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::SystemTime;
 
 use markview::annotations::{self, Error, Location, Review, Status, TextProjection};
 
@@ -12,6 +15,190 @@ pub const ENDPOINT: &str = "/_markview/review";
 const CHANGED: Error =
     Error::Conflict("The collection changed. Review the latest page and confirm again.");
 const FINISHED: Error = Error::Conflict("Review finished. You can close this tab.");
+
+/// What identifies one version of a file without reading it. A rename into
+/// place (how Markview and most editors save) changes the inode; an in-place
+/// write changes the size or a timestamp.
+#[derive(Debug, PartialEq, Eq)]
+struct FileKey(Option<(u64, Option<SystemTime>, [i64; 4])>);
+
+impl FileKey {
+    fn of(path: &Path) -> Self {
+        Self(fs::symlink_metadata(path).ok().map(|meta| {
+            #[cfg(unix)]
+            let identity = {
+                use std::os::unix::fs::MetadataExt;
+                [
+                    meta.dev() as i64,
+                    meta.ino() as i64,
+                    meta.ctime(),
+                    meta.ctime_nsec(),
+                ]
+            };
+            #[cfg(not(unix))]
+            let identity = [0; 4];
+            (meta.len(), meta.modified().ok(), identity)
+        }))
+    }
+}
+
+/// One served document as the verdict bar counts it.
+#[derive(Debug)]
+struct DocumentCount {
+    source: FileKey,
+    store_path: PathBuf,
+    store: FileKey,
+    revisions: Revisions,
+    open: usize,
+}
+
+impl DocumentCount {
+    fn read(config: &ServeConfig, doc: &ServedDocument) -> Result<Self, Error> {
+        let location = locate(config, doc)?;
+        // Taken before the bytes are read: a write that lands in between
+        // leaves a key older than the content, so the next summary reads it
+        // again instead of trusting a count it may not match.
+        let source = FileKey::of(&location.document);
+        let store = FileKey::of(&location.path);
+        let (text, bytes) = read_located(config, &location)?;
+        // Whether a comment is open does not depend on where it sits, so
+        // counting builds no projection and locates nothing.
+        let open = annotations::open_count(&location, bytes.as_deref())
+            .map_err(|error| io::Error::other(format!("{}: {error}", location.path.display())))?;
+        Ok(Self {
+            source,
+            store,
+            revisions: (
+                annotations::source_revision(&text),
+                annotations::store_revision(&location.path, bytes.as_deref()),
+            ),
+            open,
+            store_path: location.path,
+        })
+    }
+
+    fn current(&self, doc: &ServedDocument) -> bool {
+        self.source == FileKey::of(&doc.source_path) && self.store == FileKey::of(&self.store_path)
+    }
+}
+
+#[derive(Default)]
+struct Stale {
+    all: bool,
+    documents: Vec<PathBuf>,
+}
+
+/// The collection summary of one `ServeConfig`: each document's revisions and
+/// open count, keyed by its path and by the `FileKey`s of its source and
+/// store. A summary stats every document and reads only those whose keys
+/// moved. Three things drop entries regardless of the keys: the store watcher
+/// (a store that changed or moved to another root), a finish that found the
+/// summary out of date, and a rescan, which publishes a config with an empty
+/// cache.
+#[derive(Default)]
+pub struct SummaryCache {
+    /// Held while a summary is computed, so concurrent pollers share one
+    /// read of a changed document. Nothing else waits on it.
+    documents: Mutex<HashMap<PathBuf, DocumentCount>>,
+    stale: Mutex<Stale>,
+    #[cfg(test)]
+    reads: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    hold: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl std::fmt::Debug for SummaryCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SummaryCache").finish_non_exhaustive()
+    }
+}
+
+impl SummaryCache {
+    /// The review revision, the open comments and the documents that have
+    /// any. The revision is the one `Snapshot::capture` computes.
+    fn read(&self, config: &ServeConfig) -> Result<(String, usize, usize), Error> {
+        let mut documents = self.documents.lock().expect("summary lock");
+        self.before_summary();
+        let stale = std::mem::take(&mut *self.stale.lock().expect("stale lock"));
+        if stale.all {
+            documents.clear();
+        }
+        for document in &stale.documents {
+            documents.remove(document);
+        }
+        let mut revisions = Vec::with_capacity(config.documents.len());
+        let (mut comments, mut with_comments) = (0, 0);
+        for doc in &config.documents {
+            if !documents
+                .get(&doc.source_path)
+                .is_some_and(|cached| cached.current(doc))
+            {
+                documents.remove(&doc.source_path);
+                let count = DocumentCount::read(config, doc)?;
+                documents.insert(doc.source_path.clone(), count);
+            }
+            let count = &documents[&doc.source_path];
+            revisions.push(Ok(count.revisions.clone()));
+            comments += count.open;
+            with_comments += usize::from(count.open > 0);
+        }
+        let revision = collection_revision(config, revisions.into_iter())?;
+        Ok((revision, comments, with_comments))
+    }
+
+    /// Forgets one document: its store changed, or now lives elsewhere.
+    pub fn invalidate(&self, document: &Path) {
+        if let Ok(mut stale) = self.stale.lock() {
+            stale.documents.push(document.to_owned());
+        }
+    }
+
+    pub fn invalidate_all(&self) {
+        if let Ok(mut stale) = self.stale.lock() {
+            *stale = Stale {
+                all: true,
+                documents: Vec::new(),
+            };
+        }
+    }
+
+    fn note_read(&self) {
+        #[cfg(test)]
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn before_summary(&self) {
+        #[cfg(test)]
+        if let Some(hold) = self.hold.lock().expect("hold lock").take() {
+            hold();
+        }
+    }
+
+    /// How many documents summaries and snapshots have read from disk.
+    #[cfg(test)]
+    pub fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Runs `hold` once, inside the next summary, before it reads anything.
+    #[cfg(test)]
+    pub fn hold_next(&self, hold: impl FnOnce() + Send + 'static) {
+        *self.hold.lock().expect("hold lock") = Some(Box::new(hold));
+    }
+}
+
+// How many text projections this thread has built for review snapshots.
+#[cfg(test)]
+thread_local! {
+    static PROJECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn project(source: &str) -> TextProjection {
+    #[cfg(test)]
+    PROJECTIONS.set(PROJECTIONS.get() + 1);
+    TextProjection::new(source)
+}
 
 #[derive(Debug)]
 pub struct Session {
@@ -48,20 +235,29 @@ impl Session {
         operation()
     }
 
+    /// The counts the verdict bar shows. Only the finished flag is read
+    /// under the session lock: a save must not wait for a summary, and the
+    /// finish handler captures its own fresh snapshot.
     pub fn summary(&self, config: &ServeConfig) -> Result<String, Error> {
-        let accepted = self.accepted.lock().expect("review lock");
-        if *accepted {
+        if self.finished() {
             return Ok(r#"{"finished":true}"#.to_owned());
         }
-        let snapshot = Snapshot::capture(config)?;
-        let (comments, documents) = snapshot.counts();
+        let (revision, comments, documents) = config.review_summary.read(config)?;
         Ok(format!(
-            r#"{{"review_revision":"{}","comments":{comments},"documents":{documents}}}"#,
-            snapshot.revision
+            r#"{{"review_revision":"{revision}","comments":{comments},"documents":{documents}}}"#
         ))
     }
 
-    pub fn finish(&self, config: &ServeConfig, body: &[u8]) -> Result<AcceptedReview, Error> {
+    /// Accepts a verdict for exactly the collection the reviewer confirmed.
+    /// `published` says whether `config` is still the served collection: the
+    /// caller does not hold the config lock across the capture, so a rescan
+    /// that was published meanwhile is a conflict.
+    pub fn finish(
+        &self,
+        config: &ServeConfig,
+        body: &[u8],
+        published: impl FnOnce() -> bool,
+    ) -> Result<AcceptedReview, Error> {
         let mut accepted = self.accepted.lock().expect("review lock");
         if *accepted {
             return Err(FINISHED);
@@ -97,6 +293,9 @@ impl Session {
                 doc.path == page.source_path && doc.review.source_revision == source_revision
             })
         {
+            // The reviewer confirmed counts that this fresh capture does
+            // not match. Whatever the cache missed, the retry reads anew.
+            config.review_summary.invalidate_all();
             return Err(CHANGED);
         }
         if changes && snapshot.counts().0 == 0 {
@@ -114,6 +313,7 @@ impl Session {
                     .map(|doc| document_revisions(config, doc)),
             )
             .map_err(|_| CHANGED)?
+            || !published()
         {
             return Err(CHANGED);
         }
@@ -146,14 +346,10 @@ impl Snapshot {
             .iter()
             .map(|doc| {
                 let (location, source, bytes) = read_document(config, doc)?;
-                let review = Review::from_snapshot(
-                    &location,
-                    bytes.as_deref(),
-                    &TextProjection::new(&source),
-                )
-                .map_err(|error| {
-                    io::Error::other(format!("{}: {error}", location.path.display()))
-                })?;
+                let review = Review::from_snapshot(&location, bytes.as_deref(), &project(&source))
+                    .map_err(|error| {
+                        io::Error::other(format!("{}: {error}", location.path.display()))
+                    })?;
                 Ok(DocumentSnapshot {
                     path: location.document,
                     store: location.path,
@@ -226,10 +422,9 @@ impl Snapshot {
     }
 }
 
-fn read_document(
-    config: &ServeConfig,
-    doc: &ServedDocument,
-) -> io::Result<(Location, String, Option<Vec<u8>>)> {
+/// Where a served document and its store are, if the document is still the
+/// file that was allowlisted.
+fn locate(config: &ServeConfig, doc: &ServedDocument) -> io::Result<Location> {
     let path = validated_served_path(&config.root, &doc.source_path)
         .filter(|path| path == &doc.source_path)
         .ok_or_else(|| {
@@ -242,8 +437,25 @@ fn read_document(
     if location.document != path {
         return Err(io::Error::other("served document changed location"));
     }
-    let source = annotations::read_source(&location)?;
-    let store = annotations::snapshot(&location)?;
+    Ok(location)
+}
+
+fn read_located(
+    config: &ServeConfig,
+    location: &Location,
+) -> io::Result<(String, Option<Vec<u8>>)> {
+    config.review_summary.note_read();
+    let source = annotations::read_source(location)?;
+    let store = annotations::snapshot(location)?;
+    Ok((source, store))
+}
+
+fn read_document(
+    config: &ServeConfig,
+    doc: &ServedDocument,
+) -> io::Result<(Location, String, Option<Vec<u8>>)> {
+    let location = locate(config, doc)?;
+    let (source, store) = read_located(config, &location)?;
     Ok((location, source, store))
 }
 
@@ -271,7 +483,6 @@ fn collection_revision(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     struct Fixture {
         directory: tempfile::TempDir,
@@ -365,6 +576,106 @@ mod tests {
         );
     }
 
+    fn summary_json(revision: &str, comments: usize, documents: usize) -> String {
+        format!(
+            r#"{{"review_revision":"{revision}","comments":{comments},"documents":{documents}}}"#
+        )
+    }
+
+    #[test]
+    fn repeated_summaries_read_each_document_once_and_build_no_projection() {
+        let fixture = Fixture::new();
+        Fixture::write_store(&fixture.nested, "## a1 [open] line 1\n\n> Next\n\nNested\n");
+        let config = fixture.config(true);
+        let (session, _) = Session::new();
+        // The revision the finish handler will compare against.
+        let revision = Snapshot::capture(&config).unwrap().revision;
+        let (reads, projections) = (config.review_summary.reads(), PROJECTIONS.get());
+        // The bar asks again on every page load and every `annotations`
+        // event. Unchanged documents are neither read nor parsed again.
+        for _ in 0..6 {
+            assert_eq!(
+                session.summary(&config).unwrap(),
+                summary_json(&revision, 1, 1)
+            );
+        }
+        assert_eq!(
+            config.review_summary.reads() - reads,
+            config.documents.len()
+        );
+        assert_eq!(
+            PROJECTIONS.get(),
+            projections,
+            "counting needs no projection"
+        );
+
+        // A change is seen at once, and only that document is read again.
+        let reads = config.review_summary.reads();
+        Fixture::write_store(
+            &fixture.first,
+            "## a1 [open] document\n\nOne\n\n## a2 [resolved] document\n\nDone\n",
+        );
+        let changed = session.summary(&config).unwrap();
+        assert_eq!(config.review_summary.reads() - reads, 1);
+        fs::write(&fixture.nested, "# Next, edited\n").unwrap();
+        let edited = session.summary(&config).unwrap();
+        assert_eq!(config.review_summary.reads() - reads, 2);
+        assert_ne!(changed, edited);
+        let snapshot = Snapshot::capture(&config).unwrap();
+        assert_eq!(edited, summary_json(&snapshot.revision, 2, 2));
+        assert_eq!(snapshot.counts(), (2, 2));
+    }
+
+    #[test]
+    fn invalidated_documents_are_read_again_even_when_their_files_look_unchanged() {
+        let fixture = Fixture::new();
+        let config = fixture.config(true);
+        let (session, _) = Session::new();
+        let first = session.summary(&config).unwrap();
+        let reads = config.review_summary.reads();
+        // The store watcher saw this document's store change or move.
+        config
+            .review_summary
+            .invalidate(&config.documents[0].source_path);
+        assert_eq!(session.summary(&config).unwrap(), first);
+        assert_eq!(config.review_summary.reads() - reads, 1);
+        config.review_summary.invalidate_all();
+        assert_eq!(session.summary(&config).unwrap(), first);
+        assert_eq!(
+            config.review_summary.reads() - reads,
+            1 + config.documents.len()
+        );
+    }
+
+    #[test]
+    fn a_summary_in_progress_does_not_hold_up_mutations() {
+        let fixture = Fixture::new();
+        let config = fixture.config(true);
+        let (session, _) = Session::new();
+        let (entered, held) = mpsc::channel();
+        let (release, proceed) = mpsc::channel::<()>();
+        config.review_summary.hold_next(move || {
+            entered.send(()).unwrap();
+            let _ = proceed.recv();
+        });
+        std::thread::scope(|scope| {
+            let summary = scope.spawn(|| session.summary(&config));
+            held.recv().unwrap();
+            let (done, admitted) = mpsc::channel();
+            let session = &session;
+            let mutation = scope.spawn(move || {
+                session.mutate(|| Ok(())).unwrap();
+                done.send(()).unwrap();
+            });
+            // A save must be admitted while the summary is still reading.
+            let admitted = admitted.recv_timeout(std::time::Duration::from_secs(5));
+            release.send(()).unwrap();
+            mutation.join().unwrap();
+            summary.join().unwrap().unwrap();
+            assert!(admitted.is_ok(), "the save queued behind the summary");
+        });
+    }
+
     #[test]
     fn review_conflicts_leave_session_open() {
         let fixture = Fixture::new();
@@ -372,31 +683,37 @@ mod tests {
         let (session, _) = Session::new();
         let changes = Fixture::finish_form(&config, "changes");
         assert!(matches!(
-            session.finish(&config, changes.as_bytes()),
+            session.finish(&config, changes.as_bytes(), || true),
             Err(Error::Invalid(_))
         ));
 
         let old = Fixture::finish_form(&config, "approved");
+        // A rescan published a new collection while this one was captured.
         assert!(matches!(
-            session.finish(&fixture.config(true), old.as_bytes()),
+            session.finish(&config, old.as_bytes(), || false),
+            Err(Error::Conflict(_))
+        ));
+        assert!(matches!(
+            session.finish(&fixture.config(true), old.as_bytes(), || true),
             Err(Error::Conflict(_))
         ));
         assert!(matches!(
             session.finish(
                 &config,
-                old.replace("doc=/first.md", "doc=/outside.md").as_bytes()
+                old.replace("doc=/first.md", "doc=/outside.md").as_bytes(),
+                || true
             ),
             Err(Error::Conflict(_))
         ));
         Fixture::write_store(&fixture.first, "## a1 [open] document\n\nNew comment\n");
         assert!(matches!(
-            session.finish(&config, old.as_bytes()),
+            session.finish(&config, old.as_bytes(), || true),
             Err(Error::Conflict(_))
         ));
         let old = Fixture::finish_form(&config, "approved");
         fs::write(&fixture.first, "# Edited\n").unwrap();
         assert!(matches!(
-            session.finish(&config, old.as_bytes()),
+            session.finish(&config, old.as_bytes(), || true),
             Err(Error::Conflict(_))
         ));
         fs::write(&fixture.first, [0xff]).unwrap();
@@ -432,7 +749,7 @@ mod tests {
                     .unwrap();
             });
             entered.recv().unwrap();
-            let pending_finish = scope.spawn(|| session.finish(&config, old.as_bytes()));
+            let pending_finish = scope.spawn(|| session.finish(&config, old.as_bytes(), || true));
             release.send(()).unwrap();
             assert!(matches!(
                 pending_finish.join().unwrap(),
@@ -441,9 +758,9 @@ mod tests {
         });
         let form = Fixture::finish_form(&config, "changes").replace("doc=/first.md", "doc=/");
         let result = std::thread::scope(|scope| {
-            let other = scope.spawn(|| session.finish(&config, form.as_bytes()));
+            let other = scope.spawn(|| session.finish(&config, form.as_bytes(), || true));
             match (
-                session.finish(&config, form.as_bytes()),
+                session.finish(&config, form.as_bytes(), || true),
                 other.join().unwrap(),
             ) {
                 (Ok(result), Err(Error::Conflict(_))) | (Err(Error::Conflict(_)), Ok(result)) => {

@@ -54,9 +54,27 @@ function createMarkviewVerdict(page, review, token) {
     summary = null;
     render('Could not refresh the review summary.', true);
   }
-  async function refresh() {
-    if (completed) return;
+  // At most one summary request is in flight and one more is pending. A
+  // burst of events while a request is out is answered by a single request
+  // made after it, which sees everything the burst reported.
+  let loading = null;
+  let again = false;
+  function refresh() {
+    if (completed) return Promise.resolve();
     invalidate();
+    if (loading) {
+      again = true;
+      return loading;
+    }
+    loading = (async () => {
+      do {
+        again = false;
+        await load();
+      } while (again && !completed);
+    })().finally(() => { loading = null; });
+    return loading;
+  }
+  async function load() {
     const request = sequence;
     try {
       const response = await fetch(endpoint, {cache: 'no-store'});
@@ -102,6 +120,8 @@ function createMarkviewVerdict(page, review, token) {
     }
   }
 
-  refresh();
+  // The first summary is requested when the page's event stream opens, so
+  // no change can fall between the counts and the events that update them.
+  render('Refreshing collection counts…');
   return {done, refresh, invalidate, unavailable, finished: () => completed};
 }

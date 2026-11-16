@@ -78,6 +78,10 @@ class StubElement extends StubNode {
       this.childNodes.push(node);
     }
   }
+  prepend(...nodes) {
+    const rest = this.childNodes.slice();
+    this.append(...nodes, ...rest);
+  }
   remove() {
     if (!this.parentNode) return;
     this.parentNode.childNodes.splice(this.parentNode.childNodes.indexOf(this), 1);
@@ -280,7 +284,37 @@ function createPage({revision = 'source-1'} = {}) {
       return page.fetch(...args);
     },
   });
-  vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/annotations/review.js'), 'utf8'), page.context);
+  const run = file => vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src', file), 'utf8'), page.context);
+  run('annotations/review.js');
+  // The verdict bar of a blocking review. It confirms with a native dialog,
+  // which a browser has; `page.confirmations` records what it asked.
+  page.loadVerdict = (answer = true) => {
+    page.confirmations = [];
+    window.confirm = text => { page.confirmations.push(text); return answer; };
+    run('annotations/verdict.js');
+  };
+  // The live-reload shell every served page ends with. Returns its
+  // EventSource, so a test can deliver server events.
+  page.loadShell = () => {
+    let events = null;
+    Object.assign(page.context, {
+      location: {pathname: '/doc.md', reload() { page.reloads = (page.reloads || 0) + 1; }, replace() {}},
+      navigator: {clipboard: {writeText: async () => {}}},
+      EventSource: class {
+        constructor() { this.listeners = new Map(); this.closed = false; events = this; }
+        addEventListener(type, listener) { this.listeners.set(type, [...(this.listeners.get(type) || []), listener]); }
+        dispatchEvent(event) {
+          for (const listener of this.listeners.get(event.type) || []) listener(event);
+          if (event.type === 'message') this.onmessage?.(event);
+        }
+        close() { this.closed = true; }
+      },
+    });
+    page.context.createMarkviewCodeCopy ??= () => () => {};
+    window.scrollTo = () => {};
+    run('serve_reload.js');
+    return events;
+  };
   return page;
 }
 

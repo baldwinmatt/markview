@@ -809,3 +809,51 @@ test('a response that arrives after switching documents is not applied to the ne
   page.review.show('first', 'source-1', true, true);
   assert.equal(page.find('form').visible, false);
 });
+
+// A blocking review page as `markview --review` serves it: the review
+// script, the verdict bar and the live-reload shell. `page.summaries` holds
+// one function per summary request still in flight; calling it answers.
+async function reviewPage(summary = {review_revision: 'r1', comments: 0, documents: 0}) {
+  const page = createPage();
+  page.summary = summary;
+  page.summaries = [];
+  page.fetch = (url, init = {}) => {
+    if (url === '/_markview/review' && !init.method) {
+      return new Promise(resolve => page.summaries.push(() => resolve(response(200, page.summary))));
+    }
+    return Promise.resolve(response(200, review('store-1')));
+  };
+  page.loadVerdict();
+  await page.context.markviewServeReview('/doc.md', 'token', 7878, true);
+  page.events = page.loadShell();
+  page.bar = page.document.querySelector('.markview-verdict');
+  page.status = () => page.bar.querySelector('p').textContent;
+  // Answers every summary request in flight, and any that follows from it.
+  page.answerSummaries = async () => {
+    for (let index = 0; index < page.summaries.length; index++) {
+      page.summaries[index]();
+      await page.settle();
+    }
+  };
+  return page;
+}
+
+test('a review page asks for the collection summary once, and an event burst at most twice', async () => {
+  const page = await reviewPage();
+  page.events.dispatchEvent({type: 'open'});
+  await page.settle();
+  assert.equal(page.summaries.length, 1, 'page load');
+  await page.answerSummaries();
+  assert.equal(page.summaries.length, 1, 'page load, answered');
+  assert.equal(page.status(), '0 open comments in 0 documents.');
+
+  // Five saves on other pages arrive before the first summary is answered:
+  // one request is in flight and one more covers everything after it.
+  page.summary = {review_revision: 'r2', comments: 5, documents: 2};
+  for (let index = 0; index < 5; index++) page.events.dispatchEvent({type: 'annotations', data: '/other.md'});
+  await page.settle();
+  assert.equal(page.summaries.length, 2, 'in flight');
+  await page.answerSummaries();
+  assert.equal(page.summaries.length, 3, 'one pending request, not four');
+  assert.equal(page.status(), '5 open comments in 2 documents.');
+});

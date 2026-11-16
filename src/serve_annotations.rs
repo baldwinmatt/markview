@@ -387,15 +387,23 @@ pub fn handle(
         if !query.is_empty() {
             return fail(stream, "400 Bad Request", "unexpected review query");
         }
-        let config = shared.read().expect("config lock");
+        // Both read the whole collection, so neither holds the config lock:
+        // a rescan waiting to publish would otherwise stall every request.
+        let config = shared.read().expect("config lock").clone();
         let result = match request.method.as_str() {
             "GET" | "HEAD" => session.summary(&config).map(|json| (json, None)),
             "POST" if body.is_some() => session
-                .finish(&config, body.as_deref().expect("validated POST"))
+                .finish(&config, body.as_deref().expect("validated POST"), || {
+                    // `try_read`: this runs under the session lock, which a
+                    // save takes while holding the config lock. A rescan
+                    // that is publishing right now is a conflict too.
+                    shared
+                        .try_read()
+                        .is_ok_and(|published| Arc::ptr_eq(&published, &config))
+                })
                 .map(|result| ("{\"finished\":true}".to_owned(), Some(result))),
             _ => return fail(stream, "405 Method Not Allowed", "method not allowed"),
         };
-        drop(config);
         return match result {
             Ok((json, Some(result))) => {
                 broadcast_reload(clients, ReloadKind::ReviewFinished);
@@ -673,6 +681,7 @@ pub fn watch_stores(shared: SharedConfig, clients: Clients) -> notify::Result<Ar
                 Err(_) => break,
             };
             for document in changed {
+                config.review_summary.invalidate(&document);
                 let Some(route) = config.document_route_for_path(&document) else {
                     continue;
                 };
@@ -783,6 +792,75 @@ mod tests {
         }
         // One projection, and one resolution: the write's own.
         assert_eq!(config.review_cache.work(), (1, 1));
+    }
+
+    #[test]
+    fn a_summary_in_progress_blocks_neither_a_rescan_nor_a_save() {
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "# Doc\n\nSome text.\n").unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut config = ServeConfig::from_inputs(vec![path], port, false).unwrap();
+        config.review_token = Some("token".to_owned());
+        config.blocking_review = true;
+        let (entered, held) = mpsc::channel();
+        let (release, proceed) = mpsc::channel::<()>();
+        config.review_summary.hold_next(move || {
+            entered.send(()).unwrap();
+            let _ = proceed.recv();
+        });
+        let shared: SharedConfig = Arc::new(std::sync::RwLock::new(Arc::new(config)));
+        let clients: Clients = Arc::new(Mutex::new(Vec::new()));
+        let stores = watch_stores(shared.clone(), clients.clone()).unwrap();
+        let (session, _verdict) = serve_review::Session::new();
+        let server = shared.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let (shared, clients) = (server.clone(), clients.clone());
+                let (stores, session) = (stores.clone(), session.clone());
+                std::thread::spawn(move || {
+                    super::super::handle_connection(
+                        stream.unwrap(),
+                        &shared,
+                        clients,
+                        &stores,
+                        Some(session),
+                    )
+                });
+            }
+        });
+        let request = |request: String| {
+            let (done, response) = mpsc::channel();
+            std::thread::spawn(move || {
+                let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                stream.write_all(request.as_bytes()).unwrap();
+                let mut response = String::new();
+                let _ = stream.read_to_string(&mut response);
+                let _ = done.send(response);
+            });
+            response
+        };
+        let host = format!("Host: localhost:{port}\r\n");
+        let summary = request(format!("GET /_markview/review HTTP/1.1\r\n{host}\r\n"));
+        held.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The summary is now mid-computation. A rescan can still publish...
+        let rescan_can_publish = shared.try_write().is_ok();
+        // ...and a save is answered instead of queueing behind the summary.
+        let body = "op=add&doc=%2F&body=Saved";
+        let saved = request(format!(
+            "POST /_markview/annotations HTTP/1.1\r\n{host}Content-Type: application/x-www-form-urlencoded\r\nX-Markview-Token: token\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ))
+        .recv_timeout(Duration::from_secs(5));
+        release.send(()).unwrap();
+        let summary = summary.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(rescan_can_publish, "the summary held the config lock");
+        let saved = saved.expect("the save queued behind the summary");
+        assert!(saved.starts_with("HTTP/1.1 200"), "{saved}");
+        assert!(summary.starts_with("HTTP/1.1 200"), "{summary}");
+        assert!(summary.contains("\"review_revision\":"), "{summary}");
     }
 
     #[test]

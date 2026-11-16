@@ -388,6 +388,19 @@ impl ReviewCache {
     }
 }
 
+/// How many annotations in a store snapshot are open. Whether a comment is
+/// open does not depend on where it sits, so this needs no projection. It
+/// fails for exactly the stores `Review::from_snapshot` rejects.
+pub fn open_count(location: &Location, bytes: Option<&[u8]>) -> Result<usize, Error> {
+    let store = parse_snapshot(location, bytes)?;
+    store.check_ids()?;
+    Ok(store
+        .annotations
+        .iter()
+        .filter(|record| record.status == Status::Open)
+        .count())
+}
+
 pub fn read(location: &Location, projection: &TextProjection) -> Result<Review, Error> {
     let bytes = snapshot(location)?;
     Review::from_snapshot(location, bytes.as_deref(), projection)

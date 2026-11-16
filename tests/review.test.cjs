@@ -154,6 +154,7 @@ function applied(form, annotations) {
   const op = form.get('op');
   if (op === 'delete') return annotations.filter(entry => entry.id !== form.get('id'));
   if (op === 'edit') return annotations.map(entry => (entry.id === form.get('id') ? {...entry, body: form.get('body')} : entry));
+  if (op === 'add') return [...annotations, comment('a' + (annotations.length + 1), {body: form.get('body')})];
   return annotations;
 }
 
@@ -470,6 +471,58 @@ test('focus returns to the control that opened the draft after saving or cancell
   await page.settle();
   assert.equal(page.card('a2').querySelector('.markview-review-body').textContent, 'Edited');
   focused(page, page.cardButton('a2', 'Edit'));
+});
+
+// Delivers a key the way a browser does for the single-key shortcuts: to the
+// window, targeted at whatever has focus. Returns whether it was consumed.
+function press(page, key, fields = {}) {
+  const event = {type: 'keydown', key, target: page.document.activeElement, defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; }, ...fields};
+  page.window.listeners.get('keydown')(event);
+  return event.defaultPrevented;
+}
+
+function saveDraft(page, text) {
+  const body = page.find('textarea');
+  body.value = text;
+  body.dispatchEvent({type: 'input'});
+  page.find('form').requestSubmit();
+  return page.settle();
+}
+
+test('C from a card gives focus back to that card once the save has rebuilt the list', async () => {
+  const page = await pageWithComments();
+  assert.ok(press(page, 'j'));
+  focused(page, page.card('a1'));
+  const before = page.card('a1');
+  assert.ok(press(page, 'c'));
+  focused(page, page.find('textarea'));
+  await saveDraft(page, 'From the card');
+  assert.equal(page.posts.length, 1);
+  // The save replaced every card, so the card that opened the draft is a
+  // new element. Focus must not be left on the detached one, or on <body>.
+  assert.ok(page.card('a1') !== before);
+  focused(page, page.card('a1'));
+
+  // From a button on a card, focus returns to that button.
+  page.cardButton('a2', 'Edit').focus();
+  assert.ok(press(page, 'c'));
+  await saveDraft(page, 'From the Edit button');
+  assert.equal(page.posts.length, 2);
+  focused(page, page.cardButton('a2', 'Edit'));
+
+  // Cancelling an empty draft gives focus back the same way.
+  page.card('a2').focus();
+  assert.ok(press(page, 'c'));
+  page.find('.markview-review-composer').dispatchEvent({type: 'keydown', key: 'Escape'});
+  focused(page, page.card('a2'));
+
+  // A fixed control that opened the draft is still focused directly.
+  const whole = page.button('Comment on document');
+  whole.focus();
+  assert.ok(press(page, 'c'));
+  await saveDraft(page, 'From the toolbar');
+  focused(page, whole);
 });
 
 test('a reload keeps the previous comments on screen until the new list arrives', async () => {

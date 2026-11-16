@@ -183,7 +183,8 @@ function createMarkviewReview(root, mount, submit, {
   let discarding = null;
   let discardPrompt = null;
   // What opened the current draft, to give focus back when it closes:
-  // {control} for a fixed button, {id, label} for a button on a card.
+  // {control} for a fixed button, {id, label} for a button on a card, and
+  // {id, label: null} for the card itself.
   let opener = null;
   // The text points of `root`, kept until the document changes. Walking the
   // whole document on every `selectionchange` makes dragging a selection slow.
@@ -567,7 +568,14 @@ function createMarkviewReview(root, mount, submit, {
       const selection = window.getSelection();
       if (selection && !selection.isCollapsed) {
         if (!addSelection(markviewReviewSelection(root, selection, textPoints()))) return;
-      } else if (!startDraft({op: 'add'}, active === document.body ? {control: whole} : {control: active})) return;
+      } else {
+        // A save rebuilds every card, so a card or its button is remembered
+        // by comment and label. Only a fixed control is remembered itself.
+        const from = focused
+          ? {id: focused.dataset.annotation, label: active.tagName === 'BUTTON' ? active.textContent : null}
+          : {control: active === document.body ? whole : active};
+        if (!startDraft({op: 'add'}, from)) return;
+      }
     } else if ((event.key === 'e' || event.key === 'r') && focused && writable && !pending.has(key)) {
       const actions = cardActionsByElement.get(focused);
       if (!actions) return;

@@ -39,12 +39,14 @@ class StubText extends StubNode {
 }
 
 function matchesSimple(element, selector) {
-  // tag, .class, tag.class and [attribute] forms are all the script uses.
-  const match = /^([a-z0-9]*)((?:\.[\w-]+)*)(?:\[([\w-]+)\])?$/i.exec(selector.trim());
+  // tag, .class, tag.class, [attribute] and [attribute="value"] forms are
+  // all the scripts use.
+  const match = /^([a-z0-9]*)((?:\.[\w-]+)*)(?:\[([\w-]+)(?:="([^"]*)")?\])?$/i.exec(selector.trim());
   if (!match) throw new Error('unsupported selector: ' + selector);
-  const [, tag, classes, attribute] = match;
+  const [, tag, classes, attribute, value] = match;
   if (tag && element.tagName !== tag.toUpperCase()) return false;
   if (attribute && !(attribute in element.attributes)) return false;
+  if (value !== undefined && element.attributes[attribute] !== value) return false;
   const names = element.className.split(/\s+/);
   return classes.split('.').filter(Boolean).every(name => names.includes(name));
 }
@@ -136,7 +138,8 @@ class StubElement extends StubNode {
     if (proceed && this.tagName === 'BUTTON' && this.type === 'submit') this.closest('form')?.requestSubmit();
   }
   requestSubmit() { this.dispatchEvent({type: 'submit'}); }
-  focus() { this.ownerDocument.activeElement = this; }
+  // As in a browser, an element that is not in the document cannot take focus.
+  focus() { if (this.isConnected) this.ownerDocument.activeElement = this; }
   blur() { if (this.ownerDocument.activeElement === this) this.ownerDocument.activeElement = this.ownerDocument.body; }
   get visible() {
     for (let node = this; node; node = node.parentNode) if (node.hidden) return false;

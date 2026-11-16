@@ -64,7 +64,17 @@ body > .markview-review {
   font: inherit;
   resize: vertical;
 }
-.markview-review-selection { position: fixed; z-index: 20; }
+.markview-review-selection, .markview-review-selection-note { position: fixed; z-index: 20; }
+.markview-review-selection-note[hidden] { display: none !important; }
+.markview-review-selection-note {
+  max-width: 16rem;
+  padding: 0.25em 0.55em;
+  font: 0.9rem/1.45 system-ui, sans-serif;
+  color: var(--fg, #222);
+  background: var(--bg, white);
+  border: 1px solid var(--rule, #8886);
+  border-radius: 5px;
+}
 ::highlight(markview-annotations) { background: #a16ad961; text-decoration: underline #9563ca; }
 .markview-review-overlay { position: fixed; inset: 0; pointer-events: none; z-index: 4; }
 .markview-review-overlay > div { position: fixed; background: #a16ad941; border-bottom: 1px solid #9563ca; }

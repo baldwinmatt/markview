@@ -2,6 +2,14 @@ const {test} = require('node:test');
 const assert = require('node:assert/strict');
 const {createPage} = require('./support/review-dom.cjs');
 
+// node's assert describes both operands of a failed comparison by walking
+// them, and a DOM tree is one large cycle. Compare elements by identity.
+function focused(page, element) {
+  const describe = node => (node ? node[Symbol.for('nodejs.util.inspect.custom')]() : String(node));
+  const active = page.document.activeElement;
+  assert.ok(active === element, `focus is on ${describe(active)}, expected ${describe(element)}`);
+}
+
 function response(status, body) {
   return {status, ok: status >= 200 && status < 300, json: async () => body};
 }
@@ -177,14 +185,14 @@ test('Delete asks for confirmation in the card and sends nothing until confirmed
   const prompt = page.card('a1').querySelector('.markview-review-confirm');
   assert.equal(prompt.visible, true);
   assert.match(prompt.textContent, /Delete this comment\?/);
-  assert.equal(page.card('a2').querySelector('.markview-review-confirm'), null);
+  assert.ok(!page.card('a2').querySelector('.markview-review-confirm'));
   // The destructive choice takes focus, as the native dialog's default did.
-  assert.equal(page.document.activeElement, page.cardButton('a1', 'Confirm'));
+  focused(page, page.cardButton('a1', 'Confirm'));
 
   page.cardButton('a1', 'Confirm').click();
   await page.settle();
   assert.deepEqual(page.posts, [{op: 'delete', id: 'a1', store_revision: 'store-1', doc: '/doc.md'}]);
-  assert.equal(page.card('a1'), undefined);
+  assert.ok(!page.card('a1'));
   assert.equal(page.confirmCalls, 0);
 });
 
@@ -194,8 +202,8 @@ test('cancelling a delete sends nothing and restores the card actions', async ()
   page.cardButton('a1', 'Cancel').click();
   await page.settle();
   assert.deepEqual(page.posts, []);
-  assert.equal(page.card('a1').querySelector('.markview-review-confirm'), null);
-  assert.equal(page.document.activeElement, page.cardButton('a1', 'Delete'));
+  assert.ok(!page.card('a1').querySelector('.markview-review-confirm'));
+  focused(page, page.cardButton('a1', 'Delete'));
 
   // Escape is the keyboard way out of the prompt.
   page.cardButton('a1', 'Delete').click();
@@ -204,8 +212,8 @@ test('cancelling a delete sends nothing and restores the card actions', async ()
   await page.settle();
   assert.equal(escape.defaultPrevented, true);
   assert.deepEqual(page.posts, []);
-  assert.equal(page.card('a1').querySelector('.markview-review-confirm'), null);
-  assert.equal(page.document.activeElement, page.cardButton('a1', 'Delete'));
+  assert.ok(!page.card('a1').querySelector('.markview-review-confirm'));
+  focused(page, page.cardButton('a1', 'Delete'));
   assert.equal(page.confirmCalls, 0);
 });
 
@@ -238,17 +246,262 @@ test('replacing a draft asks in the composer instead of a native dialog', async 
 
   // Keeping the draft changes nothing and returns to it.
   page.button('Keep draft').click();
-  assert.equal(page.find('form').querySelector('.markview-review-confirm'), null);
+  assert.ok(!page.find('form').querySelector('.markview-review-confirm'));
   assert.equal(body.value, 'Unsaved thought');
-  assert.equal(page.document.activeElement, body);
+  focused(page, body);
 
   // Discarding it starts the edit that was asked for.
   page.cardButton('a1', 'Edit').click();
   page.button('Discard draft').click();
   assert.equal(body.value, 'Body of a1');
-  assert.equal(page.find('form').querySelector('.markview-review-confirm'), null);
+  assert.ok(!page.find('form').querySelector('.markview-review-confirm'));
   page.find('form').requestSubmit();
   await page.settle();
   assert.deepEqual(page.posts.map(post => post.op), ['edit']);
   assert.equal(page.confirmCalls, 0);
+});
+
+// A response that the test settles by hand, to observe the page meanwhile.
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return {promise, resolve, reject};
+}
+
+function openDocumentDraft(page, text) {
+  page.button('Comment on document').click();
+  const body = page.find('textarea');
+  body.value = text;
+  body.dispatchEvent({type: 'input'});
+  return body;
+}
+
+const messageOf = page => {
+  const message = page.find('.markview-review-message');
+  return message.hidden ? '' : message.textContent;
+};
+
+test('a conflict message is cleared once the refetched list arrives', async () => {
+  let annotations = [comment('a1')];
+  const refetch = deferred();
+  let gets = 0;
+  const page = await servePage(method => {
+    if (method === 'POST') return response(409, {error: 'annotation store changed on disk'});
+    gets += 1;
+    return gets === 1 ? response(200, review('store-1', annotations)) : refetch.promise;
+  });
+  page.card = id => page.panel.querySelectorAll('.markview-review-card').find(card => card.dataset.annotation === id);
+  page.card('a1').querySelectorAll('button').find(button => button.textContent === 'Resolve').click();
+  await page.settle();
+  assert.equal(messageOf(page), 'annotation store changed on disk');
+
+  annotations = [comment('a1', {status: 'resolved'})];
+  refetch.resolve(response(200, review('store-2', annotations)));
+  await page.settle();
+  assert.equal(messageOf(page), '');
+});
+
+test('an unavailable store message is cleared by the next successful list', async () => {
+  let fail = true;
+  const page = await servePage(() => (fail
+    ? response(500, {error: 'annotation store is unavailable'})
+    : response(200, review('store-1', [comment('a1')]))));
+  assert.equal(messageOf(page), 'annotation store is unavailable');
+  fail = false;
+  page.window.markviewReviewRefresh();
+  await page.settle();
+  assert.equal(messageOf(page), '');
+  assert.equal(page.panel.querySelectorAll('.markview-review-card').length, 1);
+});
+
+test('a selection over 1,000 characters is refused next to the selection, not in the panel', async () => {
+  const page = await servePage(() => response(200, review('store-1')));
+  page.main.append(page.h('p', {}, 'x'.repeat(1200)));
+  page.mutated(page.main);
+  const text = page.main.querySelector('p').childNodes[0];
+  const range = page.document.createRange();
+  range.setStart(text, 0);
+  range.setEnd(text, 1001);
+  page.select(range);
+  const note = page.document.querySelector('.markview-review-selection-note');
+  assert.equal(note.visible, true);
+  assert.equal(note.textContent, 'Select at most 1,000 characters to comment.');
+  assert.equal(note.getAttribute('role'), 'status');
+  assert.ok(note.style.left && note.style.top, 'positioned at the selection');
+  assert.equal(page.document.querySelector('.markview-review-selection').visible, false);
+  // The keyboard path gets the same answer in the same place.
+  page.document.dispatchEvent({type: 'keydown', key: 'K', ctrlKey: true, shiftKey: true, preventDefault() {}});
+  assert.equal(note.visible, true);
+  assert.equal(messageOf(page), '');
+  assert.equal(page.find('form').visible, false);
+
+  range.setEnd(text, 1000);
+  page.select(range);
+  assert.equal(note.visible, false);
+  assert.equal(page.document.querySelector('.markview-review-selection').visible, true);
+});
+
+test('Escape cancels an empty draft at once and asks before discarding text', async () => {
+  const page = await pageWithComments();
+  const composer = page.find('form');
+  const press = fields => {
+    const event = {type: 'keydown', key: 'Escape', ...fields};
+    page.find('textarea').dispatchEvent(event);
+    return event;
+  };
+
+  openDocumentDraft(page, '');
+  assert.equal(press().defaultPrevented, true);
+  assert.equal(composer.visible, false);
+
+  const body = openDocumentDraft(page, 'Worth keeping');
+  press();
+  assert.equal(composer.visible, true);
+  assert.equal(body.value, 'Worth keeping');
+  const prompt = composer.querySelector('.markview-review-confirm');
+  assert.match(prompt.textContent, /Discard the current comment draft\?/);
+  page.button('Keep draft').click();
+  assert.ok(!composer.querySelector('.markview-review-confirm'));
+  focused(page, body);
+
+  press();
+  page.button('Discard draft').click();
+  assert.equal(composer.visible, false);
+  assert.equal(page.confirmCalls, 0);
+
+  // An edit that changed nothing has nothing to lose either.
+  page.cardButton('a1', 'Edit').click();
+  press();
+  assert.equal(composer.visible, false);
+});
+
+test('Escape that ends an IME composition leaves the draft alone', async () => {
+  const page = await pageWithComments();
+  const composer = page.find('form');
+  openDocumentDraft(page, '');
+  for (const composing of [{isComposing: true}, {keyCode: 229}]) {
+    const event = {type: 'keydown', key: 'Escape', ...composing};
+    page.find('textarea').dispatchEvent(event);
+    assert.equal(event.defaultPrevented, false);
+    assert.equal(composer.visible, true);
+    assert.ok(!composer.querySelector('.markview-review-confirm'));
+  }
+});
+
+test('Cmd or Ctrl with Enter saves the draft', async () => {
+  for (const modifier of [{metaKey: true}, {ctrlKey: true}]) {
+    const page = await pageWithComments();
+    openDocumentDraft(page, 'Shortcut');
+    const event = {type: 'keydown', key: 'Enter', ...modifier};
+    page.find('textarea').dispatchEvent(event);
+    await page.settle();
+    assert.equal(event.defaultPrevented, true);
+    assert.deepEqual(page.posts, [{op: 'add', body: 'Shortcut', doc: '/doc.md'}]);
+  }
+});
+
+test('the selection can be commented on from the keyboard', async () => {
+  const page = await servePage(() => response(200, review('store-1')));
+  page.main.append(page.h('p', {}, 'first second third'));
+  page.mutated(page.main);
+  const text = page.main.querySelector('p').childNodes[0];
+  const range = page.document.createRange();
+  range.setStart(text, 6);
+  range.setEnd(text, 12);
+  page.select(range);
+  const button = page.document.querySelector('.markview-review-selection');
+  assert.match(button.getAttribute('title'), /Shift\+K/);
+  assert.equal(button.getAttribute('aria-keyshortcuts'), 'Control+Shift+K Meta+Shift+K');
+
+  let prevented = false;
+  page.document.dispatchEvent({type: 'keydown', key: 'K', metaKey: true, shiftKey: true, preventDefault() { prevented = true; }});
+  assert.equal(prevented, true);
+  assert.equal(page.find('form').visible, true);
+  assert.equal(page.find('form').querySelector('blockquote').textContent, 'second');
+  focused(page, page.find('textarea'));
+  // Without the modifiers the key is just a letter.
+  let plain = false;
+  page.document.dispatchEvent({type: 'keydown', key: 'k', preventDefault() { plain = true; }});
+  assert.equal(plain, false);
+});
+
+test('cards and their buttons are labelled with the comment they belong to', async () => {
+  const page = await servePage(() => response(200, review('store-1', [
+    comment('a1', {quote: 'only referenced assets are served', lines: [3, 3], range: null, attached: false}),
+    comment('a2'),
+  ])));
+  const cards = page.panel.querySelectorAll('.markview-review-card');
+  assert.equal(cards[0].getAttribute('aria-label'), 'Comment a1 on “only referenced assets are served”');
+  assert.equal(cards[1].getAttribute('aria-label'), 'Comment a2 on the document');
+  const labels = card => card.querySelectorAll('button').map(button => button.getAttribute('aria-label'));
+  assert.deepEqual(labels(cards[0]), ['Edit comment a1', 'Resolve comment a1', 'Delete comment a1']);
+  assert.deepEqual(labels(cards[1]), ['Edit comment a2', 'Resolve comment a2', 'Delete comment a2']);
+  // The accessible name starts with the visible label.
+  for (const button of cards[0].querySelectorAll('button')) assert.ok(button.getAttribute('aria-label').startsWith(button.textContent));
+});
+
+test('focus returns to the control that opened the draft after saving or cancelling', async () => {
+  const page = await pageWithComments();
+  const whole = page.button('Comment on document');
+
+  whole.click();
+  page.button('Cancel').click();
+  focused(page, whole);
+
+  openDocumentDraft(page, 'Saved');
+  page.find('form').requestSubmit();
+  await page.settle();
+  assert.equal(page.posts.length, 1);
+  focused(page, whole);
+
+  // Cards are rebuilt by a save, so the Edit button is a new element.
+  page.cardButton('a2', 'Edit').click();
+  focused(page, page.find('textarea'));
+  page.button('Cancel').click();
+  focused(page, page.cardButton('a2', 'Edit'));
+
+  page.cardButton('a2', 'Edit').click();
+  const body = page.find('textarea');
+  body.value = 'Edited';
+  body.dispatchEvent({type: 'input'});
+  page.find('form').requestSubmit();
+  await page.settle();
+  assert.equal(page.card('a2').querySelector('.markview-review-body').textContent, 'Edited');
+  focused(page, page.cardButton('a2', 'Edit'));
+});
+
+test('a reload keeps the previous comments on screen until the new list arrives', async () => {
+  const next = deferred();
+  let gets = 0;
+  const page = await servePage(() => {
+    gets += 1;
+    return gets === 1 ? response(200, review('store-1', [comment('a1')])) : next.promise;
+  });
+  const cards = () => page.panel.querySelectorAll('.markview-review-card').map(card => card.querySelector('.markview-review-body').textContent);
+  assert.deepEqual(cards(), ['Body of a1']);
+
+  // Live reload replaced the document: a new source revision, list pending.
+  page.main.dataset.sourceRevision = 'source-2';
+  page.window.markviewReviewRefresh();
+  await page.settle();
+  assert.equal(page.panel.visible, true);
+  assert.deepEqual(cards(), ['Body of a1']);
+
+  next.resolve(response(200, {source_revision: 'source-2', store_revision: 'store-1', annotations: [comment('a1', {body: 'Fresh', range: [0, 1]})]}));
+  await page.settle();
+  assert.deepEqual(cards(), ['Fresh']);
+});
+
+test('a failed list fetch says so and keeps what was shown', async () => {
+  let gets = 0;
+  const page = await servePage(() => {
+    gets += 1;
+    if (gets === 1) return response(200, review('store-1', [comment('a1')]));
+    throw new TypeError('Failed to fetch');
+  });
+  page.window.markviewReviewRefresh();
+  await page.settle();
+  assert.equal(messageOf(page), 'Could not load comments. Reload the page to try again.');
+  assert.equal(page.panel.querySelectorAll('.markview-review-card').length, 1);
 });

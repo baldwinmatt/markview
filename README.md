@@ -81,12 +81,15 @@ markview --annotations notes.md docs/
 markview --annotations --include-resolved notes.md
 ```
 
-Select rendered text and click **Comment**, or choose **Comment on document**.
-Use Cmd/Ctrl+Enter to save a draft and Escape to cancel it. Choose **Edit**,
-**Resolve**, **Reopen**, or **Delete** on a card. Existing comments are available
-for read-only review with `--serve` alone. In macOS Preview, comments share
-the table-of-contents sidebar. Use **View → Add Comment** (Cmd+Shift+K) on
-a selection. Save a dirty or untitled tab before adding a comment.
+Select rendered text and click **Comment** or press Ctrl/Cmd+Shift+K, or
+choose **Comment on document**. A selection can hold at most 1,000 characters.
+Use Cmd/Ctrl+Enter to save a draft and Escape to cancel it; Escape asks first
+if the draft has text. Choose **Edit**, **Resolve**, **Reopen**, or **Delete**
+on a card; **Delete** asks for confirmation in the card. Existing comments are
+available for read-only review with `--serve` alone. In macOS Preview, comments
+share the table-of-contents sidebar, which opens when you start a comment. Use
+**View → Add Comment** (Cmd+Shift+K) on a selection. Save a dirty or untitled
+tab before adding a comment.
 
 The browser and GUI update when the shared Markdown store changes. A comment
 whose text is missing or ambiguous stays visible as **Detached** with its

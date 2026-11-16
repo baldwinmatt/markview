@@ -194,6 +194,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
                 sync_view(&webview, &model, &preferences);
             }
+            Event::UserEvent(UserEvent::ShowSidebar) if reveal_sidebar(&mut preferences) => {
+                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
+                sync_view(&webview, &model, &preferences);
+            }
             Event::UserEvent(UserEvent::ToggleAutoRefresh) => {
                 preferences.auto_refresh = !preferences.auto_refresh;
                 persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
@@ -662,6 +666,7 @@ fn ipc_event(body: &str) -> Option<UserEvent> {
         "find" => UserEvent::FindRequested,
         "quit" => UserEvent::QuitRequested,
         "toggle-sidebar" => UserEvent::ToggleSidebar,
+        "show-sidebar" => UserEvent::ShowSidebar,
         "add-comment" => UserEvent::AddComment,
         "toggle-auto-refresh" => UserEvent::ToggleAutoRefresh,
         "cycle-theme" => UserEvent::CycleTheme,
@@ -1003,6 +1008,14 @@ fn sync_after_tab_mutation(
     sync_persisted_view(preferences_path, preferences, model, webview, window);
 }
 
+/// Makes the sidebar visible for the review panel inside it. Returns whether
+/// the preference changed, so the caller persists and pushes only then.
+fn reveal_sidebar(preferences: &mut GuiPreferences) -> bool {
+    let changed = !preferences.sidebar_visible;
+    preferences.sidebar_visible = true;
+    changed
+}
+
 fn sync_persisted_view(
     preferences_path: &Path,
     preferences: &mut GuiPreferences,
@@ -1102,6 +1115,7 @@ enum UserEvent {
     FindRequested,
     QuitRequested,
     ToggleSidebar,
+    ShowSidebar,
     ToggleAutoRefresh,
     CycleTheme,
     OpenExternal(String),
@@ -2244,8 +2258,14 @@ const review = createMarkviewReview(document.getElementById('document'), documen
   annotationRequests.set(id, {{resolve, reject}});
   window.ipc.postMessage(`annotation:${{id}}:${{form}}`);
 }}), () => {{
+  // The panel shares the sidebar. Show it now, and record that in state so
+  // the next state push (an auto-refresh, say) does not hide it again.
   document.getElementById('toc').classList.remove('hidden');
   document.querySelector('.content-shell').classList.remove('sidebar-hidden');
+  if (!window.markview.state.preferences.sidebarVisible && !window.markview.sidebarRevealed) {{
+    window.markview.sidebarRevealed = true;
+    window.ipc.postMessage('show-sidebar');
+  }}
 }});
 function receiveAnnotation(id, error) {{
   const request = annotationRequests.get(id);
@@ -2270,6 +2290,7 @@ const savedReadingState = readReadingState();
 window.markview = {{
   state: null,
   scrollPositions: new Map(savedReadingState.scrollPositions || []),
+  sidebarRevealed: false,
   editorPositions: new Map(savedReadingState.editorPositions || []),
   findQuery: savedReadingState.findQuery || '',
   findIndex: -1,
@@ -2326,8 +2347,11 @@ window.markview = {{
     const recent = document.getElementById('recent-files');
     document.documentElement.dataset.theme = next.preferences.theme === 'system' ? '' : next.preferences.theme;
     const sidebarToggle = document.getElementById('sidebar-toggle');
-    sidebarToggle.classList.toggle('active', next.preferences.sidebarVisible);
-    setTip(sidebarToggle, next.preferences.sidebarVisible ? 'Hide table of contents' : 'Show table of contents');
+    // A reveal for the review panel holds until the preference catches up.
+    if (next.preferences.sidebarVisible) this.sidebarRevealed = false;
+    const sidebarVisible = next.preferences.sidebarVisible || this.sidebarRevealed;
+    sidebarToggle.classList.toggle('active', sidebarVisible);
+    setTip(sidebarToggle, sidebarVisible ? 'Hide table of contents' : 'Show table of contents');
 
     const autoRefreshToggle = document.getElementById('auto-refresh-toggle');
     autoRefreshToggle.classList.toggle('active', next.preferences.autoRefresh);
@@ -2435,8 +2459,8 @@ window.markview = {{
         }}
       }});
       tocHeadings.replaceChildren();
-      toc.classList.toggle('hidden', !next.preferences.sidebarVisible);
-      shell.classList.toggle('sidebar-hidden', !next.preferences.sidebarVisible);
+      toc.classList.toggle('hidden', !sidebarVisible);
+      shell.classList.toggle('sidebar-hidden', !sidebarVisible);
       if (next.headings.length === 0) {{
         const empty = document.createElement('div');
         empty.className = 'toc-empty';
@@ -2820,6 +2844,7 @@ mod tests {
             ("find", "FindRequested"),
             ("quit", "QuitRequested"),
             ("toggle-sidebar", "ToggleSidebar"),
+            ("show-sidebar", "ShowSidebar"),
             ("toggle-auto-refresh", "ToggleAutoRefresh"),
             ("cycle-theme", "CycleTheme"),
             ("toggle-edit", "ToggleActiveEdit"),
@@ -2877,6 +2902,31 @@ mod tests {
         // One projection and one resolution, both from the write itself:
         // nothing is searched again on the UI thread.
         assert_eq!(model.review_cache().work(), (1, 1));
+    }
+
+    #[test]
+    fn revealing_the_review_panel_is_recorded_in_state() {
+        // The composer lives in the sidebar. Opening it for a comment must
+        // outlast the next state push, such as an auto-refresh.
+        let mut preferences = GuiPreferences {
+            sidebar_visible: false,
+            ..GuiPreferences::default()
+        };
+        assert!(reveal_sidebar(&mut preferences));
+        assert!(preferences.sidebar_visible);
+        assert!(!reveal_sidebar(&mut preferences), "already visible");
+
+        let shell = app_shell_html(&app_view_with_preferences(
+            &AppModel::new(),
+            GuiPreferences::default(),
+        ));
+        assert!(shell.contains("window.ipc.postMessage('show-sidebar')"));
+        // The page keeps the sidebar open until the state agrees.
+        assert!(shell.contains(
+            "const sidebarVisible = next.preferences.sidebarVisible || this.sidebarRevealed;"
+        ));
+        assert!(shell.contains("toc.classList.toggle('hidden', !sidebarVisible);"));
+        assert!(!shell.contains("toggle('hidden', !next.preferences.sidebarVisible)"));
     }
 
     #[test]

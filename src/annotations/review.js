@@ -103,7 +103,7 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
   panel.setAttribute('aria-label', 'Annotations');
   const toolbar = element('header', 'markview-review-toolbar');
   const count = element('strong');
-  const whole = button('Comment on document', () => startDraft({op: 'add'}));
+  const whole = button('Comment on document', () => startDraft({op: 'add'}, {control: whole}));
   const resolvedLabel = element('label');
   const resolvedToggle = element('input');
   resolvedToggle.type = 'checkbox';
@@ -116,11 +116,7 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
   const actions = element('div', 'markview-review-actions');
   const save = element('button', '', 'Save comment');
   save.type = 'submit';
-  const cancel = button('Cancel', () => {
-    keepDraft(null);
-    setMessage('');
-    renderComposer();
-  });
+  const cancel = button('Cancel', () => cancelDraft());
   const retry = button('Use latest version', () => {
     const draft = getDraft();
     if (draft?.op === 'edit' && review?.annotations.some(card => card.id === draft.id)) {
@@ -134,17 +130,23 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
   const cards = element('div', 'markview-review-cards');
   const selectionButton = button('Comment', () => addSelection());
   selectionButton.className = 'markview-review-selection';
+  selectionButton.setAttribute('title', 'Comment on the selection (Ctrl/Cmd+Shift+K)');
+  selectionButton.setAttribute('aria-keyshortcuts', 'Control+Shift+K Meta+Shift+K');
   selectionButton.addEventListener('pointerdown', event => event.preventDefault());
+  // Shown in place of the Comment button when the selection cannot be used,
+  // so the reason appears where the reader is looking.
+  const selectionNote = element('div', 'markview-review-selection-note', 'Select at most 1,000 characters to comment.');
+  selectionNote.setAttribute('role', 'status');
   actions.append(save, cancel, retry);
   composer.append(quote, body, actions);
   toolbar.append(count, whole, resolvedLabel);
   panel.append(toolbar, composer, message, cards);
   mount.append(panel);
-  document.body.append(selectionButton);
+  document.body.append(selectionButton, selectionNote);
   const fallback = element('div', 'markview-review-overlay');
   fallback.setAttribute('aria-hidden', 'true');
   document.body.append(fallback);
-  panel.hidden = selectionButton.hidden = true;
+  panel.hidden = selectionButton.hidden = selectionNote.hidden = true;
 
   let key = null;
   let revision = null;
@@ -158,10 +160,13 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
   // the cards are rebuilt: {id, label}.
   let deleting = null;
   let focusNext = null;
-  // The draft the reader asked to start while another one was open, and the
-  // prompt that asks whether to discard the open one for it.
-  let replacing = null;
-  let replacingPrompt = null;
+  // A pending question about discarding the open draft: {next, opener} when
+  // another draft should replace it, {next: null} when Escape would drop it.
+  let discarding = null;
+  let discardPrompt = null;
+  // What opened the current draft, to give focus back when it closes:
+  // {control} for a fixed button, {id, label} for a button on a card.
+  let opener = null;
   // The text points of `root`, kept until the document changes. Walking the
   // whole document on every `selectionchange` makes dragging a selection slow.
   let points = null;
@@ -209,17 +214,18 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
     message.textContent = text;
     message.hidden = !text;
   }
-  function startDraft(fields, discard = false) {
+  function startDraft(fields, from = null, discard = false) {
     if (!writable || (fields.op === 'add' && !canAdd) || pending.has(key)) return;
     const previous = getDraft();
     const reuseBody = previous?.op === 'add' && fields.op === 'add';
     if (previous && !reuseBody && !discard) {
-      replacing = fields;
+      discarding = {next: fields, opener: from};
       renderComposer();
       reveal();
       return;
     }
-    replacing = null;
+    discarding = null;
+    opener = from;
     keepDraft({body: reuseBody ? previous.body : '', ...fields});
     setMessage('');
     renderComposer();
@@ -227,15 +233,52 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
     if (panel.getClientRects().length) composer.scrollIntoView({block: 'nearest'});
     body.focus();
   }
+  // Whether the current draft holds text that cancelling would lose.
+  function draftHasText() {
+    const draft = getDraft();
+    if (!draft) return false;
+    if (draft.op !== 'edit') return draft.body.trim() !== '';
+    return draft.body !== review?.annotations.find(card => card.id === draft.id)?.body;
+  }
+  function cancelDraft() {
+    discarding = null;
+    keepDraft(null);
+    setMessage('');
+    renderComposer();
+    restoreFocus();
+  }
+  // Returns focus to whatever opened the draft. Cards are rebuilt when the
+  // list changes, so a card button is found again by its card and label.
+  function restoreFocus() {
+    const from = opener;
+    opener = null;
+    if (from?.control) from.control.focus();
+    else if (from?.id) {
+      const card = Array.from(cards.children).find(card => card.dataset.annotation === from.id);
+      const control = card && Array.from(card.querySelectorAll('button')).find(button => button.textContent === from.label);
+      (control || card)?.focus();
+    }
+  }
+  function tooLong(selection) { return [...selection.quote].length > 1000; }
+  // Places the Comment button, or the note that replaces it, at the selection.
+  function showSelection(selection) {
+    selectionButton.hidden = !selection || tooLong(selection);
+    selectionNote.hidden = !selection || !tooLong(selection);
+    if (!selection) return;
+    const rect = window.getSelection().getRangeAt(0).getBoundingClientRect();
+    for (const node of [selectionButton, selectionNote]) {
+      node.style.left = Math.max(4, Math.min(rect.right, window.innerWidth - 95)) + 'px';
+      node.style.top = Math.max(4, rect.top - 34) + 'px';
+    }
+  }
   function addSelection() {
     const selection = markviewReviewSelection(root, window.getSelection(), textPoints()) || selected;
     if (!key || !canAdd || !selection) return;
-    if ([...selection.quote].length > 1000) {
-      setMessage('Select at most 1,000 characters.');
-      selectionButton.hidden = true;
+    if (tooLong(selection)) {
+      showSelection(selection);
       return;
     }
-    selectionButton.hidden = true;
+    showSelection(null);
     selected = null;
     startDraft({op: 'add', ...selection, source_revision: revision});
   }
@@ -243,19 +286,23 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
     const draft = getDraft();
     composer.hidden = !writable || !draft;
     refreshMessage();
-    if (!draft || !writable) replacing = null;
-    if (!replacing && replacingPrompt) {
-      replacingPrompt.remove();
-      replacingPrompt = null;
-    } else if (replacing && !replacingPrompt) {
+    if (!draft || !writable) discarding = null;
+    if (!discarding && discardPrompt) {
+      discardPrompt.remove();
+      discardPrompt = null;
+    } else if (discarding && !discardPrompt) {
       const {prompt, confirm} = confirmation('Discard the current comment draft?', 'Discard draft', 'Keep draft',
-        () => startDraft(replacing, true),
         () => {
-          replacing = null;
+          const {next, opener: from} = discarding;
+          if (next) startDraft(next, from, true);
+          else cancelDraft();
+        },
+        () => {
+          discarding = null;
           renderComposer();
           body.focus();
         });
-      replacingPrompt = prompt;
+      discardPrompt = prompt;
       composer.append(prompt);
       confirm.focus();
     }
@@ -284,6 +331,10 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
       const result = await submit(new URLSearchParams(fields));
       if (draft && drafts.get(documentKey) === draft) keepDraft(null, documentKey);
       if (key === documentKey && revision === source && result?.source_revision === revision) update(result);
+      if (draft && key === documentKey) {
+        renderComposer();
+        restoreFocus();
+      }
     } catch (error) {
       setMessage(error.message || 'Could not save the comment.', documentKey);
     } finally {
@@ -308,8 +359,14 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
   });
   composer.addEventListener('keydown', event => {
     if (event.key === 'Escape') {
+      // An input method uses Escape to close its candidate window.
+      if (event.isComposing || event.keyCode === 229) return;
       event.preventDefault();
-      cancel.click();
+      if (cancel.disabled) return;
+      if (draftHasText()) {
+        discarding = {next: null};
+        renderComposer();
+      } else cancelDraft();
     } else if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
       event.preventDefault();
       composer.requestSubmit();
@@ -355,7 +412,9 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
     resolvedToggle.checked = Boolean(showResolved.get(key));
     resolvedLabel.hidden = !entries.some(entry => entry.status === 'resolved');
     count.textContent = openCount + (openCount === 1 ? ' open comment' : ' open comments');
-    const focused = document.activeElement?.closest('.markview-review-card')?.dataset.annotation;
+    const active = document.activeElement;
+    const focused = active?.closest('.markview-review-card')?.dataset.annotation;
+    const focusedLabel = active?.tagName === 'BUTTON' ? active.textContent : null;
     if (!writable || !entries.some(entry => entry.id === deleting)) deleting = null;
     cards.replaceChildren();
     for (const entry of entries) {
@@ -363,6 +422,15 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
       const card = element('article', 'markview-review-card');
       card.tabIndex = 0;
       card.dataset.annotation = entry.id;
+      // Every card has the same buttons, so each one names its comment.
+      const about = 'comment ' + entry.id;
+      const excerpt = entry.quote && (Array.from(entry.quote).length > 60 ? Array.from(entry.quote).slice(0, 59).join('') + '…' : entry.quote);
+      card.setAttribute('aria-label', 'Comment ' + entry.id + (excerpt ? ' on “' + excerpt + '”' : ' on the document'));
+      const cardButton = (label, purpose, action) => {
+        const node = button(label, action);
+        node.setAttribute('aria-label', label + ' ' + purpose);
+        return node;
+      };
       const line = entry.lines ? (entry.lines[0] === entry.lines[1] ? 'Line ' + entry.lines[0] : 'Lines ' + entry.lines.join('–')) : 'Document';
       const label = [entry.id, line, entry.section, !entry.attached && 'Detached', entry.status === 'resolved' && 'Resolved'].filter(Boolean);
       card.append(element('div', 'markview-review-label', label.join(' · ')));
@@ -387,27 +455,27 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
             focusNext = {id: entry.id, label: 'Delete'};
             render();
           });
+        for (const node of prompt.querySelectorAll('button')) node.setAttribute('aria-label', node.textContent + ' deleting ' + about);
         controls.Confirm = confirm;
         card.append(prompt);
       } else if (writable) {
         const cardActions = element('div', 'markview-review-actions');
         const fields = {id: entry.id, store_revision: review.store_revision};
         const nextStatus = entry.status === 'open' ? 'resolved' : 'open';
-        controls.Delete = button('Delete', () => {
+        const statusLabel = entry.status === 'open' ? 'Resolve' : 'Reopen';
+        controls.Edit = cardButton('Edit', about, () => startDraft({op: 'edit', ...fields, body: entry.body}, {id: entry.id, label: 'Edit'}));
+        controls[statusLabel] = cardButton(statusLabel, about, () => send({op: 'status', ...fields, status: nextStatus}));
+        controls.Delete = cardButton('Delete', about, () => {
           deleting = entry.id;
           focusNext = {id: entry.id, label: 'Confirm'};
           render();
         });
-        cardActions.append(
-          button('Edit', () => startDraft({op: 'edit', ...fields, body: entry.body})),
-          button(entry.status === 'open' ? 'Resolve' : 'Reopen', () => send({op: 'status', ...fields, status: nextStatus})),
-          controls.Delete
-        );
+        cardActions.append(controls.Edit, controls[statusLabel], controls.Delete);
         card.append(cardActions);
       }
       cards.append(card);
       if (focusNext?.id === entry.id && controls[focusNext.label]) controls[focusNext.label].focus();
-      else if (focused === entry.id) card.focus({preventScroll: true});
+      else if (focused === entry.id) (controls[focusedLabel] || card).focus({preventScroll: true});
     }
     focusNext = null;
     renderComposer();
@@ -432,36 +500,34 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
     if (!key || !canAdd) return;
     const selection = window.getSelection();
     selected = selection && !selection.isCollapsed ? markviewReviewSelection(root, selection, textPoints()) : null;
-    selectionButton.hidden = !selected;
-    if (selected) {
-      const rect = window.getSelection().getRangeAt(0).getBoundingClientRect();
-      selectionButton.style.left = Math.max(4, Math.min(rect.right, window.innerWidth - 95)) + 'px';
-      selectionButton.style.top = Math.max(4, rect.top - 34) + 'px';
-    }
+    showSelection(selected);
   });
-  document.addEventListener('scroll', () => { selectionButton.hidden = true; paintFallback(); }, true);
+  document.addEventListener('scroll', () => { showSelection(null); paintFallback(); }, true);
   window.addEventListener('resize', paintFallback);
 
   function update(data) {
     if (!key || data.source_revision !== revision) return;
-    if (review?.store_revision === data.store_revision) { repaint(); return; }
+    // A list that arrived supersedes what the last request complained about.
+    const hadMessage = Boolean(errors.get(key));
+    errors.delete(key);
+    const same = review?.store_revision === data.store_revision && review.source_revision === data.source_revision;
+    if (same && !hadMessage) { repaint(); return; }
     review = data;
     render();
   }
   return {
     show(documentKey, nextRevision, write, add) {
       if (key === documentKey && revision === nextRevision && writable === write && canAdd === add) return;
-      if (key !== documentKey || revision !== nextRevision) {
-        review = null;
-        points = null;
-      }
-      if (key !== documentKey) deleting = replacing = null;
+      if (key !== documentKey || revision !== nextRevision) points = null;
+      // Another revision of the same document keeps its comments on screen
+      // until the new list arrives, instead of flashing an empty panel.
+      if (key !== documentKey) review = deleting = discarding = opener = null;
       key = documentKey;
       revision = nextRevision;
       writable = write;
       canAdd = add;
       selected = null;
-      selectionButton.hidden = true;
+      showSelection(null);
       render();
     },
     update,
@@ -472,8 +538,14 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
       repaint();
     },
     addSelection,
+    // The annotations cannot be read at all: show why instead of a list.
     unavailable(message) {
       review = null;
+      setMessage(message);
+      render();
+    },
+    // One request for them failed: say so and keep what is on screen.
+    failed(message) {
       setMessage(message);
       render();
     }
@@ -503,15 +575,27 @@ function markviewServeReview(route, token, port) {
     review.show(route, revision, Boolean(token), Boolean(token));
     try {
       const response = await fetch(endpoint + '?doc=' + encodeURIComponent(route), {cache: 'no-store'});
-      if (response.status === 403 && sequence === requested) {
+      if (sequence !== requested) return;
+      if (response.status === 403) {
         // The server answers `/_markview/` only for its loopback Host.
         review.unavailable('Open this page at localhost:' + port + ' to review.');
         return;
       }
       const data = await response.json();
-      if (sequence === requested && response.ok && revision === data.source_revision) review.update(data);
-    } catch { /* Live reload will retry on the next change. */ }
+      if (sequence !== requested) return;
+      if (!response.ok) review.unavailable(data.error || 'Could not load comments.');
+      else if (revision === data.source_revision) review.update(data);
+    } catch {
+      if (sequence === requested) review.failed('Could not load comments. Reload the page to try again.');
+    }
   };
+  // The Comment button follows the pointer's selection. This is the same
+  // action for the keyboard, with the shortcut the macOS app uses.
+  document.addEventListener('keydown', event => {
+    if (!(event.metaKey || event.ctrlKey) || !event.shiftKey || event.key.toLowerCase() !== 'k') return;
+    event.preventDefault();
+    review.addSelection();
+  });
   window.markviewReviewRoute = route;
   return window.markviewReviewRefresh();
 }

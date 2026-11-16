@@ -21,6 +21,12 @@ class StubNode {
     for (let node = other; node; node = node.parentNode) if (node === this) return true;
     return false;
   }
+  // A failed assertion prints its operands. Without this, node walks the
+  // whole cyclic tree to describe one element and runs out of memory.
+  [Symbol.for('nodejs.util.inspect.custom')]() {
+    const name = this.nodeType === 3 ? '#text' : this.tagName.toLowerCase() + (this.className ? '.' + this.className : '');
+    return `<${name} ${JSON.stringify(this.textContent.slice(0, 40))}>`;
+  }
 }
 
 class StubText extends StubNode {

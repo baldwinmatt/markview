@@ -1646,7 +1646,12 @@ fn serve_document(
     stores.served(&document.source_path, review.is_some());
     match render_file(config, document, review) {
         Ok(html) => {
-            let policy = nonce.map(|nonce| format!("Content-Security-Policy: default-src 'self'; script-src 'nonce-{nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' https: http: data:; object-src 'none'; base-uri 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'none'\r\n"));
+            let policy = nonce.map(|nonce| {
+                format!(
+                    "Content-Security-Policy: {}\r\n",
+                    serve_annotations::content_security_policy(&nonce)
+                )
+            });
             write_response_headers(
                 &mut *stream,
                 "200 OK",
@@ -2583,6 +2588,12 @@ mod serve_nav_tests {
             .expect("serve config");
 
         assert!(config.sidebar_nav.is_some());
+    }
+
+    #[test]
+    fn serve_listener_binds_to_loopback_only() {
+        let listener = bind_serve_listener(0).unwrap();
+        assert!(listener.local_addr().unwrap().ip().is_loopback());
     }
 
     #[test]

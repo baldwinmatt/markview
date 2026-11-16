@@ -68,7 +68,7 @@ Done when `/` returns `200`. Then give the user the URL, the PID, and `kill <PID
 - For a directory, `/` selects the top-level `README.md`, else top-level `index.md` (both matched case-insensitively), else the first Markdown relative path in alphabetical byte order. For explicit files, `/` serves the first FILE argument.
 - A directory containing one document has an empty navigation area; larger collections list their discovered documents.
 - Discovery covers `.md`, `.markdown`, and `.mdown`. Hidden files/directories and symlinked directories are skipped for document discovery.
-- Asset discovery scans only relative Markdown `![]()` and `[]()` destinations, including reference-style Markdown links. Assets must resolve under the root; referenced assets inside hidden directories are allowed outside the annotation store. Raw HTML such as `<img src>` and absolute destinations do not add assets to the allowlist, so those files return 404 unless independently allowlisted. The favicon route has its own local-file/built-in fallback.
+- Asset discovery scans only relative Markdown `![]()` and `[]()` destinations, including reference-style Markdown links. Assets must resolve under the root; referenced assets inside hidden directories are allowed, except that nothing under a `.markview` directory is ever served. Raw HTML such as `<img src>` and absolute destinations do not add assets to the allowlist, so those files return 404 unless independently allowlisted. The favicon route has its own local-file/built-in fallback.
 - Only served documents and allowlisted assets are accessible; other files return 404.
 - Edits, additions, and removals on disk reach open browser tabs automatically, so a running server needs no restart.
 - The server binds to `127.0.0.1`. For a remote host, the user forwards the port first: `ssh -L <PORT>:localhost:<PORT> user@host`.
@@ -82,3 +82,12 @@ comments. Read the source and address the requested changes. Re-read each
 store immediately before editing, change the addressed section header from
 `[open]` to `[resolved]`, and verify the status after saving. Preserve
 unrelated sections and any user-written preamble.
+
+Header lines must stay exactly `## a<N> [open|resolved] <anchor>`, where the
+anchor is `line <n>`, `lines <n>-<m>` or `document`. Change only the word in
+the brackets. Do not change its case (`[Resolved]`, `[OPEN]`), add a second
+space anywhere, leave a trailing space, or renumber the ID: any of those turns
+the header into comment text and the annotation disappears from the list.
+`markview --annotations` warns on stderr about a header that almost parses,
+and exits non-zero with `error: <document>: <problem>` lines if a store cannot
+be read, so check stderr and the exit status after editing.

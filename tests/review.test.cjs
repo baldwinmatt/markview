@@ -505,3 +505,306 @@ test('a failed list fetch says so and keeps what was shown', async () => {
   assert.equal(messageOf(page), 'Could not load comments. Reload the page to try again.');
   assert.equal(page.panel.querySelectorAll('.markview-review-card').length, 1);
 });
+
+// --- The pure functions that map between Rust's offsets and the DOM ---
+
+function documentOf(page, ...children) {
+  page.main.append(...children);
+  return page.context.markviewReviewText(page.main);
+}
+
+test('text points skip every Unicode White_Space character and nothing else', () => {
+  const page = createPage();
+  const {h} = page;
+  // Space, tab, line feed, no-break space, NEL, line separator, ideographic
+  // space and thin space are White_Space. A zero-width space is not.
+  const points = documentOf(page, h('p', {}, 'a b\tc\nd e\u0085f g　h i​j'));
+  assert.equal(points.map(point => point.scalar).join(''), 'abcdefghi​j');
+  // A gap is recorded where whitespace separated two points, for quotes.
+  // (The script runs in its own realm, so copy its array before comparing.)
+  assert.deepEqual(Array.from(points, point => point.gap), [true, true, true, true, true, true, true, true, true, false, false]);
+});
+
+test('text points follow DOM order and leave out images, controls and footnote numerals', () => {
+  const page = createPage();
+  const {h} = page;
+  const points = documentOf(page,
+    h('h1', {}, 'Title'),
+    h('p', {}, 'one', h('img', {alt: 'not text', src: 'x.png'}), h('strong', {}, 'two'),
+      h('sup', {class: 'footnote-reference'}, h('a', {href: '#1'}, '1'))),
+    h('ul', {}, h('li', {}, h('input', {type: 'checkbox'}), 'task')),
+    h('pre', {}, h('code', {}, h('span', {class: 'diff-line diff-addition'}, '+new\n'), ' context\n')),
+    h('div', {class: 'footnote-definition'}, h('sup', {class: 'footnote-definition-label'}, '1'), h('p', {}, 'Note')));
+  assert.equal(points.map(point => point.scalar).join(''), 'Titleonetwotask+newcontextNote');
+  // Block boundaries separate words in a quote even with no whitespace
+  // text between them. Inline elements do not: "one" and "two" touch.
+  const words = points.map((point, index) => (index && point.gap ? ' ' : '') + point.scalar).join('');
+  assert.equal(words, 'Title onetwo task +new context Note');
+});
+
+test('scalar offsets become DOM ranges that do not split supplementary characters', () => {
+  const page = createPage();
+  const {h} = page;
+  // Each emoji is one scalar and two UTF-16 code units.
+  const points = documentOf(page, h('p', {}, 'a😀b ', h('em', {}, '𝒳y')), h('p', {}, 'z'));
+  assert.equal(points.length, 6);
+  const text = range => range.startContainer === range.endContainer
+    ? range.startContainer.data.slice(range.startOffset, range.endOffset)
+    : range.startContainer.data.slice(range.startOffset) + '|' + range.endContainer.data.slice(0, range.endOffset);
+  const range = offsets => page.context.markviewReviewRange(points, offsets);
+  assert.equal(text(range([1, 2])), '😀');
+  assert.deepEqual([range([1, 2]).startOffset, range([1, 2]).endOffset], [1, 3]);
+  assert.equal(text(range([0, 3])), 'a😀b');
+  assert.equal(text(range([3, 4])), '𝒳');
+  // A range may cross inline and block boundaries.
+  assert.equal(text(range([2, 6])), 'b |z');
+  // Empty, reversed and out-of-bounds offsets give no range.
+  for (const offsets of [[2, 2], [3, 1], [0, 7], [6, 7]]) assert.equal(range(offsets), null);
+});
+
+test('a selection round-trips through offsets, including across elements', () => {
+  const page = createPage();
+  const {h} = page;
+  const points = documentOf(page, h('p', {}, 'one ', h('strong', {}, 'two'), ' 😀 three'));
+  const range = page.context.markviewReviewRange(points, [3, 7]);
+  const selection = {rangeCount: 1, isCollapsed: false, getRangeAt: () => range};
+  assert.deepEqual({...page.context.markviewReviewSelection(page.main, selection)}, {quote: 'two 😀', start: 3, end: 7});
+  // Collapsed, missing, multi-range and outside selections are not captured.
+  const outside = page.document.createRange();
+  const elsewhere = h('p', {}, 'navigation');
+  page.document.body.append(elsewhere);
+  outside.setStart(elsewhere.childNodes[0], 0);
+  outside.setEnd(elsewhere.childNodes[0], 4);
+  for (const rejected of [null, {...selection, isCollapsed: true}, {...selection, rangeCount: 2}, {...selection, getRangeAt: () => outside}]) {
+    assert.equal(page.context.markviewReviewSelection(page.main, rejected), null);
+  }
+});
+
+test('overlapping open comments are all highlighted and resolved ones are not', async () => {
+  const page = await servePage(() => response(200, review('store-1', [
+    comment('a1', {range: [0, 9], quote: 'first sec', lines: [1, 1]}),
+    comment('a2', {range: [5, 11], quote: 'second', lines: [1, 1]}),
+    comment('a3', {range: [5, 11], quote: 'second', lines: [1, 1], status: 'resolved'}),
+    comment('a4', {range: null, quote: 'gone', lines: [9, 9], attached: false}),
+  ])));
+  page.main.append(page.h('p', {}, 'first second third'));
+  page.mutated(page.main);
+  page.window.markviewReviewRefresh();
+  await page.settle();
+  const highlight = page.highlights.get('markview-annotations');
+  assert.equal(highlight.size, 2);
+  const spans = highlight.ranges.map(range => range.startContainer.data.slice(range.startOffset, range.endOffset));
+  assert.deepEqual(spans, ['first seco', 'second']);
+  // Highlighting never edits the document.
+  assert.equal(page.main.querySelectorAll('p').length, 1);
+  assert.equal(page.main.textContent, 'first second third');
+  // The detached comment keeps its card, quote and last known line.
+  const detached = page.panel.querySelectorAll('.markview-review-card').find(card => card.dataset.annotation === 'a4');
+  assert.match(detached.querySelector('.markview-review-label').textContent, /a4 · Line 9 · Detached/);
+  assert.equal(detached.querySelector('blockquote').textContent, 'gone');
+});
+
+test('comment text is shown as text, never as markup', async () => {
+  const page = await servePage(() => response(200, review('store-1', [comment('a1', {body: '<b>bold</b>\n<script>alert(1)</script>'})])));
+  const body = page.find('.markview-review-body');
+  assert.equal(body.textContent, '<b>bold</b>\n<script>alert(1)</script>');
+  assert.equal(body.children.length, 0);
+});
+
+test('an annotation-only update leaves the document and an open draft alone', async () => {
+  let annotations = [comment('a1', {range: [0, 5]})];
+  let store = 1;
+  const page = await servePage(() => response(200, review('store-' + store, annotations)));
+  page.main.append(page.h('p', {}, 'first second'));
+  page.mutated(page.main);
+  const paragraph = page.main.querySelector('p');
+  const text = paragraph.childNodes[0];
+  const body = openDocumentDraft(page, 'Half-written');
+
+  // The store changes on disk: the page refetches the list only.
+  annotations = [comment('a1', {range: [0, 5], status: 'resolved'}), comment('a2')];
+  store = 2;
+  page.window.markviewReviewRefresh();
+  await page.settle();
+  assert.ok(page.main.querySelector('p') === paragraph && paragraph.childNodes[0] === text, 'document nodes were replaced');
+  assert.equal(page.main.scrolledIntoView + paragraph.scrolledIntoView, 0);
+  assert.equal(body.value, 'Half-written');
+  assert.equal(page.find('form').visible, true);
+  assert.equal(page.find('strong').textContent, '1 open comment');
+  // The draft also survives a page reload, through session storage.
+  assert.equal(JSON.parse(page.storage.get('markview-review:/doc.md')).body, 'Half-written');
+});
+
+// --- Behaviour the specification promises, one promise per test ---
+
+// A panel driven directly, as the macOS app drives it: `submit` receives the
+// form and returns a promise the test settles.
+function directPage(submit = () => new Promise(() => {})) {
+  const page = createPage();
+  page.mount = page.h('aside');
+  page.document.body.append(page.mount);
+  page.review = page.context.createMarkviewReview(page.main, page.mount, submit);
+  page.panel = page.mount.querySelector('.markview-review');
+  page.find = selector => page.panel.querySelector(selector);
+  page.button = label => page.panel.querySelectorAll('button').find(button => button.textContent === label && button.visible);
+  page.cards = () => page.panel.querySelectorAll('.markview-review-card');
+  return page;
+}
+
+test('resolved comments stay out of the list until asked for, and can be reopened', async () => {
+  const page = await pageWithComments();
+  page.cardButton('a1', 'Resolve').click();
+  await page.settle();
+  assert.deepEqual(page.posts, [{op: 'status', id: 'a1', store_revision: 'store-1', status: 'resolved', doc: '/doc.md'}]);
+});
+
+test('the resolved toggle is off by default and reveals a Reopen action', async () => {
+  const posts = [];
+  const page = await servePage((method, form) => {
+    if (method === 'POST') posts.push(Object.fromEntries(form));
+    return response(200, review('store-1', [comment('a1'), comment('a2', {status: 'resolved'})]));
+  });
+  const ids = () => page.panel.querySelectorAll('.markview-review-card').map(card => card.dataset.annotation);
+  assert.deepEqual(ids(), ['a1']);
+  assert.equal(page.find('strong').textContent, '1 open comment');
+  const toggle = page.find('input');
+  assert.equal(toggle.checked, false);
+  toggle.checked = true;
+  toggle.dispatchEvent({type: 'change'});
+  assert.deepEqual(ids(), ['a1', 'a2']);
+  page.button('Reopen').click();
+  await page.settle();
+  assert.deepEqual(posts, [{op: 'status', id: 'a2', store_revision: 'store-1', status: 'open', doc: '/doc.md'}]);
+});
+
+test('a read-only page lists comments without any way to change them', async () => {
+  const page = createPage();
+  page.fetch = async () => response(200, review('store-1', [comment('a1', {quote: 'quoted', lines: [2, 3], section: 'Intro > Scope', range: null, attached: false})]));
+  await page.context.markviewServeReview('/doc.md', null, 7878);
+  const panel = page.document.querySelector('.markview-review');
+  assert.equal(panel.visible, true);
+  const card = panel.querySelector('.markview-review-card');
+  assert.equal(card.querySelector('.markview-review-label').textContent, 'a1 · Lines 2–3 · Intro > Scope · Detached');
+  assert.equal(card.querySelector('blockquote').textContent, 'quoted');
+  assert.deepEqual(panel.querySelectorAll('button').filter(button => button.visible), []);
+  assert.equal(panel.querySelector('form').visible, false);
+});
+
+test('a comment over 10,000 characters is refused with a message and kept as a draft', async () => {
+  const page = await pageWithComments();
+  const body = openDocumentDraft(page, '😀'.repeat(10001));
+  page.find('form').requestSubmit();
+  await page.settle();
+  assert.deepEqual(page.posts, []);
+  assert.equal(messageOf(page), 'Comments can contain at most 10,000 characters.');
+  assert.equal([...body.value].length, 10001);
+  // Exactly 10,000 scalars, each two UTF-16 units, is accepted.
+  body.value = '😀'.repeat(10000);
+  body.dispatchEvent({type: 'input'});
+  page.find('form').requestSubmit();
+  await page.settle();
+  assert.equal(page.posts.length, 1);
+});
+
+test('a text draft is kept but cannot be saved once the document has changed', () => {
+  const page = directPage();
+  page.main.append(page.h('p', {}, 'first second'));
+  page.review.show('doc', 'source-1', true, true);
+  page.review.update(review('store-1'));
+  const text = page.main.querySelector('p').childNodes[0];
+  const range = page.document.createRange();
+  range.setStart(text, 6);
+  range.setEnd(text, 12);
+  page.select(range);
+  page.review.addSelection();
+  const body = page.find('textarea');
+  body.value = 'About this word';
+  body.dispatchEvent({type: 'input'});
+  assert.equal(page.find('form').querySelectorAll('button')[0].disabled, false);
+
+  // The document is edited and re-rendered: the selection's offsets are stale.
+  page.review.show('doc', 'source-2', true, true);
+  page.review.update({source_revision: 'source-2', store_revision: 'store-1', annotations: []});
+  assert.equal(page.find('form').visible, true);
+  assert.equal(body.value, 'About this word');
+  assert.equal(page.find('form').querySelector('blockquote').textContent, 'second');
+  assert.equal(page.find('form').querySelectorAll('button')[0].disabled, true);
+  assert.equal(page.find('.markview-review-message').textContent, 'The document changed. Select the text again to continue this draft.');
+  // The stored draft still names the revision it was made against.
+  assert.equal(JSON.parse(page.storage.get('markview-review:doc')).source_revision, 'source-1');
+});
+
+test('an edit draft made against an older list offers the latest version', () => {
+  const page = directPage();
+  page.review.show('doc', 'source-1', true, true);
+  page.review.update(review('store-1', [comment('a1')]));
+  page.cards()[0].querySelectorAll('button').find(button => button.textContent === 'Edit').click();
+  const body = page.find('textarea');
+  body.value = 'My edit';
+  body.dispatchEvent({type: 'input'});
+  page.review.update(review('store-2', [comment('a1', {body: 'Changed elsewhere'})]));
+  assert.equal(body.value, 'My edit');
+  assert.equal(page.find('.markview-review-message').textContent, 'The annotations changed. Review the latest comment before saving this draft.');
+  assert.equal(page.button('Save comment').disabled, true);
+  page.button('Use latest version').click();
+  assert.equal(page.button('Save comment').disabled, false);
+  assert.equal(JSON.parse(page.storage.get('markview-review:doc')).store_revision, 'store-2');
+});
+
+test('clicking a highlight focuses its card and clicking a card scrolls to its highlight', () => {
+  const page = directPage();
+  page.main.append(page.h('p', {}, 'first second'));
+  page.review.show('doc', 'source-1', false, false);
+  page.review.update(review('store-1', [
+    comment('a1', {range: [0, 5], quote: 'first', lines: [1, 1]}),
+    comment('a2', {range: null, quote: 'gone', lines: [4, 4], attached: false}),
+  ]));
+  const paragraph = page.main.querySelector('p');
+  const [attached, detached] = page.cards();
+  // The stub lays every range out at (0,0)-(10,10).
+  page.main.dispatchEvent({type: 'click', target: paragraph, clientX: 5, clientY: 5});
+  focused(page, attached);
+  page.main.dispatchEvent({type: 'click', target: paragraph, clientX: 50, clientY: 50});
+  focused(page, attached);
+
+  attached.dispatchEvent({type: 'click', target: attached});
+  assert.equal(paragraph.scrolledIntoView, 1);
+  // A detached comment has no highlight to go to.
+  detached.dispatchEvent({type: 'click', target: detached});
+  detached.dispatchEvent({type: 'keydown', key: 'Enter', target: detached});
+  assert.equal(paragraph.scrolledIntoView, 1);
+  attached.dispatchEvent({type: 'keydown', key: 'Enter', target: attached});
+  assert.equal(paragraph.scrolledIntoView, 2);
+});
+
+test('an unsaved tab shows comments and a hint, but takes no new ones', () => {
+  const page = directPage();
+  page.review.show('doc', 'source-1', true, false);
+  page.review.update(review('store-1', [comment('a1')]));
+  assert.equal(page.find('.markview-review-message').textContent, 'Save to comment.');
+  assert.equal(page.button('Comment on document'), undefined);
+  assert.equal(page.cards().length, 1);
+  page.review.addSelection();
+  assert.equal(page.find('form').visible, false);
+  // Existing comments can still be resolved.
+  assert.ok(page.cards()[0].querySelectorAll('button').some(button => button.textContent === 'Resolve'));
+});
+
+test('a response that arrives after switching documents is not applied to the new one', async () => {
+  const saved = deferred();
+  const page = directPage(() => saved.promise);
+  page.review.show('first', 'source-1', true, true);
+  page.review.update(review('store-1'));
+  openDocumentDraft(page, 'For the first document');
+  page.find('form').requestSubmit();
+  // The reader switches tabs while the save is in flight.
+  page.review.show('second', 'source-9', true, true);
+  page.review.update({source_revision: 'source-9', store_revision: 'other', annotations: []});
+  saved.resolve(review('store-2', [comment('a1', {body: 'For the first document'})]));
+  await page.settle();
+  assert.equal(page.cards().length, 0);
+  assert.equal(page.find('strong').textContent, '0 open comments');
+  // Back on the first document, its draft is gone because it was saved.
+  page.review.show('first', 'source-1', true, true);
+  assert.equal(page.find('form').visible, false);
+});

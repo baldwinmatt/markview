@@ -157,6 +157,117 @@ fn assert_parity(name: &str, source: &str) {
     assert!(!dom.is_empty(), "{name}: empty document");
 }
 
+/// The rendered corpus in `tests/fixtures/parity`: one Markdown file per
+/// area of the renderer, each a document a reviewer could annotate.
+fn corpus() -> Vec<(String, String)> {
+    let mut files: Vec<_> = std::fs::read_dir("tests/fixtures/parity")
+        .expect("parity corpus")
+        .map(|entry| entry.expect("corpus entry").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "md"))
+        .collect();
+    files.sort();
+    files
+        .into_iter()
+        .map(|path| {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            (name, std::fs::read_to_string(&path).expect("corpus file"))
+        })
+        .collect()
+}
+
+#[test]
+fn projection_matches_the_dom_across_the_rendered_corpus() {
+    let corpus = corpus();
+    let names: Vec<_> = corpus.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "blocks.md",
+            "code-and-diff.md",
+            "footnotes.md",
+            "html-and-mojibake.md",
+            "inline.md",
+            "unicode.md"
+        ]
+    );
+    for (name, source) in &corpus {
+        assert_parity(name, source);
+        assert_parity(&format!("{name} with CRLF"), &source.replace('\n', "\r\n"));
+        // Serve rewrites link and image destinations. That must leave the
+        // text, and so every annotation offset, exactly as it was.
+        let rewritten = crate::HtmlRenderer
+            .render_with_destinations(&crate::MarkdownDocument::new(source.as_str()), |_, _| {
+                Some("/rewritten/route.md#fragment".to_owned())
+            });
+        assert!(rewritten.contains("/rewritten/route.md#fragment") || !source.contains("]("));
+        assert_eq!(
+            dom_scalars(&rewritten),
+            dom_scalars(&crate::render_html(source)),
+            "{name}: rewriting destinations changed the text"
+        );
+    }
+}
+
+#[test]
+fn corpus_selections_map_to_the_same_text_and_source_line() {
+    // Each quote appears once, verbatim on one source line, so the expected
+    // line comes straight from the file and not from the projection.
+    for (file, quote) in [
+        ("inline.md", "strikethrough"),
+        ("inline.md", "sits between words"),
+        ("blocks.md", "another nested bullet"),
+        ("blocks.md", "an open task with"),
+        ("blocks.md", "with two lines"),
+        ("code-and-diff.md", "+added \"line\" with café"),
+        ("code-and-diff.md", "let message ="),
+        ("code-and-diff.md", "+still a diff"),
+        ("footnotes.md", "Its second paragraph is indented."),
+        ("footnotes.md", "Text after the definitions."),
+        ("html-and-mojibake.md", "literal &amp; text inside a block"),
+        (
+            "html-and-mojibake.md",
+            "<script>alert(\"never runs\")</script>",
+        ),
+        ("unicode.md", "日本語のテキストです。"),
+        ("unicode.md", "👨\u{200d}👩\u{200d}👧\u{200d}👦"),
+        ("unicode.md", "コード 😀 inside a fence"),
+    ] {
+        let source = std::fs::read_to_string(format!("tests/fixtures/parity/{file}")).unwrap();
+        let lines: Vec<_> = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains(quote))
+            .map(|(index, _)| index + 1)
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "{file}: {quote:?} must be on exactly one line"
+        );
+
+        let projection = TextProjection::new(&source);
+        let token = normalized(quote);
+        let text = normalized(&projection.text());
+        let starts: Vec<_> = text
+            .windows(token.len())
+            .enumerate()
+            .filter(|(_, window)| *window == token)
+            .map(|(start, _)| start)
+            .collect();
+        assert_eq!(starts.len(), 1, "{file}: {quote:?} must project once");
+        let range = starts[0]..starts[0] + token.len();
+        assert_eq!(
+            projection.lines(range.clone()),
+            (lines[0], lines[0]),
+            "{file}: {quote:?}"
+        );
+        assert_eq!(projection.quote(range.clone()).as_deref(), Some(quote));
+        // The same offsets select the same characters in the rendered DOM.
+        let dom = dom_scalars(&crate::render_html(&source));
+        assert_eq!(dom[range], token[..], "{file}: {quote:?}");
+    }
+}
+
 #[test]
 fn dom_walker_decodes_like_an_html_parser() {
     // The stand-in must reproduce the browser behaviour the parity test is

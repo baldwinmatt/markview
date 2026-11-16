@@ -468,6 +468,16 @@ pub fn hooks(route: &str, token: Option<&str>, port: u16, nonce_attr: &str) -> S
     )
 }
 
+/// The policy sent with a token-bearing page. Only scripts carrying the
+/// response's fresh nonce run: Markview's own. An injected or inline script,
+/// an inline event handler, a `javascript:` URL, a plugin, a frame and a form
+/// post are all refused, so nothing in a document can use the write token.
+pub fn content_security_policy(nonce: &str) -> String {
+    format!(
+        "default-src 'self'; script-src 'nonce-{nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' https: http: data:; object-src 'none'; base-uri 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'none'"
+    )
+}
+
 /// Whether `document` has an annotation store file right now.
 pub fn has_store(document: &Path) -> bool {
     annotations::resolve(document)
@@ -723,44 +733,10 @@ mod tests {
         assert!(reserved("/foo/../_markview/anything"));
         assert!(!reserved("/nested/_markview/anything"));
 
-        // Pages link the cached script. The standalone fixture has no server
-        // to fetch it from, so it carries the script inline instead.
-        let external = format!(
+        // The review script is linked, with the nonce, not inlined.
+        assert!(html.contains(&format!(
             r#"<script nonce="{nonce}" src="/_markview/review.js?v={}"></script>"#,
             static_version()
-        );
-        assert!(html.contains(&external));
-        let html = html.replacen(
-            &external,
-            &format!(
-                r#"<script nonce="{nonce}">{}</script>"#,
-                annotations::REVIEW_SCRIPT
-            ),
-            1,
-        );
-
-        if let Some(path) = std::env::var_os("MARKVIEW_REVIEW_BROWSER_FIXTURE") {
-            let projection = annotations::TextProjection::new(SOURCE);
-            let policy = format!("script-src 'nonce-{nonce}'; object-src 'none'; base-uri 'none'");
-            let meta =
-                format!("<meta http-equiv=\"Content-Security-Policy\" content=\"{policy}\">");
-            let expected = annotations::json_string(&projection.text());
-            let harness = include_str!("../tests/review.browser.js");
-            let setup = format!(
-                r#"<script nonce="{nonce}">const expectedText = {expected};
-window.fetch = () => new Promise(() => {{}});
-window.EventSource = class {{ addEventListener() {{}} }};
-</script>
-<script>window.untrustedScriptRan = true;</script>"#
-            );
-            let html = html
-                .replacen("<head>", &format!("<head>{meta}{setup}"), 1)
-                .replacen(
-                    "</body>",
-                    &format!(r#"<script nonce="{nonce}">{harness}</script></body>"#),
-                    1,
-                );
-            std::fs::write(path, html).unwrap();
-        }
+        )));
     }
 }

@@ -2930,6 +2930,69 @@ mod tests {
     }
 
     #[test]
+    fn store_change_updates_annotations_and_leaves_unsaved_source_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.md");
+        let saved = "# Title\n\ntext";
+        fs::write(&path, saved).unwrap();
+        let mut model = AppModel::new();
+        let file = model.open_file(path.clone(), saved.to_owned());
+        model.select(file);
+        apply_annotation(
+            model.tab(file),
+            "op=add&body=Check+this",
+            model.review_cache(),
+        )
+        .unwrap();
+        // The reader has unsaved edits and is back in Preview.
+        let unsaved = "# Title\n\ntext with unsaved edits";
+        model.toggle_editing(file);
+        model.update_source(file, unsaved.to_owned());
+        model.toggle_editing(file);
+        let shown = AnnotationView::for_tab(model.tab(file).unwrap(), model.review_cache());
+        let shown = shown.unwrap().review.unwrap();
+        assert_eq!(shown.annotations[0].status, annotations::Status::Open);
+
+        // An agent resolves the comment by editing the store file.
+        let store = annotations::resolve(&path).unwrap().path;
+        let resolved = fs::read_to_string(&store)
+            .unwrap()
+            .replace("[open]", "[resolved]");
+        fs::write(&store, resolved).unwrap();
+
+        // The store event pushes annotation state only: this payload.
+        let view = AnnotationView::for_tab(model.tab(file).unwrap(), model.review_cache()).unwrap();
+        let payload = annotation_js(Some(&view));
+        assert!(payload.contains(r#""status":"resolved""#), "{payload}");
+        assert!(!payload.contains("activeHtml") && !payload.contains("unsaved edits"));
+        assert!(!view.can_add, "a dirty tab still cannot take new comments");
+        assert_eq!(
+            view.revision,
+            annotations::source_revision(unsaved),
+            "highlights are resolved against the preview's source"
+        );
+        // Neither the tab nor the file lost anything.
+        let tab = model.tab(file).unwrap();
+        assert_eq!(tab.document().source(), unsaved);
+        assert!(tab.is_dirty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), saved);
+        // The page applies it without rebuilding the preview.
+        let shell = app_shell_html(&app_view_with_preferences(
+            &model,
+            GuiPreferences::default(),
+        ));
+        let update = shell
+            .split("setAnnotations(id, annotation) {")
+            .nth(1)
+            .and_then(|rest| rest.split("addComment() {").next())
+            .expect("annotation-only update");
+        assert!(update.contains("review.update(annotation.data)"));
+        for rebuild in ["innerHTML", "scrollTop", "setState", "activeSource"] {
+            assert!(!update.contains(rebuild), "{rebuild}");
+        }
+    }
+
+    #[test]
     fn repeated_annotation_pushes_are_skipped() {
         let pushed = AnnotationPush::default();
         // A write is followed by its own store event: same tab, same state.

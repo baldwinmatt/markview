@@ -90,30 +90,67 @@ Stored values include theme, sidebar visibility, auto-refresh, window size, rece
 `src/annotations/` owns the Markdown codec, canonical store resolver,
 rendered-text projection, anchors, and mutations. The projection counts
 non-whitespace Unicode scalars from the Markdown renderer's prepared input
-and tracks source lines and headings. Serve rewrites destinations on parser
-events so link routing cannot change the selection offsets. Source and store
-revisions let each frontend reject stale ranges or mutations.
+and tracks source lines and headings. `prepare_source` is that shared
+preparation: mojibake repair, and U+0000 replaced with U+FFFD because a
+browser drops NUL from body text. The HTML escaper keeps C1 control codes as
+raw UTF-8, since a numeric reference to one is remapped through Windows-1252.
+Serve rewrites destinations on parser events, so link routing cannot change
+the selection offsets. `src/annotations/parity.rs` holds the test that keeps
+all of this true: it renders the corpus in `tests/fixtures/parity` and
+compares the text an HTML parser would build with the projection.
+
+Source and store revisions let each frontend reject stale ranges or
+mutations. They are FNV-1a/64 digests, a fixed algorithm because
+`source_revision` is written into store files. `locate` confirms a quote at
+its stored offset when the revision matches, and otherwise searches only where
+the quote's rarest character occurs. `ReviewCache` remembers the projection
+and resolved review of recently used documents by path, source revision and
+store revision. `ServeConfig` and the GUI's `AppModel` each hold one, and a
+write stores its own result there, so the read that follows is not resolved
+again.
 
 The store resolver selects the closest existing store, then the closest
 Git root, then the document directory. Reads open existing files without
 creating directories. Writes traverse directory handles without following
-symlinks and hold a persistent per-document lock through validation and
-atomic replacement or removal. Direct Markdown edits use the final
-snapshot comparison described in the README.
+symlinks, using the `libc` crate's `openat` family (`src/annotations/paths.rs`;
+other platforms get a stub that reports annotations as unsupported). They hold
+a persistent per-document lock through validation and atomic replacement or
+removal, and a first write that fails removes the directories it created.
+A store is rewritten only if reading the result back gives the same
+annotations; otherwise the write is refused and the error names the
+annotation. Direct Markdown edits use the final snapshot comparison described
+in the README.
 
-The review script converts Rust's ranges to DOM ranges, handles draft
-storage and UI actions, and never resolves anchors itself. The browser
-adapter uses the loopback-only annotation endpoint, and the WebView
-adapter sends form-encoded IPC addressed to a tab. The GUI renders the
-current annotation state into `AppView` and sends annotation-only changes as
-a smaller update. Both frontends use the same directory watch planner to
-observe creation, replacement, deletion, and changes in store precedence.
+The review script (`src/annotations/review.js`) converts Rust's ranges to DOM
+ranges, handles draft storage and UI actions, and never resolves anchors
+itself. It uses no native dialogs: the GUI's WebView has no dialog delegate,
+so confirmations are drawn in the page. The browser adapter in the same file
+uses the loopback-only annotation endpoint, and the WebView adapter sends
+form-encoded IPC addressed to a tab. The GUI renders the current annotation
+state into `AppView` and sends annotation-only changes as a smaller update,
+skipping one that repeats the last. `tests/review.test.cjs` runs the script
+against the stub DOM in `tests/support/review-dom.cjs`.
+
+A served page carries the review script only when it can use it: always with
+`--annotate`, otherwise only for a document that has a store. Any other page
+is byte-identical to the pre-annotation output, which
+`tests/fixtures/serve-baseline.expected.html` pins. The script and stylesheet
+are static, cacheable routes under the reserved `/_markview/` prefix. Both
+frontends use the same directory watch planner to observe creation,
+replacement, deletion, and changes in store precedence. Serve starts watching
+a document's store the first time the document is served and blocks on watch
+events with no timer; a rescan drops watches for documents that are gone.
 Source changes still follow each shell's normal refresh path.
 
-Browser writes require `--annotate`, a matching loopback Host and the
-server's random token. Token-bearing pages use a per-response script
-nonce and Content Security Policy. The shared form parser checks encoded
-size, decoded scalar counts and allowed fields.
+Browser writes require `--annotate`, a loopback Host and the server's random
+token, which is compared in constant time and embedded only in pages requested
+through a loopback Host. Token-bearing pages use a per-response script nonce
+and the policy from `content_security_policy`; assets are served sandboxed.
+Only requests to the reserved prefix go through the strict HTTP reader; pages,
+assets and `/events` read just the request line. Every response is followed by
+a bounded drain of the unread request, so the client receives it instead of a
+connection reset. The shared form parser checks encoded size, decoded scalar
+counts and allowed fields.
 
 ## Packaging
 
@@ -131,9 +168,10 @@ The bundle includes `Info.plist`, `Markview.icns`, document registration for Mar
 3. Run `cargo test`.
 4. Run `cargo test --features gui`.
 5. Run `node --test tests/editor.test.cjs`.
-6. Run `cargo clippy --all-targets -- -D warnings`.
-7. Run `cargo clippy --features gui --all-targets -- -D warnings`.
-8. Run `cargo build --features gui --bin markview-gui`.
-9. Run `make package-macos`.
-10. Tag the release as `v<version>` after the reviewed release commit lands.
-11. Push the tag. The release workflow builds the macOS zip and attaches it to the GitHub release.
+6. Run `node --test tests/review.test.cjs`.
+7. Run `cargo clippy --all-targets -- -D warnings`.
+8. Run `cargo clippy --features gui --all-targets -- -D warnings`.
+9. Run `cargo build --features gui --bin markview-gui`.
+10. Run `make package-macos`.
+11. Tag the release as `v<version>` after the reviewed release commit lands.
+12. Push the tag. The release workflow builds the macOS zip and attaches it to the GitHub release.

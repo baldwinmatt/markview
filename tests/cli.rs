@@ -475,6 +475,19 @@ fn annotations_cli_validates_arguments() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("input is not Markdown"));
+    // A missing input is an error in the usual `markview: ...` style.
+    let missing = dir.path().join("missing.md");
+    Command::cargo_bin("markview")
+        .unwrap()
+        .arg("--annotations")
+        .arg(&missing)
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicate::str::starts_with(format!(
+            "markview: {}: ",
+            missing.display()
+        )));
 }
 
 #[test]
@@ -2590,6 +2603,98 @@ fn serve_reloads_a_plain_page_when_its_first_annotation_appears() {
 }
 
 #[test]
+fn serve_mode_never_serves_the_markview_tree_as_assets() {
+    let dir = tempfile::tempdir().unwrap();
+    let hidden = dir.path().join(".assets");
+    let store = dir.path().join(".markview/annotations");
+    std::fs::create_dir_all(&hidden).unwrap();
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(hidden.join("data.txt"), "allowed").unwrap();
+    std::fs::write(
+        store.join("doc.md"),
+        "## a1 [open] document\n\nPrivate note\n",
+    )
+    .unwrap();
+    std::fs::write(store.join("doc.md.markview-lock"), "").unwrap();
+    std::fs::write(dir.path().join(".markview/notes.txt"), "also private").unwrap();
+    let doc = dir.path().join("doc.md");
+    std::fs::write(
+        &doc,
+        concat!(
+            "# Doc\n\n[hidden](.assets/data.txt) [store](.markview/annotations/doc.md)\n",
+            "[lock](.markview/annotations/doc.md.markview-lock) [other](.markview/notes.txt)\n",
+        ),
+    )
+    .unwrap();
+    let server = ServeProcess::start(&doc);
+    // A referenced asset in a hidden directory is served as before.
+    assert!(http_get(server.port, "/.assets/data.txt").ends_with("allowed"));
+    // Referencing something under `.markview` does not make it an asset.
+    for route in [
+        "/.markview/annotations/doc.md",
+        "/.markview/annotations/doc.md.markview-lock",
+        "/.markview/notes.txt",
+    ] {
+        let response = http_get(server.port, route);
+        assert!(response.starts_with("HTTP/1.1 404"), "{route}: {response}");
+        assert!(!response.contains("rivate"), "{route}");
+    }
+}
+
+#[test]
+fn serve_annotate_pages_allow_only_their_own_nonce_scripts() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = dir.path().join("doc.md");
+    std::fs::write(
+        &doc,
+        "# Doc\n\n<script>alert(1)</script>\n\n<img src=x onerror=alert(2)>\n\n[x](javascript:alert(3))\n",
+    )
+    .unwrap();
+    let server =
+        ServeProcess::try_start_with_env(&[&doc], 0, false, false, false, None, true).unwrap();
+    let page = http_get_local(server.port, "/");
+    let (head, body) = page.split_once("\r\n\r\n").unwrap();
+    let policy = head
+        .lines()
+        .find_map(|line| line.strip_prefix("Content-Security-Policy: "))
+        .expect("policy header");
+    let nonce = policy
+        .split("'nonce-")
+        .nth(1)
+        .and_then(|rest| rest.split('\'').next())
+        .unwrap();
+    assert_eq!(nonce.len(), 48);
+    // The exact policy a browser enforces, not a copy kept in a fixture.
+    assert_eq!(
+        policy,
+        format!(
+            "default-src 'self'; script-src 'nonce-{nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' https: http: data:; object-src 'none'; base-uri 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'none'"
+        )
+    );
+    // Every script element in the page is Markview's and carries the nonce.
+    let scripts: Vec<_> = body.match_indices("<script").collect();
+    assert_eq!(
+        scripts.len(),
+        3,
+        "review.js, its start-up call, live reload"
+    );
+    for (index, _) in scripts {
+        assert!(
+            body[index..].starts_with(&format!("<script nonce=\"{nonce}\"")),
+            "{}",
+            &body[index..index + 60]
+        );
+    }
+    // What the document tried to inject is text, or a dead link.
+    assert!(body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    assert!(body.contains("&lt;img src=x onerror=alert(2)&gt;"));
+    assert!(body.contains("<a href=\"#\">x</a>"));
+    // A page without the token needs no policy and gets none.
+    let plain = ServeProcess::start(&doc);
+    assert!(!http_get(plain.port, "/").contains("Content-Security-Policy"));
+}
+
+#[test]
 fn serve_annotations_accepts_only_loopback_host_spellings() {
     let dir = tempfile::tempdir().unwrap();
     let doc = dir.path().join("doc.md");
@@ -2688,6 +2793,103 @@ fn serve_annotate_sandboxes_assets_and_warns_about_a_reserved_directory() {
     let asset = http_get(plain.port, "/data.xml");
     assert!(asset.starts_with("HTTP/1.1 200"), "{asset}");
     assert!(!asset.contains("Content-Security-Policy"), "{asset}");
+}
+
+#[test]
+fn serve_annotations_gives_up_on_headers_that_never_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = dir.path().join("doc.md");
+    std::fs::write(&doc, "# Doc\n").unwrap();
+    let server = ServeProcess::start(&doc);
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    // The request line and one header arrive, the blank line never does.
+    write!(
+        stream,
+        "GET /_markview/annotations?doc=%2Fdoc.md HTTP/1.1\r\nHost: localhost:{}\r\n",
+        server.port
+    )
+    .unwrap();
+    let started = Instant::now();
+    let response = read_until(&mut stream, "Malformed request", Duration::from_secs(15));
+    let waited = started.elapsed();
+    assert!(response.starts_with("HTTP/1.1 400"), "{response:?}");
+    // The endpoint's read deadline is 3 s: it neither answers an unfinished
+    // request early nor holds the connection open for it.
+    assert!(waited > Duration::from_millis(1_500), "{waited:?}");
+    assert!(waited < Duration::from_secs(15), "{waited:?}");
+}
+
+#[test]
+fn serve_reports_store_replacement_and_deletion_above_the_serve_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let docs = dir.path().join("docs");
+    let store_dir = dir.path().join(".markview/annotations/docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::create_dir_all(&store_dir).unwrap();
+    std::fs::write(dir.path().join(".git"), "gitdir: elsewhere").unwrap();
+    let doc = docs.join("guide.md");
+    std::fs::write(&doc, "# Guide\n").unwrap();
+    let store = store_dir.join("guide.md");
+    std::fs::write(&store, "## a1 [open] document\n\nExpand this.\n").unwrap();
+
+    // Only `docs/` is served: the store sits outside the served tree.
+    let server = ServeProcess::start(&doc);
+    let endpoint = "/_markview/annotations?doc=%2Fguide.md";
+    assert!(http_get(server.port, "/").contains("/_markview/review.js"));
+    assert!(http_get_local(server.port, endpoint).contains("\"status\":\"open\""));
+    let mut events = open_reload_stream(server.port);
+
+    // An editor or agent saves atomically: a temporary file renamed over.
+    let temporary = store_dir.join("guide.md.tmp");
+    std::fs::write(&temporary, "## a1 [resolved] document\n\nExpand this.\n").unwrap();
+    std::fs::rename(&temporary, &store).unwrap();
+    let event = read_until(&mut events, "data: /guide.md", Duration::from_secs(8));
+    assert!(
+        event.contains("event: annotations\ndata: /guide.md"),
+        "{event}"
+    );
+    assert!(!event.contains("data: reload"), "{event}");
+    assert!(http_get_local(server.port, endpoint).contains("\"status\":\"resolved\""));
+
+    std::fs::remove_file(&store).unwrap();
+    let event = read_until(&mut events, "data: /guide.md", Duration::from_secs(8));
+    assert!(
+        event.contains("event: annotations\ndata: /guide.md"),
+        "{event}"
+    );
+    assert!(http_get_local(server.port, endpoint).contains("\"annotations\":[]"));
+}
+
+#[test]
+fn serve_mode_daemon_passes_annotate_to_the_background_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("README.md");
+    std::fs::write(&file, "# Daemonized\n").unwrap();
+    let output = std::process::Command::new(cargo_bin("markview"))
+        .current_dir(dir.path())
+        .args(["--serve", "--annotate", "--daemon", "--port", "0"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let _daemon = DaemonProcess(number_after(&stdout, "pid "));
+    let port: u16 = number_after(&stdout, "http://localhost:");
+    poll_http_until_ready(port, Duration::from_secs(5));
+
+    // The background server accepts a comment, so it was started writable.
+    let token = review_token(&http_get_local(port, "/"));
+    let added = post_annotation(port, &token, "op=add&doc=%2FREADME.md&body=From+the+daemon");
+    assert!(added.starts_with("HTTP/1.1 200"), "{added}");
+    let store = std::fs::read_to_string(dir.path().join(".markview/annotations/README.md"));
+    assert!(store.unwrap().contains("From the daemon"));
 }
 
 fn raw_http(port: u16, request: &str) -> String {

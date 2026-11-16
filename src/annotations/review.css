@@ -79,6 +79,6 @@ body > .markview-review {
 .markview-review-overlay { position: fixed; inset: 0; pointer-events: none; z-index: 4; }
 .markview-review-overlay > div { position: fixed; background: #a16ad941; border-bottom: 1px solid #9563ca; }
 @media print {
-  .markview-review, .markview-review-selection, .markview-review-overlay { display: none !important; }
+  .markview-review, .markview-review-selection, .markview-review-selection-note, .markview-review-overlay { display: none !important; }
   ::highlight(markview-annotations) { background: transparent; text-decoration: none; }
 }

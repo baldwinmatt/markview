@@ -630,6 +630,14 @@ pub fn mutate(location: &Location, operation: Operation) -> Result<Review, Error
     ReviewCache::default().mutate(location, operation)
 }
 
+// Runs once, between a mutation reading the store under its lock and
+// committing: where an editor that takes no lock can still slip a write in.
+#[cfg(test)]
+thread_local! {
+    static BEFORE_COMMIT: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
+}
+
 type Project<'a> = &'a mut dyn FnMut(&str) -> Arc<TextProjection>;
 
 fn mutate_with(
@@ -739,6 +747,10 @@ fn mutate_locked(
         &projection,
         store_revision(&location.path, content.as_deref().map(str::as_bytes)),
     );
+    #[cfg(test)]
+    if let Some(interrupt) = BEFORE_COMMIT.take() {
+        interrupt();
+    }
     parent.commit(bytes.as_deref(), content.as_deref())?;
     Ok((projection, review))
 }

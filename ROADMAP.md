@@ -127,7 +127,7 @@ Markview is a small, fast, local-first Markdown viewer written in Rust. The proj
 
 ### FEAT-004: Persistent document annotations
 
-- **Status** — Implemented in the CLI, browser, and macOS Preview. Runtime verification is tracked in the build tickets.
+- **Status** — Implemented in the CLI, browser, and macOS Preview, with automated tests for every checked item in the specification and build tickets. Still open: an end-to-end run in the packaged macOS app, the native View menu item, and the visual check of highlight colours in both themes. The tickets list what was run by hand.
 - **Requested behavior** — Review rendered Markdown in the browser and macOS Preview, share comments through a Markdown store, and let agents list open comments with current source lines.
 - [Build tickets and acceptance criteria](ANNOTATIONS_TICKETS.md)
 - [Annotation specification](ANNOTATIONS_SPEC.md)

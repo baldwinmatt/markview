@@ -850,3 +850,187 @@ fn locating_quotes_does_not_scan_the_whole_document_per_annotation() {
         "per annotation: indexed {fast:?}, full scan {slow:?}"
     );
 }
+
+#[test]
+fn external_status_flip_before_commit_is_a_conflict_not_a_lost_update() {
+    let dir = tempdir().unwrap();
+    let doc = dir.path().join("doc.md");
+    fs::write(&doc, "text").unwrap();
+    let location = resolve(&doc).unwrap();
+    let review = mutate(&location, add("needs work")).unwrap();
+    // An agent resolves the comment in its editor, which takes no lock, after
+    // Markview read the store but before it replaces the file.
+    let store = location.path.clone();
+    let resolved = fs::read_to_string(&store)
+        .unwrap()
+        .replace("[open]", "[resolved]");
+    let external = resolved.clone();
+    BEFORE_COMMIT.set(Some(Box::new(move || fs::write(&store, external).unwrap())));
+    let edit = change(1, &review, Change::Edit("rewritten".to_owned()));
+    assert!(matches!(
+        mutate(&location, edit),
+        Err(Error::Conflict("annotation store changed on disk"))
+    ));
+    // The agent's edit survives, and Markview's did not land on top of it.
+    assert_eq!(fs::read_to_string(&location.path).unwrap(), resolved);
+    let current = read(&location, &TextProjection::new("text")).unwrap();
+    assert_eq!(current.annotations[0].status, Status::Resolved);
+    assert_eq!(current.annotations[0].body, "needs work");
+    // With the list refreshed, the same edit goes through.
+    let edit = change(1, &current, Change::Edit("rewritten".to_owned()));
+    assert_eq!(
+        mutate(&location, edit).unwrap().annotations[0].body,
+        "rewritten"
+    );
+}
+
+#[test]
+fn cards_from_before_a_source_change_conflict_until_refreshed() {
+    let dir = tempdir().unwrap();
+    let doc = dir.path().join("doc.md");
+    let source = "# Title\n\nalpha beta";
+    fs::write(&doc, source).unwrap();
+    let location = resolve(&doc).unwrap();
+    let shown = mutate(&location, selection(source, "alpha", 5..10, "first")).unwrap();
+    // The document gains a line, and another writer's add rewrites the store
+    // with refreshed line hints. The reviewer's cards are now out of date.
+    let edited = format!("\n{source}");
+    fs::write(&doc, &edited).unwrap();
+    mutate(&location, add("from another window")).unwrap();
+    let rewritten = fs::read_to_string(&location.path).unwrap();
+    assert!(rewritten.contains("## a1 [open] line 4"), "{rewritten}");
+
+    for stale in [
+        Change::Edit("changed".to_owned()),
+        Change::Status(Status::Resolved),
+        Change::Delete,
+    ] {
+        assert!(matches!(
+            mutate(&location, change(1, &shown, stale)),
+            Err(Error::Conflict("annotation store changed on disk"))
+        ));
+        assert_eq!(fs::read_to_string(&location.path).unwrap(), rewritten);
+    }
+    let fresh = read(&location, &TextProjection::new(&edited)).unwrap();
+    assert_eq!(fresh.annotations[0].lines, Some((4, 4)));
+    let resolved = mutate(
+        &location,
+        change(1, &fresh, Change::Status(Status::Resolved)),
+    );
+    assert_eq!(resolved.unwrap().annotations[1].status, Status::Resolved);
+}
+
+#[test]
+fn first_writes_never_follow_a_symlinked_store_component() {
+    for component in [
+        ".markview",
+        ".markview/annotations",
+        ".markview/annotations/docs",
+    ] {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir(root.join("docs")).unwrap();
+        fs::write(root.join(".git"), "gitdir: elsewhere").unwrap();
+        let doc = root.join("docs/spec.md");
+        fs::write(&doc, "text").unwrap();
+        // The store location is resolved while nothing exists yet.
+        let location = resolve(&doc).unwrap();
+        assert_eq!(
+            location.path,
+            root.join(".markview/annotations/docs/spec.md")
+        );
+        // Then one component appears as a link to somewhere else.
+        let outside = root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        let link = root.join(component);
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(&outside, &link).unwrap();
+
+        assert!(
+            mutate(&location, add("first write")).is_err(),
+            "{component}"
+        );
+        assert!(
+            ReviewCache::default()
+                .mutate(&location, add("again"))
+                .is_err(),
+            "{component}"
+        );
+        // Nothing was created through the link: no store, lock or directory.
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0, "{component}");
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+}
+
+#[test]
+fn ties_between_identical_quotes_go_to_the_nearest_stored_line() {
+    // No context or section hints, so only the last known line can choose.
+    let source = "same\n\nfiller\n\nfiller\n\nsame\n";
+    let projection = TextProjection::new(source);
+    let near_top = Store::parse("## a1 [open] line 2\n\n> same\n\nNote\n");
+    let near_end = Store::parse("## a1 [open] line 6\n\n> same\n\nNote\n");
+    let halfway = Store::parse("## a1 [open] line 4\n\n> same\n\nNote\n");
+    assert_eq!(projection.locate(&near_top.annotations[0]), Some(0..4));
+    assert_eq!(projection.locate(&near_end.annotations[0]), Some(16..20));
+    // Equally far from both: ambiguous, so the comment detaches.
+    assert_eq!(projection.locate(&halfway.annotations[0]), None);
+}
+
+#[test]
+fn a_quote_across_blocks_reports_its_line_range_and_detached_hints_survive_rewrites() {
+    let dir = tempdir().unwrap();
+    let doc = dir.path().join("doc.md");
+    let source = "# Title\n\nfirst **bold** end\n\nsecond paragraph\n";
+    fs::write(&doc, source).unwrap();
+    let location = resolve(&doc).unwrap();
+    // "bold end second": out of the emphasis, across the paragraph break.
+    let review = mutate(
+        &location,
+        selection(source, "bold end second", 10..23, "spans blocks"),
+    )
+    .unwrap();
+    assert_eq!(review.annotations[0].lines, Some((3, 5)));
+    assert_eq!(
+        review.annotations[0].quote.as_deref(),
+        Some("bold end second")
+    );
+    let stored = fs::read_to_string(&location.path).unwrap();
+    assert!(stored.contains("## a1 [open] lines 3-5\n"), "{stored}");
+
+    // The text goes away: the comment detaches but keeps what it knew.
+    fs::write(&doc, "# Title\n\nrewritten\n").unwrap();
+    let detached = mutate(&location, add("another comment")).unwrap();
+    assert!(!detached
+        .annotations
+        .iter()
+        .any(|record| record.id == 1 && record.attached));
+    let rewritten = fs::read_to_string(&location.path).unwrap();
+    let section = |text: &str| text.split("## a2 ").next().unwrap().to_owned();
+    assert_eq!(section(&rewritten), section(&stored));
+    // The text comes back one line lower and the comment reattaches there.
+    fs::write(&doc, format!("\n{source}")).unwrap();
+    let back = read(&location, &TextProjection::new(&format!("\n{source}"))).unwrap();
+    assert_eq!(back.annotations[0].lines, Some((4, 6)));
+    assert!(back.annotations[0].attached);
+}
+
+#[test]
+fn review_styles_keep_annotations_out_of_print() {
+    let print = REVIEW_STYLE
+        .split("@media print {")
+        .nth(1)
+        .expect("print rules");
+    for selector in [
+        ".markview-review,",
+        ".markview-review-selection,",
+        ".markview-review-selection-note,",
+        ".markview-review-overlay",
+    ] {
+        assert!(print.contains(selector), "{selector}");
+    }
+    assert!(print.contains("display: none !important"));
+    assert!(print.contains("::highlight(markview-annotations) { background: transparent;"));
+}

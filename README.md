@@ -67,7 +67,7 @@ markview --serve --open --daemon docs/       # background server, browser opened
 
 `--port`, `--recurse`, `--open`, `--daemon`, and `--annotate` require `--serve`.
 
-The server renders Markdown as HTML and live-reloads open browser tabs whenever a served file changes (a file watcher feeds a `/events` server-sent-events stream). It serves the listed documents and assets allowlisted by relative Markdown image/link destinations (`![]()` and `[]()`, including reference-style links). Referenced assets inside hidden directories are allowed. Raw HTML `<img src>` and absolute destinations do not add assets; those files return 404 unless independently allowlisted. `/favicon.ico` has a separate local-file/built-in fallback. Other files return 404. It binds to `127.0.0.1`; to view it from another machine, forward the port over SSH first, e.g. `ssh -L 8080:localhost:8080 user@host`.
+The server renders Markdown as HTML and live-reloads open browser tabs whenever a served file changes (a file watcher feeds a `/events` server-sent-events stream). It serves the listed documents and assets allowlisted by relative Markdown image/link destinations (`![]()` and `[]()`, including reference-style links). Referenced assets inside hidden directories are allowed, except anything under a `.markview` directory: the whole tree is blocked, so annotation stores and their lock files are never served as assets. Raw HTML `<img src>` and absolute destinations do not add assets; those files return 404 unless independently allowlisted. `/favicon.ico` has a separate local-file/built-in fallback. Other files return 404. It binds to `127.0.0.1`; to view it from another machine, forward the port over SSH first, e.g. `ssh -L 8080:localhost:8080 user@host`.
 
 For directory collections, `/` chooses the top-level `README.md`, then `index.md` (case-insensitive), then the first relative Markdown path sorted by byte order. Explicit file sets use their first FILE argument. A one-document directory has an empty navigation area. Hidden files/directories and symlinked directories are excluded from document discovery, while aliases of already discovered files are silently dropped. Explicit file sets reject duplicate/aliased inputs.
 
@@ -81,10 +81,16 @@ markview --annotations notes.md docs/
 markview --annotations --include-resolved notes.md
 ```
 
+| Option | Effect |
+| --- | --- |
+| `--annotate` | With `--serve`, enable adding and changing review comments in the browser. Without it, existing comments are shown read-only. |
+| `--annotations` | List open comments for the given Markdown files or directories as Markdown, with current line numbers. It is a mode of its own and cannot be combined with `--serve`, `--html` or `--width`. |
+| `--include-resolved` | With `--annotations`, also list resolved comments, after the open ones. |
+
 Select rendered text and click **Comment** or press Ctrl/Cmd+Shift+K, or
 choose **Comment on document**. A selection can hold at most 1,000 characters.
-Use Cmd/Ctrl+Enter to save a draft and Escape to cancel it; Escape asks first
-if the draft has text. Choose **Edit**, **Resolve**, **Reopen**, or **Delete**
+Use Cmd/Ctrl+Enter to save the comment and Escape to cancel it; Escape asks
+first if the draft has text. Choose **Edit**, **Resolve**, **Reopen**, or **Delete**
 on a card; **Delete** asks for confirmation in the card. Existing comments are
 available for read-only review with `--serve` alone. In macOS Preview, comments
 share the table-of-contents sidebar, which opens when you start a comment. Use
@@ -102,7 +108,8 @@ Paths mirror the source tree below that root. For example, repository file
 `docs/notes.md` maps to `.markview/annotations/docs/notes.md`. Commit
 `.markview/` to share the Markdown comments, or add `.markview/` to
 `.gitignore` for local review. Exclude the generated `*.markview-lock` files
-if you commit comments.
+if you commit comments. Store files are created with ordinary permissions
+(your umask applies) and keep their mode when Markview rewrites them.
 
 `/_markview/` is a reserved route prefix, like `/events`. A directory named
 `_markview` at the top of a served directory is not served; Markview prints a
@@ -112,8 +119,15 @@ answers only when the page is opened as `localhost:<port>` or
 and says where to open it instead.
 
 Agents can run `markview --annotations <FILE or DIR>...` to see open comments
-and current lines. After addressing a comment, change its header from
-`[open]` to `[resolved]` in the store. Markview locks its own writes and
+and current lines: text comments in document order, then whole-document
+comments, then detached ones. Each document's output names its store file,
+relative to the working directory when the store is below it. A document that
+cannot be listed is reported on stderr as `error: <document>: <problem>`; the
+others are still listed and the command exits non-zero. After addressing a
+comment, change its header from `[open]` to `[resolved]` in the store. A
+section header must stay exactly `## a<N> [open|resolved] <anchor>`: a
+different case, an extra space or a trailing space turns it into comment text,
+which the listing warns about. Markview locks its own writes and
 compares the on-disk file immediately before committing. A direct edit can
 still race between that comparison and the final rename or removal. Re-read
 the store immediately before editing it and verify the intended change after
@@ -207,7 +221,7 @@ For a deeper map of the core types, GUI flow, persistence, packaging, and releas
 
 ## Development workflow
 
-`make test` runs both Rust test configurations and `node --test tests/editor.test.cjs`. The editor tests cover source preservation, tokenizer edge cases, UTF-16 spelling marks, revision checks, and shifting marks through edits. Rust GUI tests cover IPC parsing, model editing, canonical Copy Path targets, parser-based spelling exclusions, and native spelling ranges. Real WKWebView checks on 2026-10-19 verified reused-editor focus, initial caret position, matching wrapped textarea/overlay geometry with tabs/CJK/emoji, available-space layout, input refresh, and Find exclusions. These checks do not establish a large-document performance budget.
+`make test` runs both Rust test configurations, `node --test tests/editor.test.cjs` and `node --test tests/review.test.cjs`. The review tests run the shared annotation script against a small stub DOM: text normalisation, offset-to-range conversion, selection capture, drafts, confirmation prompts, messages and focus. The editor tests cover source preservation, tokenizer edge cases, UTF-16 spelling marks, revision checks, and shifting marks through edits. Rust GUI tests cover IPC parsing, model editing, canonical Copy Path targets, parser-based spelling exclusions, and native spelling ranges. Real WKWebView checks on 2026-10-19 verified reused-editor focus, initial caret position, matching wrapped textarea/overlay geometry with tabs/CJK/emoji, available-space layout, input refresh, and Find exclusions. These checks do not establish a large-document performance budget.
 
 Every commit should be reviewed before starting the next task:
 

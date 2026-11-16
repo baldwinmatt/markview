@@ -62,6 +62,10 @@ pub fn read_source(_location: &Location) -> io::Result<String> {
     Err(unsupported())
 }
 
+pub fn read_source_limited(_location: &Location, _limit: u64) -> io::Result<String> {
+    Err(unsupported())
+}
+
 /// Reads the file without the symlink confinement unix has: this platform
 /// cannot write annotations, but it can still serve documents.
 pub fn read_canonical_source(path: &Path) -> io::Result<String> {

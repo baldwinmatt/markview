@@ -10,7 +10,8 @@ mod unsupported;
 mod watch;
 
 pub use paths::{
-    read_canonical_source, read_canonical_source_limited, read_source, resolve, Location,
+    read_canonical_source, read_canonical_source_limited, read_source, read_source_limited,
+    resolve, Location,
 };
 pub use projection::{collapse, TextProjection};
 pub use store::{Annotation, Status, Store};

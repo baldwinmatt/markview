@@ -4167,3 +4167,56 @@ fn disabled_api_writes_say_how_to_enable_them() {
         "{response}"
     );
 }
+
+fn status_and_body(response: &str) -> (String, String) {
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .expect("a complete response");
+    (head.lines().next().unwrap().to_owned(), body.to_owned())
+}
+
+#[cfg(unix)]
+#[test]
+fn document_and_annotation_endpoints_report_unreadable_documents_alike() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["bad", "locked", "gone", "swapped"] {
+        std::fs::write(dir.path().join(format!("{name}.md")), "# Fine\n").unwrap();
+    }
+    let server = ServeProcess::start_dir(dir.path());
+    let port = server.port;
+    std::fs::write(dir.path().join("bad.md"), [0xff, 0xfe, b'\n']).unwrap();
+    let locked = dir.path().join("locked.md");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::fs::remove_file(dir.path().join("gone.md")).unwrap();
+    std::fs::remove_file(dir.path().join("swapped.md")).unwrap();
+    std::fs::create_dir(dir.path().join("swapped.md")).unwrap();
+
+    let mut cases = vec![
+        ("bad", "500", "bad.md: the document is not valid UTF-8"),
+        ("gone", "404", "gone.md: the document cannot be read"),
+        ("swapped", "404", "swapped.md: the document cannot be read"),
+    ];
+    if unsafe { libc::geteuid() } != 0 {
+        cases.push((
+            "locked",
+            "500",
+            "locked.md: the document cannot be read: permission denied",
+        ));
+    }
+    for (name, status, message) in cases {
+        let route = format!("doc=%2F{name}.md");
+        let document = status_and_body(&http_get_local(
+            port,
+            &format!("/_markview/api/v1/document?{route}"),
+        ));
+        let annotations = status_and_body(&http_get_local(
+            port,
+            &format!("/_markview/api/v1/annotations?{route}"),
+        ));
+        assert_eq!(document, annotations, "{name}");
+        assert!(document.0.contains(status), "{name}: {document:?}");
+        assert!(document.1.contains(message), "{name}: {document:?}");
+    }
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+}

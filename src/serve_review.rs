@@ -58,6 +58,7 @@ impl DocumentProblem {
             Error::Io(error) => match error.kind() {
                 io::ErrorKind::InvalidData => format!("the {what} is not valid UTF-8"),
                 io::ErrorKind::NotFound => format!("the {what} is missing"),
+                io::ErrorKind::FileTooLarge => format!("the {what} is too large"),
                 io::ErrorKind::PermissionDenied => {
                     format!("the {what} cannot be read: permission denied")
                 }

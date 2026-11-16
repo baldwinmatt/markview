@@ -336,6 +336,11 @@ pub fn read_source(location: &Location) -> io::Result<String> {
     read_canonical_source(&location.document)
 }
 
+/// `read_source`, refusing a document larger than `limit` bytes.
+pub fn read_source_limited(location: &Location, limit: u64) -> io::Result<String> {
+    read_canonical_source_limited(&location.document, limit)
+}
+
 /// Reads a canonical document path without following symlinks in any component.
 pub fn read_canonical_source(path: &Path) -> io::Result<String> {
     read_canonical_source_limited(path, u64::MAX)

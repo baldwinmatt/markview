@@ -273,26 +273,7 @@ fn page_review(
     document: &super::ServedDocument,
 ) -> Result<annotations::Review, Error> {
     use serve_review::DocumentProblem;
-    let location = config.served_location(document).map_err(|error| {
-        DocumentProblem::wrap(
-            config,
-            document,
-            "document",
-            &document.source_path,
-            error.into(),
-            "404 Not Found",
-        )
-    })?;
-    let source = annotations::read_source(&location).map_err(|error| {
-        DocumentProblem::wrap(
-            config,
-            document,
-            "document",
-            &location.document,
-            error.into(),
-            "500 Internal Server Error",
-        )
-    })?;
+    let (location, source) = read_served_source(config, document, None)?;
     config
         .review_cache
         .read(&location, &source)
@@ -307,6 +288,47 @@ fn page_review(
                 status,
             )
         })
+}
+
+/// A served document's location and source. A failure names the document
+/// and what is wrong with it, with the status that goes with it; a source
+/// over `limit` bytes is a 413.
+pub(super) fn read_served_source(
+    config: &ServeConfig,
+    document: &super::ServedDocument,
+    limit: Option<u64>,
+) -> Result<(annotations::Location, String), Error> {
+    use serve_review::DocumentProblem;
+    let location = config.served_location(document).map_err(|error| {
+        DocumentProblem::wrap(
+            config,
+            document,
+            "document",
+            &document.source_path,
+            error.into(),
+            "404 Not Found",
+        )
+    })?;
+    let source = match limit {
+        Some(limit) => annotations::read_source_limited(&location, limit),
+        None => annotations::read_source(&location),
+    }
+    .map_err(|error| {
+        let status = if error.kind() == io::ErrorKind::FileTooLarge {
+            "413 Payload Too Large"
+        } else {
+            "500 Internal Server Error"
+        };
+        DocumentProblem::wrap(
+            config,
+            document,
+            "document",
+            &location.document,
+            error.into(),
+            status,
+        )
+    })?;
+    Ok((location, source))
 }
 
 fn status(error: &Error) -> &'static str {
@@ -427,19 +449,7 @@ pub fn handle(
         };
         let loaded = match serve_api::load(&initial, document) {
             Ok(loaded) => loaded,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return fail(stream, "404 Not Found", "document is unavailable")
-            }
-            Err(error) if error.kind() == io::ErrorKind::FileTooLarge => {
-                return fail(stream, "413 Payload Too Large", "document is too large")
-            }
-            Err(error) => {
-                eprintln!(
-                    "markview: cannot read {}: {error}",
-                    document.source_path.display()
-                );
-                return fail(stream, "500 Internal Server Error", "cannot read document");
-            }
+            Err(error) => return respond_error(stream, error, "document is unavailable", fail),
         };
         let headers = format!(
             "ETag: \"{}\"\r\nCache-Control: no-cache\r\n",

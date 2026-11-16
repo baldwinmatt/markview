@@ -3,6 +3,7 @@ use std::io;
 
 use markview::annotations::{self, json_string, push_json_string};
 
+use super::serve_annotations::read_served_source;
 use super::{ServeConfig, ServedDocument};
 
 pub const PREFIX: &str = "/_markview/api/v1/";
@@ -71,11 +72,9 @@ pub struct Loaded {
 }
 
 /// Reads the served document, refusing one larger than `DOCUMENT_CAP`.
-pub fn load(config: &ServeConfig, doc: &ServedDocument) -> io::Result<Loaded> {
-    let location = config
-        .served_location(doc)
-        .map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))?;
-    let source = annotations::read_canonical_source_limited(&location.document, DOCUMENT_CAP)?;
+/// Failures read as they do on the annotation endpoints.
+pub fn load(config: &ServeConfig, doc: &ServedDocument) -> Result<Loaded, annotations::Error> {
+    let (location, source) = read_served_source(config, doc, Some(DOCUMENT_CAP))?;
     let revision = annotations::source_revision(&source);
     Ok(Loaded {
         location,

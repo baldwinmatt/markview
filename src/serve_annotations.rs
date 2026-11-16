@@ -509,20 +509,28 @@ const VERDICT_SCRIPT: &str = include_str!("annotations/verdict.js");
 /// good and a new markview build is still picked up at once.
 pub const STATIC_CACHE: &str = "Cache-Control: public, max-age=31536000, immutable\r\n";
 
+fn digest(bodies: &[&str]) -> String {
+    annotations::source_revision(&bodies.concat())
+}
+
+/// Versions the review assets. Only pages that carry review hooks link them.
 fn static_version() -> &'static str {
     static VERSION: OnceLock<String> = OnceLock::new();
     VERSION.get_or_init(|| {
-        annotations::source_revision(
-            &[
-                annotations::REVIEW_SCRIPT,
-                annotations::REVIEW_STYLE,
-                annotations::COPY_SCRIPT,
-                annotations::COPY_STYLE,
-                VERDICT_SCRIPT,
-            ]
-            .concat(),
-        )
+        digest(&[
+            annotations::REVIEW_SCRIPT,
+            annotations::REVIEW_STYLE,
+            VERDICT_SCRIPT,
+        ])
     })
+}
+
+/// Versions the copy assets on their own. Every page links them, so a digest
+/// that also covered the review scripts would change the bytes of a plain
+/// page whenever review.js, review.css or verdict.js is edited.
+fn copy_version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION.get_or_init(|| digest(&[annotations::COPY_SCRIPT, annotations::COPY_STYLE]))
 }
 
 /// What a page needs to show annotations: the cached stylesheet and script,
@@ -556,7 +564,7 @@ pub fn hooks(
 }
 
 pub fn copy_hooks(nonce_attr: &str) -> String {
-    let version = static_version();
+    let version = copy_version();
     format!(
         r#"<link rel="stylesheet" href="/_markview/copy.css?v={version}">
 <script{nonce_attr} src="/_markview/copy.js?v={version}"></script>"#
@@ -869,9 +877,13 @@ window.EventSource = class extends EventTarget {{
                 ("review.js", annotations::REVIEW_SCRIPT),
                 ("verdict.js", VERDICT_SCRIPT),
             ] {
-                let link = format!(
-                    r#"<script nonce="{nonce}" src="/_markview/{name}?v={}"></script>"#,
+                let version = if name == "copy.js" {
+                    copy_version()
+                } else {
                     static_version()
+                };
+                let link = format!(
+                    r#"<script nonce="{nonce}" src="/_markview/{name}?v={version}"></script>"#
                 );
                 html = html.replace(
                     &link,

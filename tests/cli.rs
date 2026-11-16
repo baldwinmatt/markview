@@ -2466,6 +2466,33 @@ fn without_timestamp(body: &str) -> String {
     format!("{before}{marker}TIMESTAMP\"{after}")
 }
 
+/// The digest in the copy assets' `?v=` links: FNV-1a/64 over copy.js then
+/// copy.css, and nothing else. A plain page links only these two, so editing
+/// the review scripts must not change its bytes.
+fn copy_assets_version() -> String {
+    markview::annotations::source_revision(concat!(
+        include_str!("../src/annotations/copy.js"),
+        include_str!("../src/annotations/copy.css"),
+    ))
+}
+
+/// Replaces the copy assets' version, which follows their content, so the
+/// fixture does not have to be regenerated when they are edited.
+fn without_copy_version(body: &str) -> String {
+    let version = copy_assets_version();
+    for name in ["copy.css", "copy.js"] {
+        assert!(
+            body.contains(&format!("/_markview/{name}?v={version}\"")),
+            "{name} is not versioned by the copy assets alone"
+        );
+    }
+    body.replace(&format!("?v={version}\""), "?v=COPY_VERSION\"")
+}
+
+fn plain_page_body(body: &str) -> String {
+    without_copy_version(&without_timestamp(body))
+}
+
 const BASELINE_HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\nContent-Length: 13909\r\nConnection: close";
 const BASELINE_BODY: &str = include_str!("fixtures/serve-baseline.expected.html");
 
@@ -2476,7 +2503,49 @@ fn serve_page_without_annotations_matches_the_plain_page_fixture() {
     let response = http_get(server.port, "/");
     let (head, body) = response.split_once("\r\n\r\n").unwrap();
     assert_eq!(head, BASELINE_HEAD);
-    assert_eq!(without_timestamp(body), BASELINE_BODY);
+    assert_eq!(plain_page_body(body), BASELINE_BODY);
+}
+
+#[test]
+fn plain_page_version_is_independent_of_the_review_scripts() {
+    use markview::annotations::source_revision;
+    let (_dir, site) = baseline_site();
+    let server = ServeProcess::start_dir(&site);
+    let page = http_get(server.port, "/");
+    let token = page
+        .split("/_markview/copy.js?v=")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("versioned copy script");
+    assert_eq!(token, copy_assets_version());
+    // The same digest over the copy assets plus a review script, edited or
+    // not, is a different token: the review scripts are not hashed into it.
+    let review = include_str!("../src/annotations/review.js");
+    let verdict = include_str!("../src/annotations/verdict.js");
+    let copy = concat!(
+        include_str!("../src/annotations/copy.js"),
+        include_str!("../src/annotations/copy.css"),
+    );
+    for script in [
+        review.to_owned(),
+        format!("{review}// edited"),
+        verdict.to_owned(),
+    ] {
+        assert_ne!(token, source_revision(&format!("{script}{copy}")));
+        assert_ne!(token, source_revision(&format!("{copy}{script}")));
+    }
+    // A review page versions its own assets separately.
+    let store = site.join(".markview/annotations");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("guide.md"), "## a1 [open] document\n\nExpand.\n").unwrap();
+    let annotated = http_get(server.port, "/guide.md");
+    let review_token = annotated
+        .split("/_markview/review.js?v=")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("versioned review script");
+    assert_ne!(review_token, token);
+    assert!(annotated.contains(&format!("/_markview/copy.js?v={token}\"")));
 }
 
 #[test]
@@ -2502,7 +2571,7 @@ fn serve_injects_review_hooks_only_where_they_are_needed() {
     let plain = http_get(read_only.port, "/");
     let (head, body) = plain.split_once("\r\n\r\n").unwrap();
     assert_eq!(head, BASELINE_HEAD);
-    assert_eq!(without_timestamp(body), BASELINE_BODY);
+    assert_eq!(plain_page_body(body), BASELINE_BODY);
     let annotated = http_get(read_only.port, "/guide.md");
     for hook in hooks {
         assert!(annotated.contains(hook), "{hook}: {annotated}");
@@ -2675,16 +2744,31 @@ fn serve_annotate_pages_allow_only_their_own_nonce_scripts() {
     let scripts: Vec<_> = body.match_indices("<script").collect();
     assert_eq!(
         scripts.len(),
-        3,
-        "review.js, its start-up call, live reload"
+        4,
+        "review.js, copy.js, start-up call, live reload"
     );
-    for (index, _) in scripts {
+    for (index, _) in &scripts {
         assert!(
-            body[index..].starts_with(&format!("<script nonce=\"{nonce}\"")),
+            body[*index..].starts_with(&format!("<script nonce=\"{nonce}\"")),
             "{}",
-            &body[index..index + 60]
+            &body[*index..*index + 60]
         );
     }
+    for name in ["review.js", "copy.js"] {
+        assert_eq!(
+            body.matches(&format!(
+                "<script nonce=\"{nonce}\" src=\"/_markview/{name}?v="
+            ))
+            .count(),
+            1,
+            "{name}"
+        );
+    }
+    assert_eq!(
+        body.matches(&format!("<script nonce=\"{nonce}\">")).count(),
+        2,
+        "start-up call and live reload"
+    );
     // What the document tried to inject is text, or a dead link.
     assert!(body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
     assert!(body.contains("&lt;img src=x onerror=alert(2)&gt;"));
@@ -3227,14 +3311,7 @@ fn review_serves_a_verdict_and_saved_comments_with_optional_gate() {
         let mut server = start_review(dir.path(), options);
         let port = server.port;
         assert!(requested.is_none_or(|requested| requested == port));
-        let html = http_get(port, "/");
-        let token = html
-            .split("const token = \"")
-            .nth(1)
-            .unwrap()
-            .split('"')
-            .next()
-            .unwrap();
+        let token = &review_token(&http_get_local(port, "/"));
         let host = format!("localhost:{port}");
         let summary = raw_http(
             port,
@@ -3374,14 +3451,7 @@ fn review_finish_rejects_missing_token_and_times_out_an_incomplete_form() {
     )
     .starts_with("HTTP/1.1 403"));
 
-    let page = http_get(port, "/");
-    let token = page
-        .split("const token = \"")
-        .nth(1)
-        .unwrap()
-        .split('"')
-        .next()
-        .unwrap();
+    let token = review_token(&http_get_local(port, "/"));
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(6)))

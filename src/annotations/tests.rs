@@ -6,7 +6,7 @@ fn add(body: &str) -> Operation {
     Operation::Add {
         body: body.to_owned(),
         selection: None,
-        document_revision: None,
+        revision: None,
     }
 }
 
@@ -16,9 +16,8 @@ fn selection(source: &str, quote: &str, range: Range<usize>, body: &str) -> Oper
         selection: Some(Selection {
             quote: quote.to_owned(),
             range,
-            revision: source_revision(source),
         }),
-        document_revision: None,
+        revision: Some(source_revision(source)),
     }
 }
 
@@ -1165,4 +1164,67 @@ fn canonical_source_reads_reject_paths_without_a_file_name_instead_of_panicking(
     fs::write(&doc, "# Fine\n").unwrap();
     let doc = resolve(&doc).unwrap().document;
     assert_eq!(read_canonical_source(&doc).unwrap(), "# Fine\n");
+}
+
+#[test]
+fn a_stale_revision_conflicts_alike_before_and_under_the_lock() {
+    for text in [false, true] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("doc.md");
+        let (original, changed) = ("# Doc\n\nfirst second\n", "# Doc\n\nfirst second!\n");
+        fs::write(&path, original).unwrap();
+        let location = resolve(&path).unwrap();
+        let add = |revision: String| Operation::Add {
+            body: "Note".to_owned(),
+            selection: text.then(|| Selection {
+                quote: "second".to_owned(),
+                range: 8..14,
+            }),
+            revision: Some(revision),
+        };
+        // Stale when the add starts: refused before anything is created.
+        let before = mutate(&location, add(source_revision(changed))).unwrap_err();
+        assert!(matches!(before, Error::Conflict(_)), "{before:?}");
+        // Current at first, stale by the time the lock is held.
+        let rewrite = path.clone();
+        AFTER_PRECHECK.set(Some(Box::new(move || fs::write(rewrite, changed).unwrap())));
+        let under = mutate(&location, add(source_revision(original))).unwrap_err();
+        assert!(matches!(under, Error::Conflict(_)), "{under:?}");
+        assert_eq!(before.to_string(), under.to_string(), "text add: {text}");
+        assert!(!dir.path().join(".markview").exists(), "text add: {text}");
+    }
+}
+
+#[test]
+fn request_parse_reads_one_revision_for_both_kinds_of_add() {
+    let revision = |request: &str, policy| match Request::parse_with(request.as_bytes(), policy) {
+        Ok(Request {
+            operation: Operation::Add { revision, .. },
+            ..
+        }) => Ok(revision),
+        other => Err(other.map(|_| ()).unwrap_err().to_string()),
+    };
+    use RevisionPolicy::{Optional, Required};
+    assert_eq!(
+        revision("op=add&body=x&source_revision=abc", Optional),
+        Ok(Some("abc".to_owned()))
+    );
+    assert_eq!(
+        revision(
+            "op=add&body=x&quote=a&start=0&end=1&source_revision=abc",
+            Required
+        ),
+        Ok(Some("abc".to_owned()))
+    );
+    assert_eq!(revision("op=add&body=x", Optional), Ok(None));
+    assert_eq!(
+        revision("op=add&body=x", Required),
+        Err("source revision required".to_owned())
+    );
+    assert_eq!(
+        revision("op=add&body=x&source_revision=", Optional),
+        Err("source revision must not be empty".to_owned())
+    );
+    // A selection cannot be made without the revision it was made against.
+    assert!(revision("op=add&body=x&quote=a&start=0&end=1", Optional).is_err());
 }

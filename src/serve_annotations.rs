@@ -583,19 +583,12 @@ pub fn handle(
                 .then(|| shared.read().expect("config lock").clone());
             let config = published.as_deref().or(live.as_ref()).unwrap_or(&initial);
             let mutation = || {
-                let form = Request::parse(body.as_deref().expect("validated POST"))?;
-                if api.is_some()
-                    && matches!(
-                        &form.operation,
-                        annotations::Operation::Add {
-                            selection: None,
-                            document_revision: None,
-                            ..
-                        }
-                    )
-                {
-                    return Err(Error::Invalid("source revision required"));
-                }
+                let policy = if api.is_some() {
+                    annotations::RevisionPolicy::Required
+                } else {
+                    annotations::RevisionPolicy::Optional
+                };
+                let form = Request::parse_with(body.as_deref().expect("validated POST"), policy)?;
                 let route = form
                     .doc
                     .ok_or(Error::Invalid("expected a document route"))?;

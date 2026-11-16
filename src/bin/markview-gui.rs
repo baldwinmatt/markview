@@ -1577,13 +1577,14 @@ fn apply_annotation(
     if request.doc.is_some() {
         return Err(Error::Invalid("document is identified by the tab"));
     }
-    if let Operation::Add { selection, .. } = &request.operation {
+    if matches!(&request.operation, Operation::Add { .. }) {
         if tab.is_dirty() {
             return Err(Error::Invalid("save this document to comment"));
         }
-        if selection.as_ref().is_some_and(|selected| {
-            selected.revision() != annotations::source_revision(tab.document().source())
-        }) {
+        if request.operation.is_selection()
+            && request.operation.source_revision()
+                != Some(annotations::source_revision(tab.document().source()).as_str())
+        {
             return Err(Error::Conflict(
                 "the preview changed, select the text again",
             ));

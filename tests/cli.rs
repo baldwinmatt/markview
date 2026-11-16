@@ -4220,3 +4220,29 @@ fn document_and_annotation_endpoints_report_unreadable_documents_alike() {
     }
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
 }
+
+#[test]
+fn browser_endpoint_validates_a_lone_source_revision_on_whole_document_comments() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "# Home\n\ntext\n";
+    let doc = dir.path().join("README.md");
+    std::fs::write(&doc, source).unwrap();
+    let server =
+        ServeProcess::try_start_with_env(&[&doc], 0, false, false, false, None, true).unwrap();
+    let port = server.port;
+    let token = review_token(&http_get_local(port, "/"));
+    let revision = markview::annotations::source_revision(source);
+    let add = |revision: &str| {
+        post_annotation(
+            port,
+            &token,
+            &format!("op=add&doc=%2F&body=Whole&source_revision={revision}"),
+        )
+    };
+    assert!(add(&revision).starts_with("HTTP/1.1 200"));
+    assert!(add("0000000000000000").starts_with("HTTP/1.1 409"));
+    let empty = add("");
+    assert!(empty.starts_with("HTTP/1.1 400"), "{empty}");
+    // The browser UI may still send no revision at all.
+    assert!(post_annotation(port, &token, "op=add&doc=%2F&body=Bare").starts_with("HTTP/1.1 200"));
+}

@@ -486,21 +486,17 @@ pub struct Request {
 pub struct Selection {
     quote: String,
     range: Range<usize>,
-    revision: String,
 }
 
-impl Selection {
-    pub fn revision(&self) -> &str {
-        &self.revision
-    }
-}
-
+/// The source revision a request was made against: the one slot both kinds
+/// of add use. A text add always names it; a whole-document add may leave
+/// it out unless the caller's `RevisionPolicy` requires it.
 #[derive(Debug)]
 pub enum Operation {
     Add {
         body: String,
         selection: Option<Selection>,
-        document_revision: Option<String>,
+        revision: Option<String>,
     },
     Change {
         id: u64,
@@ -572,40 +568,77 @@ pub fn parse_form(bytes: &[u8]) -> Result<HashMap<String, String>, Error> {
     Ok(fields)
 }
 
+/// Whether an add must say which source revision it was written against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RevisionPolicy {
+    /// A whole-document add may omit it (the browser page does).
+    Optional,
+    /// Every add names it, so a stale write is always refused (agents).
+    Required,
+}
+
+impl Operation {
+    /// The source revision an add was made against, if it names one.
+    pub fn source_revision(&self) -> Option<&str> {
+        match self {
+            Self::Add { revision, .. } => revision.as_deref(),
+            Self::Change { .. } => None,
+        }
+    }
+
+    /// Whether this is an add anchored to selected text.
+    pub fn is_selection(&self) -> bool {
+        matches!(
+            self,
+            Self::Add {
+                selection: Some(_),
+                ..
+            }
+        )
+    }
+}
+
 impl Request {
+    /// Parses with `RevisionPolicy::Optional`.
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::parse_with(bytes, RevisionPolicy::Optional)
+    }
+
+    pub fn parse_with(bytes: &[u8], policy: RevisionPolicy) -> Result<Self, Error> {
         let mut fields = parse_form(bytes)?;
         let invalid = Error::Invalid("missing or invalid annotation fields");
         let doc = fields.remove("doc");
         let operation = match fields.remove("op").as_deref() {
             Some("add") => {
                 let body = take_body(&mut fields)?;
-                let (selection, document_revision) = match (
+                let revision = fields.remove("source_revision");
+                if revision.as_deref() == Some("") {
+                    return Err(Error::Invalid("source revision must not be empty"));
+                }
+                let selection = match (
                     fields.remove("quote"),
                     fields.remove("start"),
                     fields.remove("end"),
-                    fields.remove("source_revision"),
                 ) {
-                    (None, None, None, revision) => (None, revision),
-                    (Some(quote), Some(start), Some(end), Some(revision)) => {
+                    (None, None, None) => None,
+                    (Some(quote), Some(start), Some(end)) if revision.is_some() => {
                         let start =
                             decimal(&start).ok_or(Error::Invalid("invalid selection start"))?;
                         let end = decimal(&end).ok_or(Error::Invalid("invalid selection end"))?;
-                        (
-                            Some(Selection {
-                                quote,
-                                range: start..end,
-                                revision,
-                            }),
-                            None,
-                        )
+                        Some(Selection {
+                            quote,
+                            range: start..end,
+                        })
                     }
                     _ => return Err(invalid),
                 };
+                if policy == RevisionPolicy::Required && revision.is_none() {
+                    return Err(Error::Invalid("source revision required"));
+                }
                 Operation::Add {
                     body,
                     selection,
-                    document_revision,
+                    revision,
                 }
             }
             Some(op @ ("edit" | "status" | "delete")) => {
@@ -664,10 +697,39 @@ fn refresh(record: &mut Annotation, projection: &TextProjection, range: Range<us
     record.hint("start", range.start.to_string());
 }
 
-fn validate_selection(projection: &TextProjection, selection: &Selection) -> Result<String, Error> {
-    if selection.revision != projection.revision {
-        return Err(Error::Conflict("document changed, select the text again"));
+/// The one comparison of a request's source revision with the source's
+/// projection, for the check before the lock and the one under it.
+fn check_revision(
+    projection: &TextProjection,
+    revision: &str,
+    selection: bool,
+) -> Result<(), Error> {
+    if revision == projection.revision {
+        return Ok(());
     }
+    Err(Error::Conflict(if selection {
+        "document changed, select the text again"
+    } else {
+        "document changed, fetch the current revision"
+    }))
+}
+
+/// An add's revision and, for a text add, its quote, against `projection`.
+fn validate_add(
+    projection: &TextProjection,
+    selection: Option<&Selection>,
+    revision: Option<&str>,
+) -> Result<(), Error> {
+    if let Some(revision) = revision {
+        check_revision(projection, revision, selection.is_some())?;
+    }
+    if let Some(selection) = selection {
+        validate_selection(projection, selection)?;
+    }
+    Ok(())
+}
+
+fn validate_selection(projection: &TextProjection, selection: &Selection) -> Result<String, Error> {
     if !projection.matches(
         selection.range.clone(),
         &projection::normalized(&selection.quote),
@@ -683,15 +745,6 @@ fn validate_selection(projection: &TextProjection, selection: &Selection) -> Res
     Ok(quote)
 }
 
-fn validate_document_revision(projection: &TextProjection, revision: &str) -> Result<(), Error> {
-    if revision != projection.revision {
-        return Err(Error::Conflict(
-            "document changed, fetch the current revision",
-        ));
-    }
-    Ok(())
-}
-
 pub fn mutate(location: &Location, operation: Operation) -> Result<Review, Error> {
     ReviewCache::default().mutate(location, operation)
 }
@@ -701,6 +754,14 @@ pub fn mutate(location: &Location, operation: Operation) -> Result<Review, Error
 #[cfg(test)]
 thread_local! {
     static BEFORE_COMMIT: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+// Runs once, between the check before the lock and taking it: where a source
+// change slips in that only the check under the lock can catch.
+#[cfg(test)]
+thread_local! {
+    static AFTER_PRECHECK: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -715,15 +776,18 @@ fn mutate_with(
     // again against the source read under the lock.
     if let Operation::Add {
         selection,
-        document_revision,
+        revision,
         ..
     } = &operation
     {
-        if let Some(selection) = selection {
-            validate_selection(&project(&read_source(location)?), selection)?;
-        } else if let Some(revision) = document_revision {
-            validate_document_revision(&project(&read_source(location)?), revision)?;
+        if revision.is_some() || selection.is_some() {
+            let projection = project(&read_source(location)?);
+            validate_add(&projection, selection.as_ref(), revision.as_deref())?;
         }
+    }
+    #[cfg(test)]
+    if let Some(interrupt) = AFTER_PRECHECK.take() {
+        interrupt();
     }
     let existing = snapshot(location)?;
     if matches!(&operation, Operation::Change { .. }) && existing.is_none() {
@@ -757,11 +821,9 @@ fn mutate_locked(
         Operation::Add {
             body,
             selection,
-            document_revision,
+            revision,
         } => {
-            if let Some(revision) = document_revision {
-                validate_document_revision(&projection, &revision)?;
-            }
+            validate_add(&projection, selection.as_ref(), revision.as_deref())?;
             let id = store
                 .annotations
                 .iter()

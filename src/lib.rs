@@ -746,6 +746,8 @@ Render options:
 
 Review options:
       --review           Open an annotatable browser review and wait for a verdict
+                         (agents may also comment and decide through the HTTP API,
+                         see --annotate)
       --gate             Exit 2 if changes are requested (requires --review)
       --no-open          Skip launching a browser (requires --review)
       --annotations      List open comments for Markdown files or directories
@@ -753,7 +755,9 @@ Review options:
                          Include resolved comments after open comments
 
 Serve options:
-      --annotate         Enable writing review comments from the browser
+      --annotate         Enable writing review comments from the browser. With
+                         MARKVIEW_API_TOKEN set (64 lowercase hex digits), also from
+                         the HTTP API at /_markview/api/v1 (see the README)
       --serve            Serve the given files, or the top-level Markdown files of a
                          directory, with navigation between documents
       --port <PORT>      Listen on PORT (serve defaults to 7878, review to any free port)

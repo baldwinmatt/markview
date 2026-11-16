@@ -86,6 +86,24 @@ Done when `/` returns `200`. Then give the user the URL, the PID, and `kill <PID
 - The server binds to `127.0.0.1`. For a remote host, the user forwards the port first: `ssh -L <PORT>:localhost:<PORT> user@host`.
 
 
+### Use the HTTP API
+
+A running server also answers JSON under `/_markview/api/v1/`. Start with the
+catalog, `/_markview/api/v1/documents` (`curl -s http://localhost:<PORT>/_markview/api/v1/documents`): it lists the
+served documents and says, in `can_annotate` and `can_finish`, whether this
+server accepts writes. `/document?doc=<route>` returns the source and the
+`projected_text` to anchor comments in, and `/annotations?doc=<route>` the saved
+comments and their revisions. Reads need no token.
+
+Writes need a token chosen when the server starts: set `MARKVIEW_API_TOKEN` to
+64 lowercase hex digits (`openssl rand -hex 32`) in the environment of
+`markview --serve --annotate` or `markview --review`, and send it as
+`Authorization: Bearer <token>`. The README's *Agent HTTP API* section has the
+fields, revisions and errors. An existing daemon started without the token must
+be restarted with it: the token cannot be added to a running server, and
+`--annotate` or `--review` is required as well. When `can_annotate` is `false`,
+say so rather than falling back to editing the store file.
+
 ## Read and address saved comments
 
 Run `markview --annotations <FILE or DIR>...` for open comments, current

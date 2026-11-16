@@ -186,6 +186,30 @@ annotation text walk. Browser code copy uses the clipboard API. GUI code copy
 uses a bounded IPC frame addressed to the current Preview tab and source
 revision, with the same native pasteboard helper as Copy Path.
 
+## Agent HTTP API
+
+`src/serve_api.rs` answers everything under `/_markview/api/v1/`. The request
+flow is: the strict HTTP reader parses the request, `serve_annotations::handle`
+applies the loopback `Host` check and hands the prefix to `serve_api::handle`,
+which then owns the route table, the credential, the lock policy and the
+errors. Both handlers share only helpers (`json_response`, `post_body`,
+`query_document`, `respond_error`, `token_matches`), the review endpoint and the
+annotations endpoint, which take their differences as data (`Writes`).
+
+Writes need a second credential beside the page token: `MARKVIEW_API_TOKEN`,
+64 lowercase hex digits read once at startup into `ServeSession`. An empty
+value counts as unset and a malformed one stops `--annotate` and `--review`.
+`ServeSession::api_access` is the one place that says what the credential
+allows (comment, and give a verdict only under `--review`); the catalog's
+`can_annotate` and `can_finish` and the write gate both read it. Reads need no
+credential. `GET /document` goes through the same `ReviewCache` projection as
+`GET /annotations`, so a revision is projected once, refuses a document over
+16 MiB, and answers `If-None-Match` with `304`. An API write without a
+review session reads the live config but never holds the config lock across the
+store's blocking `flock`. Every add names the revision it was made against; the
+check runs before the lock (by digest for a whole-document add) and again
+under it.
+
 ## Packaging
 
 Local macOS packaging keeps Cargo as the build path:

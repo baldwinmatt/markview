@@ -141,6 +141,13 @@ Markview is a small, fast, local-first Markdown viewer written in Rust. The proj
   render in the terminal and every HTML frontend.
 - [Review workflow specification](REVIEW_WORKFLOW_SPEC.md)
 
+### FEAT-006: Agent HTTP API
+
+- **Status** — Implemented.
+- Agents can list served documents, fetch a document with its anchoring text, and read comments under `/_markview/api/v1/`. With `MARKVIEW_API_TOKEN` and `--annotate` or `--review` they can also save revision-bound comments and give the review verdict.
+- [Annotation specification](ANNOTATIONS_SPEC.md)
+- [Review workflow specification](REVIEW_WORKFLOW_SPEC.md)
+
 ## Review Workflow
 
 Every commit should be reviewed before starting the next task:

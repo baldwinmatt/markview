@@ -115,6 +115,7 @@ Provide an accessible "Single-key shortcuts" toggle in the review panel, on by d
 ## Security Boundaries
 
 - [x] `/_markview/review` exists only under `--review`. Outside that mode, `GET`/`HEAD` return `404` and `POST` returns `405`. Apply the existing local `Host` check to reads and writes and the token check to every finish request. Reuse the annotations endpoint's form framing, size cap, and read deadline. Review responses use `Cache-Control: no-store`. The page route carried by finish is an allowlist key and never a filesystem path.
+- [x] `/_markview/api/v1/review` follows the same rule, with `Authorization: Bearer <MARKVIEW_API_TOKEN>` in place of the page token: `404` for every method outside `--review`; inside it, `GET` returns the summary (`finished` is `false`, and the whole body is `{"finished":true}` once a verdict is accepted) and `POST` returns `403` when API writes are disabled.
 - [x] `--review` keeps every annotations boundary: loopback only, `Host` check, per-process token, no CORS headers, nonce-only script policy.
 - [x] Serve the new UI logic through Markview's existing nonce-approved scripts. Use DOM listeners and text nodes for controls, counts, errors, and other data.
 - [x] Cap copied GUI text at 1 MiB of UTF-8. Bound the IPC frame before decoding it, and verify the decoded byte length before touching the pasteboard. Report an error without truncation if the cap is exceeded.

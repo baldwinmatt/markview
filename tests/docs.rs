@@ -177,3 +177,75 @@ fn plain_page_claims_match_what_a_plain_page_carries() {
         }
     }
 }
+
+fn normalized(file: &str) -> String {
+    fs::read_to_string(file)
+        .unwrap_or_else(|error| panic!("read {file}: {error}"))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[test]
+fn specs_describe_the_agent_api_and_its_credential() {
+    let annotations = normalized("ANNOTATIONS_SPEC.md");
+    // The statements the API made false are gone.
+    for old in [
+        "accepted on `/_markview/annotations` only",
+        "per-process random token on every `POST`",
+    ] {
+        assert!(!annotations.contains(old), "outdated: {old}");
+    }
+    for claim in [
+        "then `POST` is accepted on `/_markview/annotations` and, with `--annotate` or `--review` and a `MARKVIEW_API_TOKEN`, on `/_markview/api/v1/annotations` and, under `--review`, `/_markview/api/v1/review`",
+        "Require a per-process random token on every browser `POST`",
+        "Require `Authorization: Bearer <MARKVIEW_API_TOKEN>` on every API `POST`",
+        "compared in constant time",
+        "An API route that does not exist, or that this server does not offer, returns `404` for every method; a route that exists and gets another method returns `405`; a write while API writes are disabled returns `403`",
+        "`GET /_markview/api/v1/documents`, `/document` and `/annotations` need no credential, only a loopback `Host`",
+        "no CORS headers",
+        "an `Authorization` header forces a preflight",
+        "Both kinds of add carry one `source_revision`",
+    ] {
+        assert!(annotations.contains(claim), "ANNOTATIONS_SPEC.md: {claim}");
+    }
+    let review = normalized("REVIEW_WORKFLOW_SPEC.md");
+    for claim in [
+        "`/_markview/api/v1/review` follows the same rule",
+        "`Authorization: Bearer <MARKVIEW_API_TOKEN>` in place of the page token",
+        "`404` for every method outside `--review`",
+    ] {
+        assert!(review.contains(claim), "REVIEW_WORKFLOW_SPEC.md: {claim}");
+    }
+}
+
+#[test]
+fn architecture_skill_help_and_roadmap_cover_the_agent_api() {
+    let architecture = normalized("ARCHITECTURE.md");
+    for claim in [
+        "## Agent HTTP API",
+        "`src/serve_api.rs`",
+        "second credential",
+        "`MARKVIEW_API_TOKEN`",
+        "request flow",
+        "`ServeSession::api_access`",
+    ] {
+        assert!(architecture.contains(claim), "ARCHITECTURE.md: {claim}");
+    }
+    let skill = normalized("skills/markview/SKILL.md");
+    for claim in [
+        "### Use the HTTP API",
+        "`/_markview/api/v1/documents`",
+        "`MARKVIEW_API_TOKEN`",
+        "`openssl rand -hex 32`",
+        "`--annotate` or `--review`",
+        "started without the token must be restarted",
+    ] {
+        assert!(skill.contains(claim), "SKILL.md: {claim}");
+    }
+    let help = markview::help();
+    assert!(help.contains("MARKVIEW_API_TOKEN"), "{help}");
+    assert!(help.contains("/_markview/api/v1"), "{help}");
+    let roadmap = normalized("ROADMAP.md");
+    assert!(roadmap.contains("### FEAT-006: Agent HTTP API"));
+}

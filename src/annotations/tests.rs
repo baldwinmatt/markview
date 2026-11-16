@@ -1145,3 +1145,24 @@ fn limited_source_reads_refuse_a_file_over_the_limit_by_its_size() {
     let error = read_canonical_source_limited(&doc, 9).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
 }
+
+#[test]
+fn canonical_source_reads_reject_paths_without_a_file_name_instead_of_panicking() {
+    for path in [
+        "/usr/..",
+        "/usr/bin/..",
+        "/..",
+        "/usr/bin/../",
+        "/",
+        "",
+        "relative.md",
+    ] {
+        let error = read_canonical_source(Path::new(path)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{path:?}");
+    }
+    let dir = tempdir().unwrap();
+    let doc = dir.path().join("doc.md");
+    fs::write(&doc, "# Fine\n").unwrap();
+    let doc = resolve(&doc).unwrap().document;
+    assert_eq!(read_canonical_source(&doc).unwrap(), "# Fine\n");
+}

@@ -3146,12 +3146,16 @@ impl ServeProcess {
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }
-        cmd.args(["--port", &port.to_string()])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.args(["--port", &port.to_string()]);
         if log_disconnects {
             cmd.env("MARKVIEW_LOG_EVENT_DISCONNECTS", "1");
         }
+        Self::launch(cmd)
+    }
+
+    /// Spawns a prepared `--serve` command and waits for its startup line.
+    fn launch(mut cmd: std::process::Command) -> Result<Self, String> {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd.spawn().expect("spawn server");
         let stdout = child.stdout.take().expect("stdout");
         let mut reader = BufReader::new(stdout);
@@ -3968,4 +3972,86 @@ fn review_signals_cancel_without_losing_comments() {
         assert!(stdout.is_empty());
         assert_eq!(std::fs::read_to_string(&annotation_path).unwrap(), comment);
     }
+}
+
+/// Starts `--serve --annotate` on `dir` with `MARKVIEW_API_TOKEN` set.
+fn start_api_server(dir: &std::path::Path, token: &str, recurse: bool) -> ServeProcess {
+    let mut cmd = std::process::Command::new(cargo_bin("markview"));
+    cmd.args(["--serve", "--annotate", "--port", "0"])
+        .arg(dir)
+        .env("MARKVIEW_API_TOKEN", token);
+    if recurse {
+        cmd.arg("--recurse");
+    }
+    ServeProcess::launch(cmd).unwrap_or_else(|message| panic!("{message}"))
+}
+
+/// `GET` that gives up (`None`) when no complete response arrives within `limit`.
+fn get_within(port: u16, route: &str, limit: Duration) -> Option<String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(limit)).ok()?;
+    write!(
+        stream,
+        "GET {route} HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    Some(response)
+}
+
+#[cfg(unix)]
+#[test]
+fn api_write_waiting_on_a_store_lock_does_not_stall_a_rescan_or_other_requests() {
+    use std::os::unix::io::AsRawFd;
+    let dir = tempfile::tempdir().unwrap();
+    let source = "# Home\n";
+    std::fs::write(dir.path().join("README.md"), source).unwrap();
+    let token = "b2".repeat(32);
+    let server = start_api_server(dir.path(), &token, true);
+    let port = server.port;
+
+    // Hold the document's store lock so the next API write blocks on it.
+    let store = dir.path().join(".markview/annotations");
+    std::fs::create_dir_all(&store).unwrap();
+    let lock = std::fs::File::create(store.join("README.md.markview-lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+    let form = format!(
+        "op=add&doc=%2FREADME.md&body=Queued&source_revision={}",
+        markview::annotations::source_revision(source)
+    );
+    let mut pending = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(
+        pending,
+        "POST /_markview/api/v1/annotations HTTP/1.1\r\nHost: localhost:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{form}",
+        form.len()
+    )
+    .unwrap();
+    // Let the write reach the lock before the rescan is triggered.
+    std::thread::sleep(Duration::from_millis(300));
+
+    std::fs::write(dir.path().join("added.md"), "# Added\n").unwrap();
+    let until = Instant::now() + Duration::from_secs(20);
+    loop {
+        let catalog = get_within(port, "/_markview/api/v1/documents", Duration::from_secs(5))
+            .expect("the catalog is answered while an API write waits for a store lock");
+        assert!(catalog.starts_with("HTTP/1.1 200"), "{catalog}");
+        if catalog.contains("/added.md") {
+            break;
+        }
+        assert!(Instant::now() < until, "rescan never published: {catalog}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    pending
+        .set_read_timeout(Some(Duration::from_secs(8)))
+        .unwrap();
+    let mut response = String::new();
+    pending.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(std::fs::read_to_string(store.join("README.md"))
+        .unwrap()
+        .contains("Queued"));
 }

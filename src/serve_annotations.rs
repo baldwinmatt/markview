@@ -526,9 +526,17 @@ pub fn handle(
         "POST" if body.is_some() => {
             // Agent writes and blocking reviews use the current allowlist
             // and hold it stable through validation and writing.
-            let published =
-                (session.is_some() || api.is_some()).then(|| shared.read().expect("config lock"));
-            let config = published.as_deref().unwrap_or(&initial);
+            // Only a review session holds the guard: its saves must see a
+            // stable allowlist. An API write without a session takes the
+            // live config but never holds the lock across the store's
+            // blocking flock, which would stall every request behind a
+            // rescan waiting to publish.
+            let published = session
+                .is_some()
+                .then(|| shared.read().expect("config lock"));
+            let live = (session.is_none() && api.is_some())
+                .then(|| shared.read().expect("config lock").clone());
+            let config = published.as_deref().or(live.as_ref()).unwrap_or(&initial);
             let mutation = || {
                 let form = Request::parse(body.as_deref().expect("validated POST"))?;
                 if api.is_some()

@@ -1735,13 +1735,8 @@ fn serve_annotations_enforces_http_boundaries_and_keeps_stores_in_sync() {
     let port = server.port;
     let host = format!("localhost:{port}");
     let page = http_get(port, "/");
-    let token = page
-        .split("const token = \"")
-        .nth(1)
-        .unwrap()
-        .split('"')
-        .next()
-        .unwrap();
+    let token = review_token(&page);
+    let token = token.as_str();
     let nonce = page
         .split("nonce-")
         .nth(1)
@@ -1824,6 +1819,61 @@ fn serve_annotations_enforces_http_boundaries_and_keeps_stores_in_sync() {
     assert!(response.starts_with("HTTP/1.1 405"));
 }
 
+/// The review token a `--annotate` page embeds for its own POSTs.
+fn review_token(page: &str) -> String {
+    page.split("const token = \"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("review token")
+        .to_owned()
+}
+
+fn post_annotation(port: u16, token: &str, form: &str) -> String {
+    raw_http(port, &format!(
+        "POST /_markview/annotations HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/x-www-form-urlencoded\r\nX-Markview-Token: {token}\r\nContent-Length: {}\r\n\r\n{form}",
+        form.len()
+    ))
+}
+
+#[test]
+fn serve_annotations_accepts_writes_next_to_a_hand_edited_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = dir.path().join("review.md");
+    std::fs::write(&doc, "one\n\nthree\n").unwrap();
+    let store_dir = dir.path().join(".markview/annotations");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    let store = store_dir.join("review.md");
+    let hand_edited = "## a1 [open] line 3\n\nPlease reword this line.\n";
+    std::fs::write(&store, hand_edited).unwrap();
+    let server =
+        ServeProcess::try_start_with_env(&[&doc], 0, false, false, false, None, true).unwrap();
+    let token = review_token(&http_get(server.port, "/"));
+
+    let added = post_annotation(
+        server.port,
+        &token,
+        "op=add&doc=%2Freview.md&body=Whole+document",
+    );
+    assert!(added.starts_with("HTTP/1.1 200"), "{added}");
+    let written = std::fs::read_to_string(&store).unwrap();
+    assert!(written.starts_with(hand_edited), "{written}");
+    assert!(written.contains("## a2 [open] document"), "{written}");
+
+    let revision = added
+        .split("\"store_revision\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap();
+    let unsafe_edit = post_annotation(
+        server.port,
+        &token,
+        &format!("op=edit&doc=%2Freview.md&id=a1&store_revision={revision}&body=%3E+not+a+quote"),
+    );
+    assert!(unsafe_edit.starts_with("HTTP/1.1 409"), "{unsafe_edit}");
+    assert!(unsafe_edit.contains("annotation a1 "), "{unsafe_edit}");
+    assert_eq!(std::fs::read_to_string(&store).unwrap(), written);
+}
+
 #[test]
 fn serve_annotations_rejects_a_body_that_exceeds_the_read_deadline() {
     let dir = tempfile::tempdir().unwrap();
@@ -1832,13 +1882,8 @@ fn serve_annotations_rejects_a_body_that_exceeds_the_read_deadline() {
     let server =
         ServeProcess::try_start_with_env(&[&doc], 0, false, false, false, None, true).unwrap();
     let page = http_get(server.port, "/");
-    let token = page
-        .split("const token = \"")
-        .nth(1)
-        .unwrap()
-        .split('"')
-        .next()
-        .unwrap();
+    let token = review_token(&page);
+    let token = token.as_str();
     let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(6)))

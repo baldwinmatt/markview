@@ -304,7 +304,7 @@ pub fn handle(
         Err(error) => {
             let status = match error {
                 Error::Invalid(_) => "400 Bad Request",
-                Error::Conflict(_) => "409 Conflict",
+                Error::Conflict(_) | Error::Section(..) => "409 Conflict",
                 Error::Io(_) => "500 Internal Server Error",
             };
             let message = error.to_string();

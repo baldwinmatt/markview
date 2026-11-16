@@ -37,6 +37,14 @@ pub struct Annotation {
 }
 
 impl Annotation {
+    /// Records a machine hint. A hand-edited metadata line that does not
+    /// parse is written back verbatim, so it takes no new fields.
+    pub(super) fn hint(&mut self, key: &str, value: String) {
+        if self.raw_metadata.is_none() {
+            self.metadata.insert(key.to_owned(), value);
+        }
+    }
+
     pub(super) fn new(id: u64, body: String) -> Self {
         Self {
             id,
@@ -54,7 +62,11 @@ impl Annotation {
 pub struct Store {
     pub preamble: String,
     pub annotations: Vec<Annotation>,
+    /// Every line in the file read ended with CRLF, so writes keep CRLF.
+    crlf: bool,
 }
+
+const BYTE_ORDER_MARK: char = '\u{feff}';
 
 fn number<T: std::str::FromStr>(value: &str) -> Option<T> {
     (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
@@ -172,7 +184,26 @@ impl Store {
         format!("# Annotations: {name}\n\n<!-- markview-annotations v1. To resolve one, change [open] to [resolved]. Deleting a section deletes the annotation. Prefix a header-shaped body line with a backslash. -->\n\n")
     }
 
+    pub fn new(preamble: String) -> Self {
+        Self {
+            preamble,
+            annotations: Vec::new(),
+            crlf: false,
+        }
+    }
+
     pub fn parse(source: &str) -> Self {
+        // Windows editors may prepend a byte order mark. It is kept in the
+        // preamble but must not hide a header on the first line.
+        let content = source.strip_prefix(BYTE_ORDER_MARK).unwrap_or(source);
+        let mark = &source[..source.len() - content.len()];
+        let mut store = Self::parse_content(content);
+        store.preamble.insert_str(0, mark);
+        store
+    }
+
+    fn parse_content(source: &str) -> Self {
+        let crlf = source.contains("\r\n") && !source.replace("\r\n", "").contains('\n');
         let mut sections = Vec::new();
         let mut offset = 0;
         for line in source.split_inclusive('\n') {
@@ -226,6 +257,12 @@ impl Store {
                 }
                 annotation.body = trim_body(content)
                     .split('\n')
+                    // A CRLF store keeps its line endings out of the comment,
+                    // so an edited body is written back with CRLF as well.
+                    .map(|line| match line.strip_suffix('\r') {
+                        Some(stripped) if crlf => stripped,
+                        _ => line,
+                    })
                     .map(|line| {
                         let unescaped = line.trim_start_matches('\\');
                         if unescaped.len() < line.len()
@@ -244,15 +281,13 @@ impl Store {
         Self {
             preamble,
             annotations,
+            crlf,
         }
     }
 
     pub fn encode(&self) -> String {
-        let mut output = self.preamble.clone();
+        let mut output = String::new();
         for record in &self.annotations {
-            if !output.is_empty() && !output.ends_with('\n') {
-                output.push('\n');
-            }
             let anchor = match record.lines {
                 Some((first, last)) if first != last => format!("lines {first}-{last}"),
                 Some((first, _)) => format!("line {first}"),
@@ -291,22 +326,54 @@ impl Store {
             }
             output.push('\n');
         }
-        output
+        if self.crlf {
+            output = output.replace("\r\n", "\n").replace('\n', "\r\n");
+        }
+        let mut content = self.preamble.clone();
+        let text = content.strip_prefix(BYTE_ORDER_MARK).unwrap_or(&content);
+        if !text.is_empty() && !text.ends_with('\n') && !output.is_empty() {
+            content.push_str(if self.crlf { "\r\n" } else { "\n" });
+        }
+        content + &output
     }
 
-    pub(super) fn check_rewrite(&self) -> Result<(), super::Error> {
+    /// Refuses a store in which an ID names more than one section: an edit,
+    /// status change or delete could not tell them apart.
+    pub(super) fn check_ids(&self) -> Result<(), super::Error> {
         let mut ids = std::collections::HashSet::new();
-        if self.annotations.iter().any(|record| !ids.insert(record.id)) {
-            return Err(super::Error::Conflict("duplicate annotation ID"));
+        match self
+            .annotations
+            .iter()
+            .find(|record| !ids.insert(record.id))
+        {
+            Some(record) => Err(super::Error::Section(
+                record.id,
+                "appears more than once; give each section a unique ID",
+            )),
+            None => Ok(()),
         }
-        if self.annotations.iter().any(|record| {
-            record.raw_metadata.is_some()
-                || (record.lines.is_some() && record.quote.as_deref().is_none_or(str::is_empty))
-        }) {
+    }
+
+    /// Encodes the store, then reads the result back. A section that would
+    /// not come back as it is now cannot be written without losing content,
+    /// so the write is refused and the error names that annotation.
+    pub(super) fn encode_checked(&self) -> Result<String, super::Error> {
+        let content = self.encode();
+        let reread = Self::parse(&content);
+        let mut written = reread.annotations.iter();
+        for record in &self.annotations {
+            if written.next() != Some(record) {
+                return Err(super::Error::Section(
+                    record.id,
+                    "cannot be saved without losing content; edit the store file instead",
+                ));
+            }
+        }
+        if written.next().is_some() || reread.preamble != self.preamble {
             return Err(super::Error::Invalid(
-                "malformed annotation section cannot be rewritten safely",
+                "annotation store cannot be rewritten without losing content",
             ));
         }
-        Ok(())
+        Ok(content)
     }
 }

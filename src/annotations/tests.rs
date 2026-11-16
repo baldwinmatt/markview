@@ -280,22 +280,88 @@ fn mutation_refreshes_attached_hints_preserves_preamble_and_reuses_lock() {
     assert_eq!(fs::metadata(lock).unwrap().ino(), inode);
 }
 
-#[test]
-fn refuses_ambiguous_or_lossy_store_rewrites() {
+fn store_fixture(source: &str, store: &str) -> (tempfile::TempDir, Location) {
     let dir = tempdir().unwrap();
     let doc = dir.path().join("doc.md");
-    fs::write(&doc, "yes").unwrap();
+    fs::write(&doc, source).unwrap();
     let location = resolve(&doc).unwrap();
-    mutate(&location, add("setup")).unwrap();
-    for contents in [
-        "## a1 [open] document\n\nA\n\n## a01 [open] document\n\nB",
-        "## a1 [open] document\n<!-- markview: what is this -->\n\nBody",
-        "## a1 [open] line 1\n\nText section with no quote",
+    fs::create_dir_all(location.path.parent().unwrap()).unwrap();
+    fs::write(&location.path, store).unwrap();
+    (dir, location)
+}
+
+#[test]
+fn hand_edited_sections_do_not_freeze_store_writes() {
+    let source = "one\n\nthree\n";
+    for store in [
+        "## a1 [open] line 3\n\nPlease reword this line.\n",
+        "## a1 [open] document\n<!-- markview: what is this -->\n\nBody\n",
     ] {
-        fs::write(&location.path, contents).unwrap();
-        assert!(mutate(&location, add("must not overwrite")).is_err());
-        assert_eq!(fs::read_to_string(&location.path).unwrap(), contents);
+        let (_dir, location) = store_fixture(source, store);
+        let added = mutate(&location, add("whole document")).unwrap();
+        assert_eq!(added.annotations.len(), 2, "{store}");
+        let written = fs::read_to_string(&location.path).unwrap();
+        // The untouched section is written back byte for byte.
+        assert!(written.starts_with(store), "{written}");
+        assert!(written.contains("\n## a2 [open] document\n"), "{written}");
+
+        let resolved = mutate(
+            &location,
+            change(1, &added, Change::Status(Status::Resolved)),
+        );
+        assert_eq!(resolved.unwrap().annotations.len(), 2, "{store}");
+        let written = fs::read_to_string(&location.path).unwrap();
+        assert!(written.starts_with(&store.replace("[open]", "[resolved]")));
     }
+}
+
+#[test]
+fn unsafe_rewrites_are_refused_and_name_the_annotation() {
+    let duplicate = "## a1 [open] document\n\nA\n\n## a01 [open] document\n\nB\n";
+    let (_dir, location) = store_fixture("text", duplicate);
+    let error = mutate(&location, add("must not overwrite")).unwrap_err();
+    assert!(error.to_string().contains("a1"), "{error}");
+    assert_eq!(fs::read_to_string(&location.path).unwrap(), duplicate);
+
+    // A line-anchored section without a quote cannot hold a comment that
+    // starts with `>`: reading it back would turn the comment into the quote.
+    let quoteless = "## a7 [open] line 1\n\nPlease reword this line.\n";
+    let (_dir, location) = store_fixture("text", quoteless);
+    let review = read(&location, &TextProjection::new("text")).unwrap();
+    let edit = Change::Edit("> not a quote".to_owned());
+    let error = mutate(&location, change(7, &review, edit)).unwrap_err();
+    assert!(error.to_string().contains("a7"), "{error}");
+    assert_eq!(fs::read_to_string(&location.path).unwrap(), quoteless);
+}
+
+#[test]
+fn byte_order_mark_before_the_first_header_is_ignored() {
+    let store = "\u{feff}## a1 [open] document\n\nFrom a Windows editor.\n";
+    let parsed = Store::parse(store);
+    assert_eq!(parsed.annotations.len(), 1);
+    assert_eq!(parsed.annotations[0].id, 1);
+    let (_dir, location) = store_fixture("text", store);
+    let review = mutate(&location, add("second")).unwrap();
+    let ids: Vec<_> = review.annotations.iter().map(|record| record.id).collect();
+    assert_eq!(ids, [1, 2]);
+    assert!(fs::read_to_string(&location.path)
+        .unwrap()
+        .starts_with(store));
+}
+
+#[test]
+fn rewriting_a_crlf_store_keeps_crlf_line_endings() {
+    let store = "# Notes\r\n\r\n## a1 [open] document\r\n\r\nFirst line\r\nsecond line\r\n";
+    let (_dir, location) = store_fixture("text", store);
+    let review = mutate(&location, add("added\nwith two lines")).unwrap();
+    assert_eq!(review.annotations[0].body, "First line\nsecond line");
+    let written = fs::read_to_string(&location.path).unwrap();
+    assert!(written.starts_with(store), "{written:?}");
+    assert!(written.contains("added\r\nwith two lines\r\n"));
+    assert!(
+        !written.replace("\r\n", "").contains(['\r', '\n']),
+        "{written:?}"
+    );
 }
 
 #[test]

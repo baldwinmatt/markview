@@ -30,6 +30,8 @@ pub const FORM_CAP: usize = 160 * 1024;
 pub enum Error {
     Invalid(&'static str),
     Conflict(&'static str),
+    /// One annotation, by ID, that stops the store from being written.
+    Section(u64, &'static str),
     Io(io::Error),
 }
 
@@ -37,6 +39,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalid(message) | Self::Conflict(message) => f.write_str(message),
+            Self::Section(id, problem) => write!(f, "annotation a{id} {problem}"),
             Self::Io(error) => error.fmt(f),
         }
     }
@@ -214,10 +217,7 @@ fn parse_snapshot(location: &Location, bytes: Option<&[u8]>) -> Result<Store, Er
                 Error::Invalid("annotation store is not UTF-8")
             })?))
         }
-        None => Ok(Store {
-            preamble: Store::generated_preamble(&location.relative),
-            annotations: Vec::new(),
-        }),
+        None => Ok(Store::new(Store::generated_preamble(&location.relative))),
     }
 }
 
@@ -402,16 +402,9 @@ fn take_body(fields: &mut HashMap<String, String>) -> Result<String, Error> {
 
 fn refresh(record: &mut Annotation, projection: &TextProjection, range: Range<usize>) {
     record.lines = Some(projection.lines(range.clone()));
-    record.metadata.insert(
-        "section".to_owned(),
-        projection.section(range.start).to_owned(),
-    );
-    record
-        .metadata
-        .insert("source_revision".to_owned(), projection.revision.clone());
-    record
-        .metadata
-        .insert("start".to_owned(), range.start.to_string());
+    record.hint("section", projection.section(range.start).to_owned());
+    record.hint("source_revision", projection.revision.clone());
+    record.hint("start", range.start.to_string());
 }
 
 fn validate_selection(projection: &TextProjection, selection: &Selection) -> Result<String, Error> {
@@ -469,7 +462,7 @@ fn mutate_locked(
     let bytes = parent.read()?;
     let projection = TextProjection::new(&read_source(location)?);
     let mut store = parse_snapshot(location, bytes.as_deref())?;
-    store.check_rewrite()?;
+    store.check_ids()?;
     match operation {
         Operation::Add { body, selection } => {
             let id = store
@@ -520,7 +513,7 @@ fn mutate_locked(
     }
     let remove = store.annotations.is_empty()
         && store.preamble == Store::generated_preamble(&location.relative);
-    let content = (!remove).then(|| store.encode());
+    let content = (!remove).then(|| store.encode_checked()).transpose()?;
     let result =
         Review::from_snapshot(location, content.as_deref().map(str::as_bytes), &projection)?;
     parent.commit(bytes.as_deref(), content.as_deref())?;

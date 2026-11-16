@@ -2496,7 +2496,7 @@ fn plain_page_body(body: &str) -> String {
     without_copy_version(&without_timestamp(body))
 }
 
-const BASELINE_HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\nContent-Length: 13909\r\nConnection: close";
+const BASELINE_HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\nContent-Length: 14106\r\nConnection: close";
 const BASELINE_BODY: &str = include_str!("fixtures/serve-baseline.expected.html");
 
 #[test]

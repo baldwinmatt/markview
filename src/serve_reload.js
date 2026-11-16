@@ -71,8 +71,12 @@
     }
     if (currentMain && nextMain) {
       currentMain.innerHTML = nextMain.innerHTML;
-      currentMain.dataset.sourceRevision = nextMain.dataset.sourceRevision;
-      currentMain.dataset.markviewRoute = nextMain.dataset.markviewRoute;
+      // Only a page with review hooks has these. Assigning a missing one
+      // would write the string "undefined" into the attribute.
+      for (const name of ['sourceRevision', 'markviewRoute']) {
+        if (name in nextMain.dataset) currentMain.dataset[name] = nextMain.dataset[name];
+        else delete currentMain.dataset[name];
+      }
       window.markviewAttachCodeCopy();
       window.markviewReviewRefresh?.();
     }

@@ -58,7 +58,9 @@ class StubElement extends StubNode {
     this.tagName = tag.toUpperCase();
     this.className = '';
     this.attributes = {};
-    this.dataset = {};
+    // Like DOMStringMap, every value is stored as a string: assigning
+    // `undefined` leaves an attribute reading "undefined".
+    this.dataset = new Proxy({}, {set(target, name, value) { target[name] = String(value); return true; }});
     this.style = {};
     this.hidden = false;
     this.listeners = new Map();
@@ -224,7 +226,7 @@ function createPage({revision = 'source-1'} = {}) {
   document.querySelector = selector => document.documentElement.querySelector(selector);
   document.querySelectorAll = selector => document.documentElement.querySelectorAll(selector);
   const main = document.createElement('main');
-  main.dataset.sourceRevision = revision;
+  if (revision !== null) main.dataset.sourceRevision = revision;
   document.body.append(main);
 
   const storage = new Map();
@@ -314,6 +316,13 @@ function createPage({revision = 'source-1'} = {}) {
       },
     });
     page.context.createMarkviewCodeCopy ??= () => () => {};
+    // A live reload fetches the page again and parses it. `page.next` is the
+    // document that parse yields: set it before delivering a reload event.
+    page.context.DOMParser = class {
+      parseFromString() {
+        return {title: page.next.title || '', querySelector: selector => page.next.root.querySelector(selector)};
+      }
+    };
     window.scrollTo = () => {};
     run('serve_reload.js');
     return events;

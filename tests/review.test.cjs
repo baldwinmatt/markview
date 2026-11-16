@@ -910,3 +910,30 @@ test('a review page asks for the collection summary once, and an event burst at 
   assert.equal(page.summaries.length, 3, 'one pending request, not four');
   assert.equal(page.status(), '5 open comments in 2 documents.');
 });
+
+// A served page without review hooks, and the page its next live reload
+// fetches: `attributes` are those of the new page's <main>.
+async function liveReload(page, events, attributes) {
+  page.next = {root: page.h('html', {}, page.h('main', attributes, page.h('p', {}, 'Edited')))};
+  page.fetch = async () => ({ok: true, status: 200, text: async () => ''});
+  events.dispatchEvent({type: 'message', data: 'reload'});
+  await page.settle();
+}
+
+test('a live reload copies the review attributes of <main> only when the new page has them', async () => {
+  const page = createPage({revision: null});
+  const events = page.loadShell();
+  const attributes = () => ({...page.main.dataset});
+
+  // A plain `--serve` page has neither attribute, before or after an edit.
+  await liveReload(page, events, {});
+  assert.deepEqual(attributes(), {});
+
+  // Its first annotation makes the next page a review page.
+  await liveReload(page, events, {'data-source-revision': 'source-2', 'data-markview-route': '/doc.md'});
+  assert.deepEqual(attributes(), {sourceRevision: 'source-2', markviewRoute: '/doc.md'});
+
+  // And when the page is plain again, the attributes go with the hooks.
+  await liveReload(page, events, {});
+  assert.deepEqual(attributes(), {});
+});

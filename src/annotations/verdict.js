@@ -48,9 +48,21 @@ function createMarkviewVerdict(page, review, token) {
     render(submitting ? 'Submitting verdict…' : 'Refreshing collection counts…');
   }
   function done() {
+    if (completed) return;
     completed = true;
     summary = null;
-    render('Review finished. You can close this tab.');
+    let seconds = 3;
+    function countdown() {
+      if (seconds === 0) {
+        render('Review finished. You can close this tab.');
+        window.close();
+        return;
+      }
+      render('Review finished. Closing this tab in ' + seconds + '…');
+      seconds--;
+      setTimeout(countdown, 1000);
+    }
+    countdown();
     review.show(page.dataset.markviewRoute, page.dataset.sourceRevision, false, false);
   }
   // `cause` is the server's: the document that cannot be read, and why.

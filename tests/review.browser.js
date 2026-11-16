@@ -255,7 +255,7 @@
       'The verdict was not reconfirmed against the refreshed page');
     window.fixtureEvents.dispatchEvent(new MessageEvent('review-finished'));
     require(approve.disabled && changes.disabled && document.querySelector('.markview-review-toolbar button').hidden &&
-      bar.textContent.includes('Review finished. You can close this tab.'), 'Finished review left write controls enabled');
+      bar.textContent.includes('Review finished. Closing this tab in 3…'), 'Finished review did not start the countdown or disable writes');
     checks.textContent = 'PASS — Projection, nonce policy, alerts, copy, drafts, shortcuts, and collection verdicts';
   } catch (error) {
     checks.textContent = 'FAIL — ' + error.message;

@@ -1558,7 +1558,7 @@ test('a verdict is confirmed with its scope and counts, posted with the confirme
   assert.deepEqual(page.finishes, [{op: 'finish', verdict: 'approved', review_revision: 'r7', doc: '/doc.md', source_revision: 'source-1'}]);
   const [, init] = page.fetchCalls.find(([url, init]) => url === '/_markview/review' && init?.method === 'POST');
   assert.equal(init.headers['X-Markview-Token'], 'token');
-  assert.equal(page.status(), 'Review finished. You can close this tab.');
+  assert.equal(page.status(), 'Review finished. Closing this tab in 3…');
   assert.equal(page.verdictButton('Approve').disabled, true);
   assert.equal(page.verdictButton('Request changes').disabled, true);
   // The page is read-only from here on.
@@ -1566,16 +1566,32 @@ test('a verdict is confirmed with its scope and counts, posted with the confirme
   assert.equal(panel.querySelectorAll('button').find(button => button.textContent === 'Comment on document').visible, false);
 });
 
-test('a verdict accepted in another tab closes this one through the event stream', async () => {
+test('review completion starts a single three-second countdown even if more events arrive', async () => {
   const page = await openedReviewPage({review_revision: 'r1', comments: 1, documents: 1});
+  let closeCalls = 0;
+  page.window.close = () => { closeCalls++; };
   page.events.dispatchEvent({type: 'review-finished'});
   assert.equal(page.events.closed, true);
-  assert.equal(page.status(), 'Review finished. You can close this tab.');
+  assert.equal(page.status(), 'Review finished. Closing this tab in 3…');
   assert.equal(page.verdictButton('Approve').disabled, true);
-  // Later events change nothing.
+  page.advance(1000);
+  assert.equal(page.status(), 'Review finished. Closing this tab in 2…');
+  page.events.dispatchEvent({type: 'review-finished'});
   page.events.dispatchEvent({type: 'annotations', data: '/other.md'});
+  page.events.dispatchEvent({type: 'message', data: 'rescan'});
   await page.settle();
   assert.equal(page.summaries.length, 1);
+  assert.equal(page.reloads, undefined);
+  assert.equal(page.status(), 'Review finished. Closing this tab in 2…');
+  page.advance(1000);
+  assert.equal(page.status(), 'Review finished. Closing this tab in 1…');
+  page.advance(999);
+  assert.equal(closeCalls, 0);
+  page.advance(1);
+  assert.equal(closeCalls, 1);
+  assert.equal(page.status(), 'Review finished. You can close this tab.');
+  page.advance(3000);
+  assert.equal(closeCalls, 1);
 });
 
 const counts = '1 open comment in 1 document.';
@@ -1679,7 +1695,7 @@ test('a finish refused because the review is already finished ends the page, wha
   page.finish = () => response(409, {finished: true, error: 'Reworded by a later server.'});
   page.verdictButton('Request changes').click();
   await page.settle();
-  assert.equal(page.status(), 'Review finished. You can close this tab.');
+  assert.equal(page.status(), 'Review finished. Closing this tab in 3…');
   assert.equal(page.verdictButton('Approve').disabled, true);
   assert.equal(page.verdictButton('Request changes').disabled, true);
   assert.equal(page.summaries.length, 1, 'no refresh after the review is over');

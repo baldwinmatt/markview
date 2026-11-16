@@ -50,6 +50,7 @@
     }
   };
   events.onmessage = (event) => {
+    if (window.markviewVerdict?.finished()) return;
     if (event.data === 'rescan') {
       location.reload();
       return;

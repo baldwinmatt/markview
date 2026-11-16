@@ -19,7 +19,9 @@ use std::fmt::{self, Write as _};
 use std::fs;
 use std::io::{self, Read};
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const REVIEW_SCRIPT: &str = include_str!("review.js");
@@ -95,7 +97,7 @@ fn store_revision(path: &Path, bytes: Option<&[u8]>) -> String {
     ])
 }
 
-pub fn annotation_store_root(document: &Path) -> io::Result<std::path::PathBuf> {
+pub fn annotation_store_root(document: &Path) -> io::Result<PathBuf> {
     Ok(resolve(document)?.root)
 }
 
@@ -125,28 +127,46 @@ impl Review {
         projection: &TextProjection,
     ) -> Result<Self, Error> {
         let store = parse_snapshot(location, bytes)?;
-        let mut annotations: Vec<_> = store
+        let ranges = store
             .annotations
             .iter()
-            .map(|record| {
-                let range = projection.locate(record);
-                ResolvedAnnotation {
-                    id: record.id,
-                    status: record.status,
-                    body: record.body.clone(),
-                    quote: record.quote.clone(),
-                    lines: range
-                        .clone()
-                        .map(|range| projection.lines(range))
-                        .or(record.lines),
-                    section: range
-                        .as_ref()
-                        .map(|range| projection.section(range.start).to_owned())
-                        .or_else(|| record.metadata.get("section").cloned())
-                        .filter(|section| !section.is_empty()),
-                    attached: record.lines.is_none() || range.is_some(),
-                    range,
-                }
+            .map(|record| projection.locate(record))
+            .collect();
+        Ok(Self::resolved(
+            &store.annotations,
+            ranges,
+            projection,
+            store_revision(&location.path, bytes),
+        ))
+    }
+
+    /// Builds the review from records and where each one was located.
+    /// Locating is the expensive part, so callers do it once and pass it in.
+    fn resolved(
+        records: &[Annotation],
+        ranges: Vec<Option<Range<usize>>>,
+        projection: &TextProjection,
+        store_revision: String,
+    ) -> Self {
+        let mut annotations: Vec<_> = records
+            .iter()
+            .zip(ranges)
+            .map(|(record, range)| ResolvedAnnotation {
+                id: record.id,
+                status: record.status,
+                body: record.body.clone(),
+                quote: record.quote.clone(),
+                lines: range
+                    .clone()
+                    .map(|range| projection.lines(range))
+                    .or(record.lines),
+                section: range
+                    .as_ref()
+                    .map(|range| projection.section(range.start).to_owned())
+                    .or_else(|| record.metadata.get("section").cloned())
+                    .filter(|section| !section.is_empty()),
+                attached: record.lines.is_none() || range.is_some(),
+                range,
             })
             .collect();
         annotations.sort_by_key(|record| {
@@ -156,11 +176,11 @@ impl Review {
                 record.range.as_ref().map_or(0, |range| range.start),
             )
         });
-        Ok(Self {
+        Self {
             source_revision: projection.revision.clone(),
-            store_revision: store_revision(&location.path, bytes),
+            store_revision,
             annotations,
-        })
+        }
     }
 
     pub fn json(&self) -> String {
@@ -218,6 +238,141 @@ fn parse_snapshot(location: &Location, bytes: Option<&[u8]>) -> Result<Store, Er
             })?))
         }
         None => Ok(Store::new(Store::generated_preamble(&location.relative))),
+    }
+}
+
+/// How many documents a `ReviewCache` remembers. A projection holds several
+/// words per character of the document, so the cache is kept small.
+const CACHED_DOCUMENTS: usize = 8;
+
+struct CachedDocument {
+    document: PathBuf,
+    projection: Arc<TextProjection>,
+    /// The review resolved against `projection`, and its store revision.
+    review: Option<Review>,
+}
+
+/// Remembers the projection and resolved review of recently used documents,
+/// keyed by document path, source revision and store revision. Building a
+/// projection parses the whole document and resolving searches it for every
+/// quote, while most reads repeat the revisions of the one before.
+#[derive(Clone, Default)]
+pub struct ReviewCache(Arc<CacheState>);
+
+#[derive(Default)]
+struct CacheState {
+    /// Most recently used first.
+    documents: Mutex<Vec<CachedDocument>>,
+    projections: AtomicUsize,
+    resolutions: AtomicUsize,
+}
+
+impl fmt::Debug for ReviewCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReviewCache")
+            .field("work", &self.work())
+            .finish()
+    }
+}
+
+/// A cache holds no state of its own, so it never makes two owners differ.
+impl PartialEq for ReviewCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ReviewCache {}
+
+impl ReviewCache {
+    /// How many projections this cache has built and how many reviews it has
+    /// resolved (searched a projection for every quote) since it was made.
+    /// Both stay flat while callers repeat the same revisions.
+    pub fn work(&self) -> (usize, usize) {
+        (
+            self.0.projections.load(Ordering::Relaxed),
+            self.0.resolutions.load(Ordering::Relaxed),
+        )
+    }
+
+    fn lookup<T>(
+        &self,
+        location: &Location,
+        revision: &str,
+        take: impl FnOnce(&CachedDocument) -> Option<T>,
+    ) -> Option<T> {
+        let documents = self.0.documents.lock().ok()?;
+        let cached = documents.iter().find(|cached| {
+            cached.document == location.document && cached.projection.revision == revision
+        })?;
+        take(cached)
+    }
+
+    fn remember(
+        &self,
+        location: &Location,
+        projection: &Arc<TextProjection>,
+        review: Option<Review>,
+    ) {
+        let Ok(mut documents) = self.0.documents.lock() else {
+            return;
+        };
+        documents.retain(|cached| cached.document != location.document);
+        documents.insert(
+            0,
+            CachedDocument {
+                document: location.document.clone(),
+                projection: projection.clone(),
+                review,
+            },
+        );
+        documents.truncate(CACHED_DOCUMENTS);
+    }
+
+    /// The projection of `source`, built only if its revision is not cached.
+    fn projection(&self, location: &Location, source: &str) -> Arc<TextProjection> {
+        let revision = source_revision(source);
+        self.lookup(location, &revision, |cached| {
+            Some(cached.projection.clone())
+        })
+        .unwrap_or_else(|| {
+            self.0.projections.fetch_add(1, Ordering::Relaxed);
+            let projection = Arc::new(TextProjection::new(source));
+            self.remember(location, &projection, None);
+            projection
+        })
+    }
+
+    /// Resolves the annotations of `location` against `source`, which may
+    /// differ from the file on disk (the GUI previews unsaved edits).
+    pub fn read(&self, location: &Location, source: &str) -> Result<Review, Error> {
+        let projection = self.projection(location, source);
+        let bytes = snapshot(location)?;
+        let revision = store_revision(&location.path, bytes.as_deref());
+        let cached = self.lookup(location, &projection.revision, |cached| {
+            cached
+                .review
+                .clone()
+                .filter(|review| review.store_revision == revision)
+        });
+        if let Some(review) = cached {
+            return Ok(review);
+        }
+        self.0.resolutions.fetch_add(1, Ordering::Relaxed);
+        let review = Review::from_snapshot(location, bytes.as_deref(), &projection)?;
+        self.remember(location, &projection, Some(review.clone()));
+        Ok(review)
+    }
+
+    /// Applies `operation` and remembers the result, so the read that
+    /// follows a write is already answered.
+    pub fn mutate(&self, location: &Location, operation: Operation) -> Result<Review, Error> {
+        let (projection, review) = mutate_with(location, operation, &mut |source| {
+            self.projection(location, source)
+        })?;
+        self.0.resolutions.fetch_add(1, Ordering::Relaxed);
+        self.remember(location, &projection, Some(review.clone()));
+        Ok(review)
     }
 }
 
@@ -427,6 +582,16 @@ fn validate_selection(projection: &TextProjection, selection: &Selection) -> Res
 }
 
 pub fn mutate(location: &Location, operation: Operation) -> Result<Review, Error> {
+    ReviewCache::default().mutate(location, operation)
+}
+
+type Project<'a> = &'a mut dyn FnMut(&str) -> Arc<TextProjection>;
+
+fn mutate_with(
+    location: &Location,
+    operation: Operation,
+    project: Project<'_>,
+) -> Result<(Arc<TextProjection>, Review), Error> {
     // Reject invalid text adds before creating directories, and validate again
     // against the source read under the lock.
     if let Operation::Add {
@@ -434,7 +599,7 @@ pub fn mutate(location: &Location, operation: Operation) -> Result<Review, Error
         ..
     } = &operation
     {
-        validate_selection(&TextProjection::new(&read_source(location)?), selection)?;
+        validate_selection(&project(&read_source(location)?), selection)?;
     }
     let existing = snapshot(location)?;
     if matches!(&operation, Operation::Change { .. }) && existing.is_none() {
@@ -444,7 +609,7 @@ pub fn mutate(location: &Location, operation: Operation) -> Result<Review, Error
         .parent(matches!(&operation, Operation::Add { .. }))?
         .ok_or(Error::Conflict("annotation store changed on disk"))?;
     let lock = parent.lock().inspect_err(|_| parent.discard(None))?;
-    let result = mutate_locked(location, &parent, operation);
+    let result = mutate_locked(location, &parent, operation, project);
     if result.is_err() {
         parent.discard(Some(&lock));
     }
@@ -455,12 +620,13 @@ fn mutate_locked(
     location: &Location,
     parent: &paths::Parent,
     operation: Operation,
-) -> Result<Review, Error> {
+    project: Project<'_>,
+) -> Result<(Arc<TextProjection>, Review), Error> {
     if resolve(&location.document)?.path != location.path {
         return Err(Error::Conflict("annotation store moved"));
     }
     let bytes = parent.read()?;
-    let projection = TextProjection::new(&read_source(location)?);
+    let projection = project(&read_source(location)?);
     let mut store = parse_snapshot(location, bytes.as_deref())?;
     store.check_ids()?;
     match operation {
@@ -506,18 +672,30 @@ fn mutate_locked(
             }
         }
     }
-    for record in &mut store.annotations {
-        if let Some(range) = projection.locate(record) {
-            refresh(record, &projection, range);
-        }
-    }
+    // One search per annotation: it both refreshes the stored hints and
+    // places the annotation in the review that is returned.
+    let ranges = store
+        .annotations
+        .iter_mut()
+        .map(|record| {
+            let range = projection.locate(record);
+            if let Some(range) = &range {
+                refresh(record, &projection, range.clone());
+            }
+            range
+        })
+        .collect();
     let remove = store.annotations.is_empty()
         && store.preamble == Store::generated_preamble(&location.relative);
     let content = (!remove).then(|| store.encode_checked()).transpose()?;
-    let result =
-        Review::from_snapshot(location, content.as_deref().map(str::as_bytes), &projection)?;
+    let review = Review::resolved(
+        &store.annotations,
+        ranges,
+        &projection,
+        store_revision(&location.path, content.as_deref().map(str::as_bytes)),
+    );
     parent.commit(bytes.as_deref(), content.as_deref())?;
-    Ok(result)
+    Ok((projection, review))
 }
 
 fn utc_now() -> String {

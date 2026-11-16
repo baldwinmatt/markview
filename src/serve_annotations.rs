@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use markview::annotations::{self, Error, Request, TextProjection, FORM_CAP};
+use markview::annotations::{self, Error, Request, FORM_CAP};
 use markview::DestinationKind;
 
 use super::{
@@ -273,6 +273,22 @@ fn document(config: &ServeConfig, route: &str) -> Option<annotations::Location> 
         .filter(|location| location.document == canonical)
 }
 
+fn read_review(
+    config: &ServeConfig,
+    location: &annotations::Location,
+) -> Result<annotations::Review, Error> {
+    let source = annotations::read_source(location)?;
+    config.review_cache.read(location, &source)
+}
+
+fn mutate_review(
+    config: &ServeConfig,
+    location: &annotations::Location,
+    operation: annotations::Operation,
+) -> Result<annotations::Review, Error> {
+    config.review_cache.mutate(location, operation)
+}
+
 fn annotation_response(
     stream: &mut TcpStream,
     status: &str,
@@ -338,9 +354,7 @@ pub fn handle(
                     "document route or store is unavailable",
                 );
             };
-            annotations::read_source(&location)
-                .map_err(Error::from)
-                .and_then(|source| annotations::read(&location, &TextProjection::new(&source)))
+            read_review(config, &location)
         }
         "POST" if config.review_token.is_some() => {
             let expected = config.review_token.as_deref().expect("checked token");
@@ -383,7 +397,7 @@ pub fn handle(
                             "document route or store is unavailable",
                         );
                     };
-                    annotations::mutate(&location, form.operation)
+                    mutate_review(config, &location, form.operation)
                 }
                 Err(error) => Err(error),
             }
@@ -629,6 +643,23 @@ mod tests {
     }
 
     #[test]
+    fn annotation_reads_and_writes_share_the_serve_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "# Doc\n\nSome text.\n").unwrap();
+        let config = ServeConfig::from_inputs(vec![path], 7878, false).unwrap();
+        let location = document(&config, "/").unwrap();
+        let form = Request::parse(b"op=add&body=First").unwrap();
+        let added = mutate_review(&config, &location, form.operation).unwrap();
+        // Every page load and every `annotations` event asks again.
+        for _ in 0..5 {
+            assert_eq!(read_review(&config, &location).unwrap(), added);
+        }
+        // One projection, and one resolution: the write's own.
+        assert_eq!(config.review_cache.work(), (1, 1));
+    }
+
+    #[test]
     fn token_comparison_examines_every_byte() {
         let token = "0123456789abcdef".repeat(3);
         let expected = token.as_bytes();
@@ -709,7 +740,7 @@ mod tests {
         );
 
         if let Some(path) = std::env::var_os("MARKVIEW_REVIEW_BROWSER_FIXTURE") {
-            let projection = TextProjection::new(SOURCE);
+            let projection = annotations::TextProjection::new(SOURCE);
             let policy = format!("script-src 'nonce-{nonce}'; object-src 'none'; base-uri 'none'");
             let meta =
                 format!("<meta http-equiv=\"Content-Security-Policy\" content=\"{policy}\">");

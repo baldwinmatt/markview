@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::OnceLock;
 
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 
@@ -16,6 +18,17 @@ pub struct TextProjection {
     display: Vec<char>,
     points: Vec<Point>,
     sections: Vec<String>,
+    /// Where each scalar occurs, built the first time a quote has to be
+    /// searched for instead of confirmed at its stored offset.
+    occurrences: OnceLock<HashMap<char, Vec<usize>>>,
+}
+
+// How often this thread built a projection or searched one for a quote.
+// Tests use the counts to prove work is cached, not repeated.
+#[cfg(test)]
+thread_local! {
+    pub(super) static BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static LOCATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub fn collapse(text: &str) -> String {
@@ -28,6 +41,8 @@ pub(super) fn normalized(text: &str) -> Vec<char> {
 
 impl TextProjection {
     pub fn new(source: &str) -> Self {
+        #[cfg(test)]
+        BUILDS.with(|builds| builds.set(builds.get() + 1));
         let prepared = crate::prepare_source(source);
         Self::from_prepared(source, &prepared)
     }
@@ -39,6 +54,7 @@ impl TextProjection {
             display: Vec::new(),
             points: Vec::new(),
             sections: Vec::new(),
+            occurrences: OnceLock::new(),
         };
         let bytes = prepared.as_bytes();
         let newlines: Vec<_> = bytes
@@ -205,6 +221,86 @@ impl TextProjection {
     }
 
     pub(super) fn locate(&self, record: &super::Annotation) -> Option<Range<usize>> {
+        #[cfg(test)]
+        LOCATES.with(|locates| locates.set(locates.get() + 1));
+        let token = normalized(record.quote.as_deref()?);
+        if token.is_empty() || token.len() > self.scalars.len() {
+            return None;
+        }
+        if record.metadata.get("source_revision") == Some(&self.revision) {
+            if let Some(start) = record
+                .metadata
+                .get("start")
+                .and_then(|value| value.parse::<usize>().ok())
+            {
+                let range = start..start.saturating_add(token.len());
+                if self.matches(range.clone(), &token) {
+                    return Some(range);
+                }
+            }
+        }
+        let before = normalized(record.metadata.get("before").map_or("", String::as_str));
+        let after = normalized(record.metadata.get("after").map_or("", String::as_str));
+        let mut best = None;
+        let mut best_score = None;
+        for start in self.candidates(&token) {
+            let end = start + token.len();
+            if self.scalars.get(start..end) != Some(token.as_slice()) {
+                continue;
+            }
+            let context = agreement(before.iter().rev(), self.scalars[..start].iter().rev())
+                + agreement(after.iter(), self.scalars[end..].iter());
+            let section = record
+                .metadata
+                .get("section")
+                .is_some_and(|value| value == self.section(start));
+            let distance = record
+                .lines
+                .map_or(0, |(line, _)| line.abs_diff(self.points[start].line));
+            let score = (context, section, std::cmp::Reverse(distance));
+            match best_score.map(|previous| score.cmp(&previous)) {
+                None | Some(std::cmp::Ordering::Greater) => {
+                    best = Some(start..end);
+                    best_score = Some(score);
+                }
+                Some(std::cmp::Ordering::Equal) => best = None,
+                Some(std::cmp::Ordering::Less) => {}
+            }
+        }
+        best
+    }
+
+    /// Offsets, in order, where `token` could start. Comparing the quote with
+    /// every window of the document costs the whole document per annotation.
+    /// Instead take the quote's rarest scalar and look only where it occurs.
+    fn candidates<'a>(&'a self, token: &[char]) -> impl Iterator<Item = usize> + 'a {
+        let occurrences = self.occurrences.get_or_init(|| {
+            let mut occurrences: HashMap<char, Vec<usize>> = HashMap::new();
+            for (offset, scalar) in self.scalars.iter().enumerate() {
+                occurrences.entry(*scalar).or_default().push(offset);
+            }
+            occurrences
+        });
+        let (anchor, offsets) = token
+            .iter()
+            .enumerate()
+            .map(|(index, scalar)| {
+                (
+                    index,
+                    occurrences.get(scalar).map_or(&[][..], Vec::as_slice),
+                )
+            })
+            .min_by_key(|(_, offsets)| offsets.len())
+            .unwrap_or((0, &[]));
+        offsets
+            .iter()
+            .filter_map(move |offset| offset.checked_sub(anchor))
+    }
+
+    /// The original full scan, kept as the oracle and the timing baseline
+    /// for `locate`: every window of the document is compared with the quote.
+    #[cfg(test)]
+    pub(super) fn locate_naive(&self, record: &super::Annotation) -> Option<Range<usize>> {
         let token = normalized(record.quote.as_deref()?);
         if token.is_empty() || token.len() > self.scalars.len() {
             return None;

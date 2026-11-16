@@ -175,6 +175,8 @@ struct ServeConfig {
     default_document: PathBuf,
     port: u16,
     review_token: Option<String>,
+    /// Projections and resolved reviews of recently requested documents.
+    review_cache: annotations::ReviewCache,
     /// Directories under the root that are not served because their route
     /// would fall under the reserved `/_markview/` prefix.
     reserved: Vec<PathBuf>,
@@ -570,6 +572,7 @@ impl ServeConfig {
             default_document: build.default_document,
             port,
             review_token: None,
+            review_cache: annotations::ReviewCache::default(),
             reserved: build.reserved,
             mode: build.mode,
             sidebar_nav,

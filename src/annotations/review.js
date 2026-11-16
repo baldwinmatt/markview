@@ -39,24 +39,34 @@ function markviewReviewRange(points, offsets) {
   return range;
 }
 
-function markviewReviewSelection(root, selection) {
+// `points` is the result of markviewReviewText(root) when the caller has it.
+function markviewReviewSelection(root, selection, points) {
   if (!selection || selection.rangeCount !== 1 || selection.isCollapsed) return null;
   const range = selection.getRangeAt(0);
   if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) return null;
-  const points = markviewReviewText(root);
-  let start = -1;
-  let end = 0;
+  points ??= markviewReviewText(root);
+  // Points are in document order, so the selected ones form a single run.
+  // Find its two ends by bisection: asking the range about every point is
+  // quadratic in a large document, because each comparison walks the tree.
+  const firstIndex = test => {
+    let low = 0;
+    let high = points.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (test(points[middle])) high = middle;
+      else low = middle + 1;
+    }
+    return low;
+  };
+  const start = firstIndex(point => range.comparePoint(point.node, point.offset) >= 0);
+  const end = firstIndex(point => range.comparePoint(point.node, point.end) > 0);
+  if (start >= end) return null;
   let quote = '';
-  for (let index = 0; index < points.length; index++) {
-    const point = points[index];
-    if (range.comparePoint(point.node, point.offset) !== 0 ||
-        range.comparePoint(point.node, point.end) !== 0) continue;
-    if (start === -1) start = index;
-    else if (point.gap) quote += ' ';
-    quote += point.scalar;
-    end = index + 1;
+  for (let index = start; index < end; index++) {
+    if (index > start && points[index].gap) quote += ' ';
+    quote += points[index].scalar;
   }
-  return start < 0 ? null : {quote, start, end};
+  return {quote, start, end};
 }
 
 function createMarkviewReview(root, mount, submit, reveal = () => {}) {
@@ -127,6 +137,16 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
   let selected = null;
   let ranges = [];
   let lastHit = null;
+  // The text points of `root`, kept until the document changes. Walking the
+  // whole document on every `selectionchange` makes dragging a selection slow.
+  let points = null;
+  const observer = typeof MutationObserver === 'function' ? new MutationObserver(() => { points = null; }) : null;
+  observer?.observe(root, {childList: true, subtree: true, characterData: true});
+  function textPoints() {
+    // Changes made earlier in this task have not reached the callback yet.
+    if (observer?.takeRecords().length) points = null;
+    return points ??= markviewReviewText(root);
+  }
   const drafts = new Map();
   const pending = new Set();
   const errors = new Map();
@@ -177,7 +197,7 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
     body.focus();
   }
   function addSelection() {
-    const selection = markviewReviewSelection(root, window.getSelection()) || selected;
+    const selection = markviewReviewSelection(root, window.getSelection(), textPoints()) || selected;
     if (!key || !canAdd || !selection) return;
     if ([...selection.quote].length > 1000) {
       setMessage('Select at most 1,000 characters.');
@@ -267,11 +287,11 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
     }
   }
   function repaint() {
-    const points = review?.source_revision === revision ? markviewReviewText(root) : [];
+    const current = review?.source_revision === revision ? textPoints() : [];
     ranges = [];
     for (const entry of review?.annotations || []) {
       if (entry.status !== 'open' || !entry.range) continue;
-      const range = markviewReviewRange(points, entry.range);
+      const range = markviewReviewRange(current, entry.range);
       if (range) ranges.push({id: entry.id, range});
     }
     if (globalThis.CSS?.highlights && globalThis.Highlight) {
@@ -340,7 +360,8 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
   });
   document.addEventListener('selectionchange', () => {
     if (!key || !canAdd) return;
-    selected = markviewReviewSelection(root, window.getSelection());
+    const selection = window.getSelection();
+    selected = selection && !selection.isCollapsed ? markviewReviewSelection(root, selection, textPoints()) : null;
     selectionButton.hidden = !selected;
     if (selected) {
       const rect = window.getSelection().getRangeAt(0).getBoundingClientRect();
@@ -360,7 +381,10 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
   return {
     show(documentKey, nextRevision, write, add) {
       if (key === documentKey && revision === nextRevision && writable === write && canAdd === add) return;
-      if (key !== documentKey || revision !== nextRevision) review = null;
+      if (key !== documentKey || revision !== nextRevision) {
+        review = null;
+        points = null;
+      }
       key = documentKey;
       revision = nextRevision;
       writable = write;
@@ -370,7 +394,12 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
       render();
     },
     update,
-    repaint,
+    // For the host to call after it changed the document, for example to
+    // mark find matches: the text nodes may have been split or replaced.
+    repaint() {
+      points = null;
+      repaint();
+    },
     addSelection,
     unavailable(message) {
       review = null;
@@ -393,7 +422,7 @@ function markviewServeReview(route, token, port) {
       if (response.status === 409) window.markviewReviewRefresh();
       throw new Error(data.error);
     }
-    window.markviewReviewRefresh();
+    // The response is the updated list, so there is nothing to fetch again.
     return data;
   });
   let requested = 0;

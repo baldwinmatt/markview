@@ -703,3 +703,150 @@ fn failed_first_write_leaves_no_new_directories() {
     fs::remove_dir_all(root.join("sub/.markview")).unwrap();
     assert_eq!(mutate(&stale, add("first")).unwrap().annotations.len(), 1);
 }
+
+fn counted<T>(work: impl FnOnce() -> T) -> (T, usize, usize) {
+    use projection::{BUILDS, LOCATES};
+    let before = (BUILDS.get(), LOCATES.get());
+    let result = work();
+    (result, BUILDS.get() - before.0, LOCATES.get() - before.1)
+}
+
+#[test]
+fn review_cache_resolves_once_per_source_and_store_revision() {
+    let dir = tempdir().unwrap();
+    let doc = dir.path().join("doc.md");
+    let source = "# Title\n\nfirst second third";
+    fs::write(&doc, source).unwrap();
+    let location = resolve(&doc).unwrap();
+    let cache = ReviewCache::default();
+    let (added, builds, _) =
+        counted(|| cache.mutate(&location, selection(source, "second", 10..16, "one")));
+    let added = added.unwrap();
+    // The selection is validated before and under the lock: one projection.
+    assert_eq!(builds, 1);
+
+    // Reads of unchanged revisions reuse both the projection and the result.
+    let (reviews, builds, locates) = counted(|| {
+        (0..5)
+            .map(|_| cache.read(&location, source).unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!((builds, locates), (0, 0));
+    assert!(reviews.iter().all(|review| *review == added));
+
+    // A store change resolves again, against the cached projection.
+    let external = fs::read_to_string(&location.path)
+        .unwrap()
+        .replace("[open]", "[resolved]");
+    fs::write(&location.path, external).unwrap();
+    let (review, builds, locates) = counted(|| cache.read(&location, source).unwrap());
+    assert_eq!((builds, locates), (0, 1));
+    assert_eq!(review.annotations[0].status, Status::Resolved);
+    assert_ne!(review.store_revision, added.store_revision);
+
+    // A source change builds one new projection, then is cached in turn.
+    let edited = format!("\n{source}");
+    let (review, builds, _) = counted(|| {
+        cache.read(&location, &edited).unwrap();
+        cache.read(&location, &edited).unwrap()
+    });
+    assert_eq!(builds, 1);
+    assert_eq!(review.annotations[0].lines, Some((4, 4)));
+    assert_eq!(
+        review,
+        read(&location, &TextProjection::new(&edited)).unwrap()
+    );
+    // The cache's own tally, which other crates use to check their wiring:
+    // two projections, and three resolutions (the add and two changes).
+    assert_eq!(cache.work(), (2, 3));
+}
+
+#[test]
+fn mutation_locates_each_annotation_once() {
+    let dir = tempdir().unwrap();
+    let doc = dir.path().join("doc.md");
+    let source = "alpha beta gamma delta";
+    fs::write(&doc, source).unwrap();
+    let location = resolve(&doc).unwrap();
+    mutate(&location, selection(source, "alpha", 0..5, "one")).unwrap();
+    mutate(&location, selection(source, "beta", 5..9, "two")).unwrap();
+    let review = mutate(&location, selection(source, "gamma", 9..14, "three")).unwrap();
+    // Stale hints force a real search, the expensive case.
+    let stale = fs::read_to_string(&location.path)
+        .unwrap()
+        .replace("source_revision=\"", "source_revision=\"stale-");
+    fs::write(&location.path, &stale).unwrap();
+    let review = read(&location, &TextProjection::new(source)).unwrap_or(review);
+    let (result, _, locates) = counted(|| {
+        mutate(
+            &location,
+            change(2, &review, Change::Status(Status::Resolved)),
+        )
+    });
+    let result = result.unwrap();
+    assert_eq!(locates, 3, "one search per stored annotation");
+    assert_eq!(result.annotations.len(), 3);
+    assert_eq!(
+        result,
+        read(&location, &TextProjection::new(source)).unwrap()
+    );
+}
+
+#[test]
+fn locating_quotes_does_not_scan_the_whole_document_per_annotation() {
+    use std::time::Instant;
+    // About 2 MB of prose with 500 distinct, findable quotes.
+    let mut source = String::new();
+    let mut quotes = Vec::new();
+    let mut paragraph = 0;
+    while source.len() < 2_000_000 {
+        if paragraph % 40 == 0 && quotes.len() < 500 {
+            let quote = format!("Marker {} closes the section", quotes.len());
+            source.push_str(&format!("Review note. {quote}. "));
+            quotes.push(quote);
+        }
+        source.push_str("The quick brown fox jumps over the lazy dog near the riverbank. ");
+        paragraph += 1;
+        if paragraph % 8 == 0 {
+            source.push_str("\n\n");
+        }
+    }
+    assert_eq!(quotes.len(), 500);
+    let projection = TextProjection::new(&source);
+    // No `source_revision` hint, as after the document was edited.
+    let records: Vec<_> = quotes
+        .iter()
+        .map(|quote| {
+            Store::parse(&format!("## a1 [open] line 1\n\n> {quote}\n\nNote\n"))
+                .annotations
+                .remove(0)
+        })
+        .collect();
+
+    let start = Instant::now();
+    let located: Vec<_> = records
+        .iter()
+        .map(|record| projection.locate(record))
+        .collect();
+    let fast = start.elapsed() / records.len() as u32;
+    // The full scan is slow, so time it on a sample and compare per record.
+    let sample = records.iter().step_by(50);
+    let start = Instant::now();
+    let naive: Vec<_> = sample
+        .clone()
+        .map(|record| projection.locate_naive(record))
+        .collect();
+    let slow = start.elapsed() / naive.len() as u32;
+
+    assert!(located.iter().all(Option::is_some));
+    assert_eq!(
+        located.iter().step_by(50).cloned().collect::<Vec<_>>(),
+        naive,
+        "the indexed search must agree with the full scan"
+    );
+    eprintln!("locate per annotation: indexed {fast:?}, full scan {slow:?}");
+    assert!(
+        fast * 5 < slow,
+        "per annotation: indexed {fast:?}, full scan {slow:?}"
+    );
+}

@@ -697,6 +697,9 @@ pub struct AppModel {
     active_tab: Option<u64>,
     next_tab_id: u64,
     stale_tabs: Vec<u64>,
+    /// Projections and resolved reviews for the tabs' documents. Clones of
+    /// the model share it, so a background write warms it for the view.
+    review_cache: annotations::ReviewCache,
 }
 
 impl AppModel {
@@ -706,7 +709,12 @@ impl AppModel {
             active_tab: None,
             next_tab_id: 1,
             stale_tabs: Vec::new(),
+            review_cache: annotations::ReviewCache::default(),
         }
+    }
+
+    pub fn review_cache(&self) -> &annotations::ReviewCache {
+        &self.review_cache
     }
 
     pub fn open_file(&mut self, path: PathBuf, source: String) -> u64 {
@@ -1105,12 +1113,15 @@ pub struct AnnotationView {
 }
 
 impl AnnotationView {
-    pub fn for_tab(tab: &DocumentTab) -> Option<Self> {
+    /// The annotations of a tab, resolved against the source its preview
+    /// shows. `cache` remembers the projection and the result, so pushing
+    /// the same tab again does not parse or search the document again.
+    pub fn for_tab(tab: &DocumentTab, cache: &annotations::ReviewCache) -> Option<Self> {
         if tab.is_editing() {
             return None;
         }
         let path = tab.path()?;
-        let projection = annotations::TextProjection::new(tab.document().source());
+        let source = tab.document().source();
         let location = annotations::resolve(path);
         let key = location
             .as_ref()
@@ -1119,11 +1130,11 @@ impl AnnotationView {
             .into_owned();
         let review = location
             .map_err(annotations::Error::from)
-            .and_then(|location| annotations::read(&location, &projection))
+            .and_then(|location| cache.read(&location, source))
             .map_err(|error| error.to_string());
         Some(Self {
             key,
-            revision: projection.revision,
+            revision: annotations::source_revision(source),
             can_add: !tab.is_dirty(),
             review,
         })
@@ -1183,7 +1194,7 @@ pub fn app_view_with_preferences(model: &AppModel, preferences: GuiPreferences) 
         headings: active_document
             .map(|document| document.headings().to_vec())
             .unwrap_or_default(),
-        annotation: active_tab.and_then(AnnotationView::for_tab),
+        annotation: active_tab.and_then(|tab| AnnotationView::for_tab(tab, model.review_cache())),
         preferences,
     }
 }

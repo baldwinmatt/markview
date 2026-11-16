@@ -41,6 +41,27 @@ type ShellRequests = Rc<RefCell<VecDeque<(Request<Vec<u8>>, RequestAsyncResponde
 struct AppWebView {
     webview: WebView,
     shell_requests: ShellRequests,
+    annotations: AnnotationPush,
+}
+
+/// The annotation state last sent to the page. A comment saved here comes
+/// back as a store event for the same state, which is not worth sending twice.
+#[derive(Default)]
+struct AnnotationPush(RefCell<Option<(Option<u64>, String)>>);
+
+impl AnnotationPush {
+    /// Records `payload` for `tab`, reporting whether the page lacks it.
+    fn changed(&self, tab: Option<u64>, payload: &str) -> bool {
+        let mut last = self.0.borrow_mut();
+        if last
+            .as_ref()
+            .is_some_and(|(last_tab, last_payload)| *last_tab == tab && last_payload == payload)
+        {
+            return false;
+        }
+        *last = Some((tab, payload.to_owned()));
+        true
+    }
 }
 
 impl std::ops::Deref for AppWebView {
@@ -453,9 +474,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             Event::UserEvent(UserEvent::AnnotationRequest(id, form)) => {
                 let tab = model.tab(id).cloned();
+                let cache = model.review_cache().clone();
                 let proxy = proxy.clone();
                 std::thread::spawn(move || {
-                    let error = apply_annotation(tab.as_ref(), &form).err().map(|error| error.to_string());
+                    let error = apply_annotation(tab.as_ref(), &form, &cache).err().map(|error| error.to_string());
                     let _ = proxy.send_event(UserEvent::AnnotationResult(id, error));
                 });
             }
@@ -735,6 +757,7 @@ fn build_webview(
     Ok(AppWebView {
         webview,
         shell_requests,
+        annotations: AnnotationPush::default(),
     })
 }
 
@@ -994,6 +1017,9 @@ fn sync_persisted_view(
 
 fn sync_view(webview: &AppWebView, model: &AppModel, preferences: &GuiPreferences) {
     let next = app_view_with_preferences(model, preferences.clone());
+    webview
+        .annotations
+        .changed(next.active_tab_id, &annotation_js(next.annotation.as_ref()));
     let script = format!("window.markview.setState({});", view_js(&next));
     if let Err(error) = webview.evaluate_script(&script) {
         eprintln!("markview-gui: failed to update view: {error}");
@@ -1455,6 +1481,7 @@ impl FileWatcher {
 fn apply_annotation(
     tab: Option<&markview::DocumentTab>,
     form: &str,
+    cache: &annotations::ReviewCache,
 ) -> Result<(), annotations::Error> {
     use annotations::{Error, Operation};
     let tab = tab
@@ -1480,16 +1507,21 @@ fn apply_annotation(
         }
     }
     let location = annotations::resolve(path)?;
-    annotations::mutate(&location, request.operation)?;
+    // The cache keeps the result, so showing it needs no second search.
+    cache.mutate(&location, request.operation)?;
     Ok(())
 }
 
 fn sync_annotations(webview: &AppWebView, model: &AppModel) {
     if let Some(id) = model.active_tab_id() {
-        let review = model.active_tab().and_then(AnnotationView::for_tab);
+        let review = model
+            .active_tab()
+            .and_then(|tab| AnnotationView::for_tab(tab, model.review_cache()));
         let payload = annotation_js(review.as_ref());
-        let _ =
-            webview.evaluate_script(&format!("window.markview.setAnnotations({id}, {payload});"));
+        if webview.annotations.changed(Some(id), &payload) {
+            let _ = webview
+                .evaluate_script(&format!("window.markview.setAnnotations({id}, {payload});"));
+        }
     }
 }
 
@@ -2825,6 +2857,43 @@ mod tests {
     }
 
     #[test]
+    fn annotation_views_and_writes_share_the_tab_model_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.md");
+        let source = "# Title\n\ntext";
+        fs::write(&path, source).unwrap();
+        let mut model = AppModel::new();
+        let file = model.open_file(path, source.to_owned());
+        model.select(file);
+        // The write runs on a background thread with a clone of the cache.
+        let background = model.review_cache().clone();
+        apply_annotation(model.tab(file), "op=add&body=First", &background).unwrap();
+        // Every state push and every store event resolves the active tab.
+        for _ in 0..4 {
+            let view = app_view_with_preferences(&model, GuiPreferences::default());
+            let review = view.annotation.unwrap().review.unwrap();
+            assert_eq!(review.annotations.len(), 1);
+        }
+        // One projection and one resolution, both from the write itself:
+        // nothing is searched again on the UI thread.
+        assert_eq!(model.review_cache().work(), (1, 1));
+    }
+
+    #[test]
+    fn repeated_annotation_pushes_are_skipped() {
+        let pushed = AnnotationPush::default();
+        // A write is followed by its own store event: same tab, same state.
+        assert!(pushed.changed(Some(1), "{revision:\"a\"}"));
+        assert!(!pushed.changed(Some(1), "{revision:\"a\"}"));
+        assert!(pushed.changed(Some(1), "{revision:\"b\"}"));
+        assert!(pushed.changed(Some(2), "{revision:\"b\"}"));
+        // Going back to an earlier state is a change too.
+        assert!(pushed.changed(Some(2), "{revision:\"a\"}"));
+        assert!(pushed.changed(None, "null"));
+        assert!(!pushed.changed(None, "null"));
+    }
+
+    #[test]
     fn annotations_guard_addressed_tab_and_resolve_against_dirty_preview() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("doc.md");
@@ -2834,7 +2903,7 @@ mod tests {
         let file = model.open_file(path.clone(), source.to_owned());
         let untitled = model.open_untitled("Draft", source.to_owned());
         let add = "op=add&body=Document+comment";
-        assert!(apply_annotation(model.tab(untitled), add).is_err());
+        assert!(apply_annotation(model.tab(untitled), add, model.review_cache()).is_err());
         assert!(app_view_with_preferences(&model, GuiPreferences::default())
             .annotation
             .is_none());
@@ -2852,25 +2921,30 @@ mod tests {
             "op=add&body=%3C%2Fscript%3E&quote=text&start=5&end=9&source_revision={}",
             annotations::source_revision(source)
         );
-        apply_annotation(model.tab(file), &form).unwrap();
+        apply_annotation(model.tab(file), &form, model.review_cache()).unwrap();
         model.select(file);
         let initial = app_view_with_preferences(&model, GuiPreferences::default());
         assert!(view_js(&initial).contains(r"\u003c/script\u003e"));
-        assert!(apply_annotation(model.tab(file), "op=add&doc=elsewhere&body=blocked").is_err());
+        assert!(apply_annotation(
+            model.tab(file),
+            "op=add&doc=elsewhere&body=blocked",
+            model.review_cache()
+        )
+        .is_err());
 
         model.toggle_editing(file);
         model.update_source(file, "# Title\n\n\ntext".to_owned());
-        assert!(AnnotationView::for_tab(model.tab(file).unwrap()).is_none());
+        assert!(AnnotationView::for_tab(model.tab(file).unwrap(), model.review_cache()).is_none());
         model.toggle_editing(file);
-        assert!(apply_annotation(model.tab(file), add).is_err());
-        let view = AnnotationView::for_tab(model.tab(file).unwrap()).unwrap();
+        assert!(apply_annotation(model.tab(file), add, model.review_cache()).is_err());
+        let view = AnnotationView::for_tab(model.tab(file).unwrap(), model.review_cache()).unwrap();
         assert!(!view.can_add);
         assert_eq!(view.review.unwrap().annotations[0].lines, Some((4, 4)));
         assert_eq!(fs::read_to_string(&path).unwrap(), source);
 
         model.mark_saved(file);
         assert!(matches!(
-            apply_annotation(model.tab(file), &form),
+            apply_annotation(model.tab(file), &form, model.review_cache()),
             Err(annotations::Error::Conflict(_))
         ));
     }

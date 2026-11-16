@@ -230,6 +230,11 @@ function createPage({revision = 'source-1'} = {}) {
       Object.assign(selection, {range, rangeCount: range ? 1 : 0, isCollapsed: !range});
       document.dispatchEvent({type: 'selectionchange'});
     },
+    // Reports a DOM change under `root`, as a MutationObserver would.
+    mutated(root) {
+      for (const observer of page.observers) if (observer.root === root || observer.root?.contains(root)) observer.callback([], observer);
+    },
+    observers: [],
     // Lets pending promise callbacks in the script run.
     async settle() { for (let turn = 0; turn < 10; turn++) await Promise.resolve(); },
   };
@@ -258,6 +263,12 @@ function createPage({revision = 'source-1'} = {}) {
     },
     CSS: {highlights: page.highlights},
     Highlight: class { constructor(...ranges) { this.ranges = ranges; this.size = ranges.length; } },
+    MutationObserver: class {
+      constructor(callback) { this.callback = callback; page.observers.push(this); }
+      observe(root) { this.root = root; }
+      takeRecords() { return []; }
+      disconnect() { this.root = null; }
+    },
     fetch: (...args) => {
       page.fetchCalls.push(args);
       return page.fetch(...args);

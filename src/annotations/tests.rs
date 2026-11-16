@@ -1167,7 +1167,7 @@ fn canonical_source_reads_reject_paths_without_a_file_name_instead_of_panicking(
 }
 
 #[test]
-fn a_stale_revision_conflicts_alike_before_and_under_the_lock() {
+fn a_source_that_changes_between_the_check_and_the_lock_is_rejected_alike() {
     for text in [false, true] {
         let dir = tempdir().unwrap();
         let path = dir.path().join("doc.md");
@@ -1227,4 +1227,56 @@ fn request_parse_reads_one_revision_for_both_kinds_of_add() {
     );
     // A selection cannot be made without the revision it was made against.
     assert!(revision("op=add&body=x&quote=a&start=0&end=1", Optional).is_err());
+}
+
+#[test]
+fn a_stale_whole_document_add_builds_no_projection() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("doc.md");
+    fs::write(&path, "# Doc\n\ntext\n").unwrap();
+    let location = resolve(&path).unwrap();
+    let cache = ReviewCache::default();
+    let stale = Operation::Add {
+        body: "Note".to_owned(),
+        selection: None,
+        revision: Some(source_revision("something else")),
+    };
+    assert!(matches!(
+        cache.mutate(&location, stale),
+        Err(Error::Conflict(_))
+    ));
+    assert_eq!(cache.work().0, 0);
+}
+
+#[test]
+fn a_stale_add_is_refused_before_anything_is_created() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root can create directories anywhere
+    }
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("doc.md");
+    fs::write(&path, "# Doc\n\nfirst second\n").unwrap();
+    let location = resolve(&path).unwrap();
+    // Creating the store would fail with an I/O error: only a check made
+    // before it can answer with the conflict.
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+    let result = (0..2).map(|text| {
+        mutate(
+            &location,
+            Operation::Add {
+                body: "Note".to_owned(),
+                selection: (text == 1).then(|| Selection {
+                    quote: "second".to_owned(),
+                    range: 8..14,
+                }),
+                revision: Some(source_revision("stale")),
+            },
+        )
+    });
+    let results: Vec<_> = result.collect();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    for result in results {
+        assert!(matches!(result, Err(Error::Conflict(_))), "{result:?}");
+    }
 }

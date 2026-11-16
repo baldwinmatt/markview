@@ -697,14 +697,10 @@ fn refresh(record: &mut Annotation, projection: &TextProjection, range: Range<us
     record.hint("start", range.start.to_string());
 }
 
-/// The one comparison of a request's source revision with the source's
-/// projection, for the check before the lock and the one under it.
-fn check_revision(
-    projection: &TextProjection,
-    revision: &str,
-    selection: bool,
-) -> Result<(), Error> {
-    if revision == projection.revision {
+/// The one comparison of a request's source revision with the current one,
+/// for the check before the lock and the one under it.
+fn check_revision(current: &str, revision: &str, selection: bool) -> Result<(), Error> {
+    if revision == current {
         return Ok(());
     }
     Err(Error::Conflict(if selection {
@@ -721,7 +717,7 @@ fn validate_add(
     revision: Option<&str>,
 ) -> Result<(), Error> {
     if let Some(revision) = revision {
-        check_revision(projection, revision, selection.is_some())?;
+        check_revision(&projection.revision, revision, selection.is_some())?;
     }
     if let Some(selection) = selection {
         validate_selection(projection, selection)?;
@@ -780,9 +776,17 @@ fn mutate_with(
         ..
     } = &operation
     {
-        if revision.is_some() || selection.is_some() {
-            let projection = project(&read_source(location)?);
-            validate_add(&projection, selection.as_ref(), revision.as_deref())?;
+        match (selection, revision) {
+            // A quote needs the projection to be checked against.
+            (Some(selection), revision) => {
+                let projection = project(&read_source(location)?);
+                validate_add(&projection, Some(selection), revision.as_deref())?;
+            }
+            // A whole-document add needs only the digest of the source.
+            (None, Some(revision)) => {
+                check_revision(&source_revision(&read_source(location)?), revision, false)?;
+            }
+            (None, None) => {}
         }
     }
     #[cfg(test)]

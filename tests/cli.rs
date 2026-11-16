@@ -539,7 +539,7 @@ fn serve_mode_returns_rendered_html() {
     assert!(response.contains("&#8212; clean text"));
     assert!(!response.contains("&#226;&#128;&#148; clean text"));
     assert!(!response.contains("— clean text"));
-    assert!(!response.contains(r#"<div class="markview-shell">"#));
+    assert!(response.contains(r#"<div class="markview-shell" data-nav="none">"#));
     assert!(response
         .contains(r#"Served by <a href="https://github.com/baldwinmatt/markview">markview</a>"#));
     assert!(response.contains(r#"<footer class="markview-footer">"#));
@@ -894,7 +894,7 @@ fn explicit_multi_file_serve_renders_navigation_and_defaults_to_first_input() {
     assert!(root.contains(r#"<h1 id="first">First</h1>"#));
     assert!(root.contains("data-markview-nav"));
     assert!(root.contains(r#"class="markview-tabs""#));
-    assert!(!root.contains(r#"<div class="markview-shell">"#));
+    assert!(root.contains(r#"<div class="markview-shell" data-nav="tabs">"#));
     assert!(root.contains(r#"href="/second.md#part""#));
     assert!(second_response.contains(r#"<h1 id="second">Second</h1>"#));
     server.stop();
@@ -940,7 +940,7 @@ fn directory_serve_selects_default_documents_and_ignores_nested_markdown() {
 
     let readme = http_get(server.port, "/");
     assert!(readme.contains(r#"<h1 id="readme">Readme</h1>"#));
-    assert!(readme.contains(r#"<div class="markview-shell">"#));
+    assert!(readme.contains(r#"<div class="markview-shell" data-nav="sidebar">"#));
     assert!(readme.contains(r#"class="markview-sidebar""#));
     assert!(http_get(server.port, "/nested/hidden.md").contains("HTTP/1.1 404 Not Found"));
     server.stop();
@@ -2526,7 +2526,7 @@ fn plain_page_body(body: &str) -> String {
     without_copy_version(&without_timestamp(body))
 }
 
-const BASELINE_HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\nContent-Length: 14106\r\nConnection: close";
+const BASELINE_HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\nContent-Length: 21928\r\nConnection: close";
 const BASELINE_BODY: &str = include_str!("fixtures/serve-baseline.expected.html");
 
 #[test]
@@ -2566,8 +2566,8 @@ fn plain_page_carries_copy_controls_and_no_review_machinery() {
     assert!(body.contains("new EventSource('/events')"));
     assert_eq!(
         body.matches("<script").count(),
-        2,
-        "copy.js and live reload"
+        3,
+        "theme, copy.js and live reload"
     );
 }
 
@@ -2809,8 +2809,8 @@ fn serve_annotate_pages_allow_only_their_own_nonce_scripts() {
     let scripts: Vec<_> = body.match_indices("<script").collect();
     assert_eq!(
         scripts.len(),
-        4,
-        "review.js, copy.js, start-up call, live reload"
+        5,
+        "theme, review.js, copy.js, start-up call, live reload"
     );
     for (index, _) in &scripts {
         assert!(
@@ -2831,8 +2831,8 @@ fn serve_annotate_pages_allow_only_their_own_nonce_scripts() {
     }
     assert_eq!(
         body.matches(&format!("<script nonce=\"{nonce}\">")).count(),
-        2,
-        "start-up call and live reload"
+        3,
+        "theme, start-up call and live reload"
     );
     // What the document tried to inject is text, or a dead link.
     assert!(body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));

@@ -6,6 +6,26 @@ use pulldown_cmark::{
     html, BlockQuoteKind, CodeBlockKind, CowStr, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
 };
 
+/// Page colours in every HTML frontend, as the light and dark themes set them.
+pub const THEME_LIGHT_VARIABLES: &str = r#"  --bg: #f8f7f4;
+  --fg: #242220;
+  --muted: #68625c;
+  --rule: #d8d2ca;
+  --accent: #0f766e;
+  --accent-fg: #ffffff;
+  --code-bg: #ebe6de;
+  --quote-bg: #f1ede7;
+  --surface: #fffdf9;"#;
+pub const THEME_DARK_VARIABLES: &str = r#"  --bg: #181715;
+  --fg: #eeeae4;
+  --muted: #aaa39a;
+  --rule: #39342f;
+  --accent: #5eead4;
+  --accent-fg: #10201d;
+  --code-bg: #25221f;
+  --quote-bg: #211f1c;
+  --surface: #1f1d1a;"#;
+
 /// Light-theme palette for diff rows in every HTML frontend.
 pub const DIFF_LIGHT_VARIABLES: &str = r#"  --diff-add-bg: #dafbe1;
   --diff-add-fg: #116329;
@@ -1792,25 +1812,13 @@ fn render_html_document(document: &RenderedDocument) -> String {
 <style>
 :root {{
   color-scheme: light dark;
-  --bg: #f8f7f4;
-  --fg: #242220;
-  --muted: #68625c;
-  --rule: #d8d2ca;
-  --accent: #0f766e;
-  --code-bg: #ebe6de;
-  --quote-bg: #f1ede7;
+{THEME_LIGHT_VARIABLES}
 {DIFF_LIGHT_VARIABLES}
 {ALERT_LIGHT_VARIABLES}
 }}
 @media (prefers-color-scheme: dark) {{
   :root {{
-    --bg: #181715;
-    --fg: #eeeae4;
-    --muted: #aaa39a;
-    --rule: #39342f;
-    --accent: #5eead4;
-    --code-bg: #25221f;
-    --quote-bg: #211f1c;
+{THEME_DARK_VARIABLES}
 {DIFF_DARK_VARIABLES}
 {ALERT_DARK_VARIABLES}
   }}

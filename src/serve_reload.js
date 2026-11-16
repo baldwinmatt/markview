@@ -21,6 +21,60 @@
   };
   updateModifiedTimes();
   updateRefreshTime();
+  const themeButtons = document.querySelectorAll('[data-markview-theme]');
+  const showTheme = (choice) => {
+    if (choice === 'light' || choice === 'dark') document.documentElement.dataset.theme = choice;
+    else delete document.documentElement.dataset.theme;
+    themeButtons.forEach((button) => {
+      button.setAttribute('aria-pressed', String(button.dataset.markviewTheme === choice));
+    });
+  };
+  let savedTheme = 'auto';
+  try {
+    const stored = localStorage.getItem('markview-theme');
+    if (stored === 'light' || stored === 'dark') savedTheme = stored;
+  } catch { /* Preference storage is optional. */ }
+  showTheme(savedTheme);
+  themeButtons.forEach((button) => {
+    button.addEventListener('click', () => {
+      const choice = button.dataset.markviewTheme;
+      showTheme(choice);
+      try {
+        if (choice === 'auto') localStorage.removeItem('markview-theme');
+        else localStorage.setItem('markview-theme', choice);
+      } catch { /* Preference storage is optional. */ }
+    });
+  });
+  const outline = document.querySelector('[data-markview-outline]');
+  const comments = document.querySelector('[data-markview-comments]');
+  const buildOutline = () => {
+    if (!outline) return;
+    outline.replaceChildren();
+    const headings = document.querySelectorAll('main h1[id], main h2[id], main h3[id], main h4[id], main h5[id], main h6[id]');
+    headings.forEach((heading) => {
+      const link = document.createElement('a');
+      link.href = '#' + heading.id;
+      link.dataset.level = heading.tagName.slice(1);
+      link.textContent = heading.textContent;
+      outline.append(link);
+    });
+    if (!headings.length) {
+      const empty = document.createElement('p');
+      empty.textContent = 'This document has no headings.';
+      outline.append(empty);
+    }
+  };
+  document.querySelectorAll('[data-markview-tab]').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      const showOutline = tab.dataset.markviewTab === 'outline';
+      document.querySelectorAll('[data-markview-tab]').forEach((other) => {
+        other.setAttribute('aria-selected', String(other === tab));
+      });
+      if (comments) comments.hidden = showOutline;
+      if (outline) outline.hidden = !showOutline;
+    });
+  });
+  buildOutline();
   const attachCodeCopy = createMarkviewCodeCopy(document.querySelector('main'));
   window.markviewAttachCodeCopy = () => attachCodeCopy(text => navigator.clipboard.writeText(text));
   window.markviewAttachCodeCopy();
@@ -98,6 +152,7 @@
     if (next.title) document.title = next.title;
     updateModifiedTimes();
     updateRefreshTime();
+    buildOutline();
     window.scrollTo(0, savedY);
     loadingDocument = false;
     await window.markviewVerdict?.refresh();

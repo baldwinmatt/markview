@@ -18,7 +18,9 @@ function createMarkviewVerdict(page, review, token) {
   const changes = button('Request changes', () => finish('changes'));
   const retry = button('Retry review summary', () => refresh());
   bar.append(scope, status, approve, changes, retry);
-  document.body.prepend(bar);
+  const slot = document.querySelector('[data-markview-verdict]');
+  if (slot) slot.append(bar);
+  else document.body.prepend(bar);
   let summary = null;
   let sequence = 0;
   let submitting = false;

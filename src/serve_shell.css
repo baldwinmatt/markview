@@ -1,0 +1,270 @@
+[data-markview-nav]:empty { display: none; }
+.markview-top {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  height: 52px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 16px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--rule);
+  font-size: 0.9rem;
+}
+.markview-brand { font-weight: 700; color: var(--fg); text-decoration: none; }
+.markview-crumb {
+  color: var(--muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.markview-crumb b { color: var(--fg); font-weight: 600; }
+.markview-top-spacer { flex: 1; }
+.markview-theme {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  background: var(--code-bg);
+}
+.markview-theme button {
+  border: 0;
+  border-radius: 999px;
+  background: none;
+  color: var(--muted);
+  padding: 2px 10px;
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.markview-theme button[aria-pressed="true"] {
+  background: var(--surface);
+  color: var(--fg);
+  box-shadow: 0 1px 2px #0003;
+}
+.markview-top .markview-verdict {
+  width: auto;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.markview-top .markview-verdict strong { display: none; }
+.markview-top .markview-verdict p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.markview-top .markview-verdict button {
+  margin: 0;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--fg);
+  padding: 4px 12px;
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.markview-top .markview-verdict button:first-of-type {
+  order: 2;
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-color: transparent;
+  font-weight: 600;
+}
+.markview-top .markview-verdict button:disabled { opacity: 0.5; cursor: default; }
+
+.markview-shell {
+  display: grid;
+  grid-template-columns: var(--nav-w, 0) minmax(0, 1fr) var(--aside-w, 0);
+  grid-template-rows: auto auto 1fr;
+  align-items: start;
+}
+.markview-shell[data-nav="sidebar"] { --nav-w: 250px; }
+.markview-shell[data-aside] { --aside-w: 340px; }
+.markview-shell > main {
+  grid-column: 2;
+  grid-row: 2;
+  width: 100%;
+  max-width: 820px;
+  margin: 0;
+  justify-self: center;
+  padding: 44px 40px 24px;
+}
+.markview-shell > [data-markview-nav] { grid-column: 2; grid-row: 1; }
+.markview-footer {
+  grid-column: 2;
+  grid-row: 3;
+  width: calc(100% - 80px);
+  max-width: 740px;
+  justify-self: center;
+  margin: 0 0 48px;
+  padding-top: 0.9rem;
+  border-top: 1px solid var(--rule);
+  color: var(--muted);
+  font-size: 0.82rem;
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: baseline;
+}
+.markview-footer-meta { display: flex; gap: 0.9rem; text-align: right; }
+.markview-modified, .markview-refreshed { white-space: nowrap; }
+
+.markview-tabs {
+  display: flex;
+  gap: 0.25rem;
+  flex-wrap: wrap;
+  margin: 20px 40px 0;
+  border-bottom: 1px solid var(--rule);
+}
+.markview-tabs a {
+  padding: 0.5rem 1rem;
+  margin-bottom: -1px;
+  border: 1px solid transparent;
+  border-radius: 8px 8px 0 0;
+  background: var(--code-bg);
+  color: var(--muted);
+  text-decoration: none;
+  max-width: 12rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.markview-tabs a:hover { background: var(--quote-bg); color: var(--fg); border-color: var(--rule) var(--rule) transparent; }
+.markview-tabs a[aria-current="page"] { background: var(--bg); color: var(--fg); font-weight: 600; border-color: var(--rule) var(--rule) var(--bg); }
+
+.markview-sidebar {
+  grid-column: 1 !important;
+  grid-row: 1 / span 3 !important;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  position: sticky;
+  top: 52px;
+  height: calc(100vh - 52px);
+  overflow-y: auto;
+  padding: 14px 10px;
+  background: var(--code-bg);
+  border-right: 1px solid var(--rule);
+  font-size: 0.92rem;
+}
+.markview-sidebar a, .markview-nav-dir > summary {
+  display: block;
+  padding: 0.38rem 0.7rem;
+  border-radius: 6px;
+  color: var(--muted);
+  text-decoration: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.markview-sidebar a:hover, .markview-nav-dir > summary:hover { background: var(--quote-bg); color: var(--fg); }
+.markview-sidebar a[aria-current="page"] {
+  background: var(--surface);
+  color: var(--fg);
+  font-weight: 600;
+  box-shadow: 0 1px 2px #0002;
+}
+.markview-nav-dir > summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  font-weight: 600;
+  user-select: none;
+}
+.markview-nav-dir > summary::-webkit-details-marker { display: none; }
+.markview-nav-dir > summary::before {
+  content: "\25B8";
+  display: inline-block;
+  width: 1em;
+  margin-right: 0.3em;
+  transition: transform 0.15s ease;
+}
+.markview-nav-dir[open] > summary::before { transform: rotate(90deg); }
+.markview-nav-dir > :not(summary) { margin-left: 0.9rem; }
+
+.markview-aside {
+  grid-column: 3;
+  grid-row: 1 / span 3;
+  position: sticky;
+  top: 52px;
+  height: calc(100vh - 52px);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--surface);
+  border-left: 1px solid var(--rule);
+}
+.markview-aside-tabs { display: flex; border-bottom: 1px solid var(--rule); }
+.markview-aside-tabs button {
+  flex: 1;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  background: none;
+  color: var(--muted);
+  padding: 12px;
+  font: inherit;
+  font-size: 0.88rem;
+  cursor: pointer;
+}
+.markview-aside-tabs button[aria-selected="true"] { color: var(--fg); font-weight: 600; border-color: var(--accent); }
+.markview-aside-pane { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.markview-aside-pane[hidden] { display: none; }
+.markview-outline { overflow-y: auto; padding: 12px; font-size: 0.9rem; }
+.markview-outline a { display: block; padding: 0.25rem 0.5rem; border-radius: 6px; color: var(--muted); text-decoration: none; }
+.markview-outline a:hover { background: var(--code-bg); color: var(--fg); }
+.markview-outline a[data-level="2"] { padding-left: 1.2rem; }
+.markview-outline a[data-level="3"] { padding-left: 1.9rem; }
+.markview-outline a[data-level="4"], .markview-outline a[data-level="5"], .markview-outline a[data-level="6"] { padding-left: 2.6rem; }
+.markview-outline p { color: var(--muted); margin: 0.5rem; }
+
+@media (max-width: 1100px) {
+  .markview-shell[data-aside] { --aside-w: 0; }
+  .markview-aside {
+    grid-column: 2;
+    grid-row: 4;
+    position: static;
+    height: auto;
+    min-height: 18rem;
+    border-left: 0;
+    border-top: 1px solid var(--rule);
+  }
+}
+@media (max-width: 800px) {
+  .markview-shell, .markview-shell[data-nav="sidebar"] { display: block; }
+  .markview-shell > main { padding: 24px 20px 16px; }
+  .markview-footer { width: calc(100% - 40px); margin: 0 20px 32px; flex-direction: column; gap: 0.35rem; }
+  .markview-footer-meta { flex-direction: column; gap: 0.2rem; text-align: left; }
+  .markview-sidebar {
+    position: static;
+    height: auto;
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    border-right: 0;
+    border-bottom: 1px solid var(--rule);
+  }
+  .markview-sidebar a { max-width: 12rem; }
+  .markview-tabs { margin: 16px 20px 0; }
+  .markview-crumb { display: none; }
+}
+@media print {
+  .markview-top, .markview-sidebar, .markview-aside, .markview-tabs { display: none !important; }
+  .markview-shell { display: block; }
+  .markview-shell > main { max-width: none; padding: 0; }
+}

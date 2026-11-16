@@ -18,7 +18,8 @@ use std::time::{Duration, SystemTime};
 use markview::annotations;
 use markview::{
     help, percent_decode, render, repair_utf8_mojibake, Cli, FrontendRenderer, HtmlRenderer,
-    MarkdownDocument, OutputFormat,
+    MarkdownDocument, OutputFormat, ALERT_DARK_VARIABLES, ALERT_LIGHT_VARIABLES,
+    DIFF_DARK_VARIABLES, DIFF_LIGHT_VARIABLES, THEME_DARK_VARIABLES, THEME_LIGHT_VARIABLES,
 };
 use notify::{event::ModifyKind, Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use pulldown_cmark::{Event, Parser, Tag};
@@ -2057,6 +2058,29 @@ fn rewritten_reference(
         .map(|asset| format!("{}{}", asset.route_path, fragment))
 }
 
+/// "dir / dir / **Title**" for the top bar.
+fn render_breadcrumb(config: &ServeConfig, active_route: &str) -> String {
+    let segments = route_path_segments(active_route);
+    let Some((last, dirs)) = segments.split_last() else {
+        return String::new();
+    };
+    let title = config
+        .documents
+        .iter()
+        .find(|document| document.route_path == active_route)
+        .map(current_document_title)
+        .unwrap_or_else(|| percent_decode(last).unwrap_or_else(|| (*last).to_owned()));
+    let mut html = String::new();
+    for dir in dirs {
+        html.push_str(&html_escape(
+            &percent_decode(dir).unwrap_or_else(|| (*dir).to_owned()),
+        ));
+        html.push_str(" / ");
+    }
+    html.push_str(&format!("<b>{}</b>", html_escape(&title)));
+    html
+}
+
 fn render_nav(config: &ServeConfig, active_route: &str) -> String {
     let layout = nav_layout(config);
     if layout == NavLayout::Empty {
@@ -2260,209 +2284,68 @@ fn inject_serve_shell(
     );
     let script = concat!("<script>\n", include_str!("serve_reload.js"), "</script>");
 
-    let style = r#"<style>
-[data-markview-nav] {
-  width: min(860px, calc(100vw - 48px));
-  margin: 24px auto 0;
-}
-[data-markview-nav]:empty { display: none; }
-.markview-shell {
-  display: grid;
-  grid-template-columns: 240px minmax(0, 860px);
-  gap: 32px;
-  width: min(1132px, calc(100vw - 48px));
-  margin: 0 auto;
-  align-items: start;
-}
-.markview-shell main {
-  width: auto;
-  margin: 0;
-}
-.markview-shell [data-markview-nav] {
-  width: auto;
-  margin: 40px 0 0;
-}
-.markview-footer {
-  width: min(860px, calc(100vw - 48px));
-  margin: -36px auto 40px;
-  padding-top: 1rem;
-  border-top: 1px solid var(--rule);
-  color: var(--muted);
-  font-size: 0.9rem;
-  display: flex;
-  justify-content: space-between;
-  gap: 1rem;
-  align-items: baseline;
-}
-.markview-refreshed {
-  text-align: right;
-  white-space: nowrap;
-}
-.markview-footer-meta {
-  display: flex;
-  flex-direction: column;
-  gap: 0.2rem;
-  text-align: right;
-}
-.markview-modified,
-.markview-refreshed {
-  white-space: nowrap;
-}
-.markview-tabs {
-  display: flex;
-  gap: 0.25rem;
-  flex-wrap: wrap;
-  border-bottom: 1px solid var(--rule);
-}
-.markview-tabs a {
-  padding: 0.55rem 1rem;
-  margin-bottom: -1px;
-  border: 1px solid transparent;
-  border-top-left-radius: 8px;
-  border-top-right-radius: 8px;
-  background: var(--code-bg);
-  color: var(--muted);
-  text-decoration: none;
-  max-width: 12rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.markview-tabs a:hover {
-  background: var(--quote-bg);
-  color: var(--fg);
-  border-color: var(--rule) var(--rule) transparent;
-}
-.markview-tabs a[aria-current="page"] {
-  background: var(--bg);
-  color: var(--fg);
-  font-weight: 600;
-  border-color: var(--rule) var(--rule) var(--bg);
-}
-.markview-sidebar {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  background: var(--code-bg);
-  border-radius: 10px;
-  padding: 14px 10px;
-  position: sticky;
-  top: 24px;
-  align-self: start;
-  max-height: calc(100vh - 48px);
-  overflow-y: auto;
-}
-.markview-sidebar a {
-  display: block;
-  padding: 0.5rem 0.7rem;
-  border-radius: 6px;
-  color: var(--muted);
-  text-decoration: none;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  transition: background-color 0.15s ease, color 0.15s ease;
-}
-.markview-sidebar a:hover {
-  background: var(--quote-bg);
-  color: var(--fg);
-}
-.markview-sidebar a[aria-current="page"] {
-  background: var(--accent);
-  color: var(--bg);
-  font-weight: 600;
-}
-.markview-nav-dir {
-  margin: 0;
-}
-.markview-nav-dir > summary {
-  cursor: pointer;
-  list-style: none;
-  display: flex;
-  align-items: center;
-  padding: 0.5rem 0.7rem;
-  border-radius: 6px;
-  color: var(--muted);
-  font-weight: 600;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  user-select: none;
-}
-.markview-nav-dir > summary::-webkit-details-marker {
-  display: none;
-}
-.markview-nav-dir > summary::before {
-  content: "\25B8";
-  display: inline-block;
-  width: 1em;
-  margin-right: 0.3em;
-  transition: transform 0.15s ease;
-}
-.markview-nav-dir[open] > summary::before {
-  transform: rotate(90deg);
-}
-.markview-nav-dir > summary:hover {
-  background: var(--quote-bg);
-  color: var(--fg);
-}
-.markview-nav-dir > :not(summary) {
-  margin-left: 0.9rem;
-}
-@media (max-width: 700px) {
-  .markview-shell {
-    display: block;
-    width: min(860px, calc(100vw - 48px));
-    margin: 0 auto;
-  }
-  .markview-shell main {
-    width: auto;
-    margin: 0;
-  }
-  .markview-sidebar {
-    position: static;
-    max-height: none;
-    overflow: visible;
-    flex-direction: row;
-    flex-wrap: wrap;
-    gap: 0.35rem;
-    margin-bottom: 1.25rem;
-  }
-  .markview-sidebar a {
-    max-width: 12rem;
-  }
-  .markview-footer {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 0.35rem;
-  }
-  .markview-refreshed {
-    text-align: left;
-    white-space: normal;
-  }
-  .markview-footer-meta {
-    text-align: left;
-  }
-  .markview-modified,
-  .markview-refreshed {
-    white-space: normal;
-  }
-}
-</style>"#;
+    let style = format!(
+        "<style>\n:root[data-theme=\"light\"] {{\n  color-scheme: light;\n{THEME_LIGHT_VARIABLES}\n{DIFF_LIGHT_VARIABLES}\n{ALERT_LIGHT_VARIABLES}\n}}\n:root[data-theme=\"dark\"] {{\n  color-scheme: dark;\n{THEME_DARK_VARIABLES}\n{DIFF_DARK_VARIABLES}\n{ALERT_DARK_VARIABLES}\n}}\n{}</style>",
+        include_str!("serve_shell.css")
+    );
     let html = html.replace("</style>", &format!("</style>\n{style}"));
-    let html = match nav_layout(config) {
-        NavLayout::Sidebar => html
-            .replacen(
-                "<main>",
-                &format!(r#"<div class="markview-shell">{nav}<main>"#),
-                1,
-            )
-            .replacen("</main>", "</main></div>", 1),
-        NavLayout::Empty | NavLayout::Tabs => html.replacen("<main>", &format!("{nav}\n<main>"), 1),
-    };
     let nonce_attr = review
         .and_then(|(_, hooks)| hooks.nonce)
         .map_or(String::new(), |nonce| format!(r#" nonce="{nonce}""#));
+    // Applies a saved Light or Dark choice before first paint; Auto leaves the
+    // attribute off so the system preference decides.
+    let theme_script = format!(
+        "<script{nonce_attr}>try{{var t=localStorage.getItem('markview-theme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t}}catch(e){{}}</script>"
+    );
+    let html = html.replacen("</head>", &format!("{theme_script}\n</head>"), 1);
+    let blocking = review.is_some_and(|(_, hooks)| hooks.blocking_review);
+    let verdict_slot = if blocking {
+        r#"<div data-markview-verdict></div>"#
+    } else {
+        ""
+    };
+    let top = format!(
+        r#"<header class="markview-top">
+<a class="markview-brand" href="/">markview</a>
+<span class="markview-crumb">{}</span>
+<span class="markview-top-spacer"></span>
+<div class="markview-theme" role="group" aria-label="Theme">
+<button type="button" data-markview-theme="light" aria-pressed="false">Light</button>
+<button type="button" data-markview-theme="auto" aria-pressed="true">Auto</button>
+<button type="button" data-markview-theme="dark" aria-pressed="false">Dark</button>
+</div>
+{verdict_slot}
+</header>
+"#,
+        render_breadcrumb(config, active_route)
+    );
+    let nav_kind = match nav_layout(config) {
+        NavLayout::Sidebar => "sidebar",
+        NavLayout::Tabs => "tabs",
+        NavLayout::Empty => "none",
+    };
+    let aside = if review.is_some() {
+        r#"<aside class="markview-aside" aria-label="Review">
+<div class="markview-aside-tabs" role="tablist">
+<button type="button" role="tab" data-markview-tab="comments" aria-selected="true">Comments</button>
+<button type="button" role="tab" data-markview-tab="outline" aria-selected="false">Outline</button>
+</div>
+<div class="markview-aside-pane" data-markview-comments></div>
+<div class="markview-aside-pane markview-outline" data-markview-outline hidden></div>
+</aside>"#
+    } else {
+        ""
+    };
+    let aside_attr = if review.is_some() { " data-aside" } else { "" };
+    let html = html
+        .replacen(
+            "<main>",
+            &format!(
+                r#"{top}<div class="markview-shell" data-nav="{nav_kind}"{aside_attr}>{nav}<main>"#
+            ),
+            1,
+        )
+        .replacen("</main>", &format!("</main>\n{footer}\n{aside}</div>"), 1);
     let (html, hooks) = if let Some((revision, hooks)) = review {
         let html = html.replacen(
             "<main>",
@@ -2487,10 +2370,7 @@ fn inject_serve_shell(
     };
     let copy = serve_annotations::copy_hooks(&nonce_attr);
     let script = script.replacen("<script>", &format!("<script{nonce_attr}>"), 1);
-    html.replace(
-        "</body>",
-        &format!("{footer}\n{copy}\n{hooks}\n{script}\n</body>"),
-    )
+    html.replace("</body>", &format!("{copy}\n{hooks}\n{script}\n</body>"))
 }
 
 fn file_mtime(path: &Path) -> Option<SystemTime> {

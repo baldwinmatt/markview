@@ -685,7 +685,7 @@ function createMarkviewReview(root, mount, submit, {
 function markviewServeReview(route, token, port, blockingReview) {
   const endpoint = '/_markview/annotations';
   const root = document.querySelector('main');
-  const review = createMarkviewReview(root, document.body, async (form) => {
+  const review = createMarkviewReview(root, document.querySelector('[data-markview-comments]') || document.body, async (form) => {
     form.set('doc', root.dataset.markviewRoute || route);
     const response = await fetch(endpoint, {method: 'POST', headers: {'X-Markview-Token': token}, body: form});
     const data = await response.json();

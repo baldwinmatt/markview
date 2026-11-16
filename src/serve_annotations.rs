@@ -1228,7 +1228,7 @@ mod tests {
         let (html, nonce) = review_page();
         assert_eq!(
             html.matches(&format!("<script nonce=\"{nonce}\">")).count(),
-            2
+            3
         );
         assert!(!html.contains("<script>"));
         assert!(html.contains("<a href=\"/target.md\">a link</a>"));

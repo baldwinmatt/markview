@@ -1542,8 +1542,8 @@ fn render_file(
         config,
         &served.route_path,
         modified_at,
-        &HtmlRenderer.render_with_destinations(&document, |destination| {
-            if serve_annotations::executable_url(destination) {
+        &HtmlRenderer.render_with_destinations(&document, |kind, destination| {
+            if serve_annotations::blocked_destination(kind, destination) {
                 Some("#".to_owned())
             } else {
                 rewritten_reference(config, served, destination, &assets)

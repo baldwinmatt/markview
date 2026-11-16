@@ -6,6 +6,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use markview::annotations::{self, Error, Request, TextProjection, FORM_CAP};
+use markview::DestinationKind;
 
 use super::{
     broadcast_reload, decode_repeated, validated_served_path, write_response_headers, Clients,
@@ -33,7 +34,13 @@ pub fn reserved(target: &str) -> bool {
         })
 }
 
-pub fn executable_url(destination: &str) -> bool {
+/// Whether a Markdown destination must not reach the page.
+///
+/// `javascript:` and `vbscript:` run script wherever they appear. `data:` can
+/// navigate to an attacker-written document, so it is blocked for links, but
+/// an `<img>` only ever decodes it as an image: `data:image/*` (SVG included,
+/// which cannot run script inside `<img>`) is kept, any other type is not.
+pub fn blocked_destination(kind: DestinationKind, destination: &str) -> bool {
     // The Markdown parser has already decoded HTML character references.
     // The browser trims leading C0/space and strips ASCII tabs and line breaks.
     let normalized: String = destination
@@ -41,11 +48,20 @@ pub fn executable_url(destination: &str) -> bool {
         .chars()
         .filter(|ch| !matches!(ch, '\t' | '\n' | '\r'))
         .collect();
-    normalized.split_once(':').is_some_and(|(scheme, _)| {
-        ["javascript", "vbscript", "data"]
-            .iter()
-            .any(|blocked| scheme.eq_ignore_ascii_case(blocked))
-    })
+    let Some((scheme, rest)) = normalized.split_once(':') else {
+        return false;
+    };
+    if scheme.eq_ignore_ascii_case("data") {
+        // `data:[<media type>][;base64],<data>`; no media type is text/plain.
+        let media_type = rest.split([';', ',']).next().unwrap_or("").trim();
+        return kind == DestinationKind::Link
+            || !media_type
+                .get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"));
+    }
+    ["javascript", "vbscript"]
+        .iter()
+        .any(|blocked| scheme.eq_ignore_ascii_case(blocked))
 }
 
 pub struct HttpRequest {

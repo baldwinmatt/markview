@@ -1188,34 +1188,47 @@ pub fn app_view_with_preferences(model: &AppModel, preferences: GuiPreferences) 
     }
 }
 
+/// What a Markdown destination is used for. A URL that is harmless as an
+/// image source can still be unsafe to navigate to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestinationKind {
+    Link,
+    Image,
+}
+
 impl HtmlRenderer {
     pub fn render_with_destinations(
         &self,
         document: &MarkdownDocument,
-        rewrite: impl FnMut(&str) -> Option<String>,
+        rewrite: impl FnMut(DestinationKind, &str) -> Option<String>,
     ) -> String {
         render_html_document(&render_document_with_destinations(document, rewrite))
     }
 }
 
 fn render_document_model(document: &MarkdownDocument) -> RenderedDocument {
-    render_document_with_destinations(document, |_| None)
+    render_document_with_destinations(document, |_, _| None)
 }
 
 fn render_document_with_destinations(
     document: &MarkdownDocument,
-    mut rewrite: impl FnMut(&str) -> Option<String>,
+    mut rewrite: impl FnMut(DestinationKind, &str) -> Option<String>,
 ) -> RenderedDocument {
     let source = prepare_source(document.source());
     let title = repair_utf8_mojibake(document.title());
     let events = Parser::new_ext(&source, markdown_options())
         .map(sanitize_html_event)
         .map(|mut event| {
-            if let Event::Start(Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. }) =
-                &mut event
-            {
-                if let Some(destination) = rewrite(dest_url) {
-                    *dest_url = destination.into();
+            let destination = match &mut event {
+                Event::Start(Tag::Link { dest_url, .. }) => Some((DestinationKind::Link, dest_url)),
+                Event::Start(Tag::Image { dest_url, .. }) => {
+                    Some((DestinationKind::Image, dest_url))
+                }
+                _ => None,
+            };
+            if let Some((kind, dest_url)) = destination {
+                if let Some(rewritten) = rewrite(kind, dest_url) {
+                    *dest_url = rewritten.into();
                 }
             }
             event

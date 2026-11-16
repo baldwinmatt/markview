@@ -1819,6 +1819,74 @@ fn serve_annotations_enforces_http_boundaries_and_keeps_stores_in_sync() {
     assert!(response.starts_with("HTTP/1.1 405"));
 }
 
+#[test]
+fn serve_mode_blocks_executable_destinations_but_keeps_data_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = dir.path().join("links.md");
+    let other = dir.path().join("other.md");
+    std::fs::write(
+        &doc,
+        concat!(
+            "# Links\n\n",
+            "[mail](mailto:a@example.com) [phone](tel:+15550100) [host](//example.com/x) [colon](a:b.md)\n",
+            "[ref][other] <https://example.com/auto> <mailto:auto@example.com>\n\n",
+            "![dot](data:image/png;base64,iVBORw0KGgo=) ![svg](DATA:Image/SVG+xml,%3Csvg/%3E)\n\n",
+            "[page](data:text/html,hi) ![page](data:text/html,hi) ![bare](data:,hi)\n",
+            "[png](data:image/png;base64,iVBORw0KGgo=)\n\n",
+            "[js](javascript:alert(1)) ![js](javascript:alert(1))\n",
+            "[tab](java&#x09;script:alert(1)) ![tab](java&#x09;script:alert(1))\n",
+            "[case](JaVaScRiPt:alert(1)) ![entity](&#106;avascript:alert(1))\n",
+            "[vb](vbscript:msgbox(1)) ![vb](&#118;bscript:msgbox(1))\n\n",
+            "[other]: other.md#frag\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(&other, "# Other\n").unwrap();
+    let server = ServeProcess::start_with_files(&[doc.as_path(), other.as_path()]);
+    let page = http_get(server.port, "/");
+
+    // Byte for byte what the server rendered before annotations existed.
+    assert!(
+        page.contains(concat!(
+            r#"<p><a href="mailto:a@example.com">mail</a> <a href="tel:+15550100">phone</a> "#,
+            r#"<a href="//example.com/x">host</a> <a href="a:b.md">colon</a>"#,
+            "\n",
+            r#"<a href="/other.md#frag">ref</a> "#,
+            r#"<a href="https://example.com/auto">https://example.com/auto</a> "#,
+            r#"<a href="mailto:auto@example.com">mailto:auto@example.com</a></p>"#,
+        )),
+        "{page}"
+    );
+    assert!(
+        page.contains(concat!(
+            r#"<p><img src="data:image/png;base64,iVBORw0KGgo=" alt="dot" /> "#,
+            r#"<img src="DATA:Image/SVG+xml,%3Csvg/%3E" alt="svg" /></p>"#,
+        )),
+        "{page}"
+    );
+    // `data:` stays blocked for links, and for images that are not images.
+    assert!(
+        page.contains(concat!(
+            r##"<p><a href="#">page</a> <img src="#" alt="page" /> <img src="#" alt="bare" />"##,
+            "\n",
+            r##"<a href="#">png</a></p>"##,
+        )),
+        "{page}"
+    );
+    assert!(
+        page.contains(concat!(
+            r##"<p><a href="#">js</a> <img src="#" alt="js" />"##,
+            "\n",
+            r##"<a href="#">tab</a> <img src="#" alt="tab" />"##,
+            "\n",
+            r##"<a href="#">case</a> <img src="#" alt="entity" />"##,
+            "\n",
+            r##"<a href="#">vb</a> <img src="#" alt="vb" /></p>"##,
+        )),
+        "{page}"
+    );
+}
+
 /// The review token a `--annotate` page embeds for its own POSTs.
 fn review_token(page: &str) -> String {
     page.split("const token = \"")

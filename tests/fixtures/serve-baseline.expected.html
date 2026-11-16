@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Baseline &#8212; page shell</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f8f7f4;
+  --fg: #242220;
+  --muted: #68625c;
+  --rule: #d8d2ca;
+  --accent: #0f766e;
+  --code-bg: #ebe6de;
+  --quote-bg: #f1ede7;
+  --diff-add-bg: #dafbe1;
+  --diff-add-fg: #116329;
+  --diff-del-bg: #ffebe9;
+  --diff-del-fg: #82071e;
+  --diff-hunk-bg: #ddf4ff;
+  --diff-hunk-fg: #0550ae;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #181715;
+    --fg: #eeeae4;
+    --muted: #aaa39a;
+    --rule: #39342f;
+    --accent: #5eead4;
+    --code-bg: #25221f;
+    --quote-bg: #211f1c;
+  --diff-add-bg: #033a16;
+  --diff-add-fg: #aff5b4;
+  --diff-del-bg: #67060c;
+  --diff-del-fg: #ffdcd7;
+  --diff-hunk-bg: #0c2d6b;
+  --diff-hunk-fg: #a5d6ff;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+main {
+  width: min(860px, calc(100vw - 48px));
+  margin: 0 auto;
+  padding: 40px 0 64px;
+}
+h1, h2, h3, h4, h5, h6 {
+  line-height: 1.2;
+  letter-spacing: 0;
+  margin: 1.7em 0 0.55em;
+}
+h1 { font-size: 2.35rem; margin-top: 0; }
+h2 { font-size: 1.7rem; padding-bottom: 0.25rem; border-bottom: 1px solid var(--rule); }
+h3 { font-size: 1.28rem; }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1.05rem; }
+a { color: var(--accent); text-underline-offset: 0.18em; }
+blockquote {
+  border-left: 4px solid var(--accent);
+  background: var(--quote-bg);
+  margin-left: 0;
+  padding: 0.75rem 1rem;
+  color: var(--muted);
+}
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.92em;
+  background: var(--code-bg);
+  border-radius: 5px;
+  padding: 0.12em 0.35em;
+}
+pre {
+  overflow: auto;
+  background: var(--code-bg);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 1rem;
+}
+pre code { background: transparent; padding: 0; }
+pre.diff { padding: 1rem 0; }
+pre.diff code { display: block; width: max-content; min-width: 100%; line-height: calc(1.65em / 0.92); }
+.diff-line { display: block; min-width: 100%; padding: 0 1rem; }
+.diff-addition { background: var(--diff-add-bg); color: var(--diff-add-fg); }
+.diff-deletion { background: var(--diff-del-bg); color: var(--diff-del-fg); }
+.diff-hunk { background: var(--diff-hunk-bg); color: var(--diff-hunk-fg); }
+.diff-header { color: inherit; font-weight: 700; }
+.syntax-keyword { color: var(--accent); font-weight: 700; }
+.syntax-comment { color: var(--muted); font-style: italic; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  display: block;
+  overflow-x: auto;
+}
+th, td {
+  border: 1px solid var(--rule);
+  padding: 0.45rem 0.65rem;
+  text-align: left;
+}
+th { background: var(--code-bg); }
+img { max-width: 100%; height: auto; }
+hr { border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }
+</style>
+<style>
+[data-markview-nav] {
+  width: min(860px, calc(100vw - 48px));
+  margin: 24px auto 0;
+}
+[data-markview-nav]:empty { display: none; }
+.markview-shell {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 860px);
+  gap: 32px;
+  width: min(1132px, calc(100vw - 48px));
+  margin: 0 auto;
+  align-items: start;
+}
+.markview-shell main {
+  width: auto;
+  margin: 0;
+}
+.markview-shell [data-markview-nav] {
+  width: auto;
+  margin: 40px 0 0;
+}
+.markview-footer {
+  width: min(860px, calc(100vw - 48px));
+  margin: -36px auto 40px;
+  padding-top: 1rem;
+  border-top: 1px solid var(--rule);
+  color: var(--muted);
+  font-size: 0.9rem;
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: baseline;
+}
+.markview-refreshed {
+  text-align: right;
+  white-space: nowrap;
+}
+.markview-footer-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  text-align: right;
+}
+.markview-modified,
+.markview-refreshed {
+  white-space: nowrap;
+}
+.markview-tabs {
+  display: flex;
+  gap: 0.25rem;
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--rule);
+}
+.markview-tabs a {
+  padding: 0.55rem 1rem;
+  margin-bottom: -1px;
+  border: 1px solid transparent;
+  border-top-left-radius: 8px;
+  border-top-right-radius: 8px;
+  background: var(--code-bg);
+  color: var(--muted);
+  text-decoration: none;
+  max-width: 12rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.markview-tabs a:hover {
+  background: var(--quote-bg);
+  color: var(--fg);
+  border-color: var(--rule) var(--rule) transparent;
+}
+.markview-tabs a[aria-current="page"] {
+  background: var(--bg);
+  color: var(--fg);
+  font-weight: 600;
+  border-color: var(--rule) var(--rule) var(--bg);
+}
+.markview-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: var(--code-bg);
+  border-radius: 10px;
+  padding: 14px 10px;
+  position: sticky;
+  top: 24px;
+  align-self: start;
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+}
+.markview-sidebar a {
+  display: block;
+  padding: 0.5rem 0.7rem;
+  border-radius: 6px;
+  color: var(--muted);
+  text-decoration: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.markview-sidebar a:hover {
+  background: var(--quote-bg);
+  color: var(--fg);
+}
+.markview-sidebar a[aria-current="page"] {
+  background: var(--accent);
+  color: var(--bg);
+  font-weight: 600;
+}
+.markview-nav-dir {
+  margin: 0;
+}
+.markview-nav-dir > summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  padding: 0.5rem 0.7rem;
+  border-radius: 6px;
+  color: var(--muted);
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  user-select: none;
+}
+.markview-nav-dir > summary::-webkit-details-marker {
+  display: none;
+}
+.markview-nav-dir > summary::before {
+  content: "\25B8";
+  display: inline-block;
+  width: 1em;
+  margin-right: 0.3em;
+  transition: transform 0.15s ease;
+}
+.markview-nav-dir[open] > summary::before {
+  transform: rotate(90deg);
+}
+.markview-nav-dir > summary:hover {
+  background: var(--quote-bg);
+  color: var(--fg);
+}
+.markview-nav-dir > :not(summary) {
+  margin-left: 0.9rem;
+}
+@media (max-width: 700px) {
+  .markview-shell {
+    display: block;
+    width: min(860px, calc(100vw - 48px));
+    margin: 0 auto;
+  }
+  .markview-shell main {
+    width: auto;
+    margin: 0;
+  }
+  .markview-sidebar {
+    position: static;
+    max-height: none;
+    overflow: visible;
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    margin-bottom: 1.25rem;
+  }
+  .markview-sidebar a {
+    max-width: 12rem;
+  }
+  .markview-footer {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+  .markview-refreshed {
+    text-align: left;
+    white-space: normal;
+  }
+  .markview-footer-meta {
+    text-align: left;
+  }
+  .markview-modified,
+  .markview-refreshed {
+    white-space: normal;
+  }
+}
+</style>
+</head>
+<body>
+<div class="markview-shell"><nav data-markview-nav class="markview-sidebar"><a href="/README.md" title="/README.md" aria-current="page">Baseline &#8212; page shell</a><a href="/guide.md" title="/guide.md">Guide</a></nav><main>
+<h1 id="baseline-page-shell">Baseline &#8212; page shell</h1>
+<p>A paragraph with <strong>strong</strong>, <em>emphasis</em>, <code>inline code</code>, an entity &amp; a
+<a href="/guide.md#setup">link to the guide</a>, an <a href="https://example.com/">external link</a>,
+a <a href="/guide.md">reference link</a> and an image <img src="/chart.png" alt="chart" />.</p>
+<h2 id="code">Code</h2>
+<pre><code class="language-python">def main():
+    print("hello &lt;world&gt; &amp; more")  # comment
+</code></pre>
+<pre class="diff"><code class="language-diff"><span class="diff-line diff-deletion">-old line
+</span><span class="diff-line diff-addition">+new line
+</span> context
+</code></pre>
+<h2 id="lists-and-tables">Lists and tables</h2>
+<ul>
+<li><input disabled="" type="checkbox" checked=""/>
+done</li>
+<li><input disabled="" type="checkbox"/>
+open</li>
+</ul>
+<table><thead><tr><th>Name</th><th>Value</th></tr></thead><tbody>
+<tr><td>caf&#233;</td><td>&#128512;</td></tr>
+</tbody></table>
+<p>Raw &lt;span&gt;HTML&lt;/span&gt; is shown as text.<sup class="footnote-reference"><a href="#note">1</a></sup></p>
+<div class="footnote-definition" id="note"><sup class="footnote-definition-label">1</sup>
+<p>A footnote with <em>prose</em>.</p>
+</div>
+
+</main></div>
+<footer class="markview-footer">
+<span>Served by <a href="https://github.com/baldwinmatt/markview">markview</a></span>
+<span class="markview-footer-meta">
+<span class="markview-modified">Doc modified <time data-markview-modified-at data-timestamp-ms="TIMESTAMP"></time></span>
+<span class="markview-refreshed">Last refreshed <time data-markview-refreshed-at></time></span>
+</span>
+</footer>
+<script>
+(() => {
+  const formatTime = (date) => date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+  const updateModifiedTimes = () => {
+    document.querySelectorAll('[data-markview-modified-at]').forEach((element) => {
+      const millis = Number(element.dataset.timestampMs);
+      if (!Number.isFinite(millis)) {
+        element.textContent = 'unknown';
+        return;
+      }
+      const modified = new Date(millis);
+      element.dateTime = modified.toISOString();
+      element.textContent = formatTime(modified);
+    });
+  };
+  const updateRefreshTime = () => {
+    const now = new Date();
+    document.querySelectorAll('[data-markview-refreshed-at]').forEach((element) => {
+      element.dateTime = now.toISOString();
+      element.textContent = formatTime(now);
+    });
+  };
+  updateModifiedTimes();
+  updateRefreshTime();
+  const events = new EventSource('/events');
+  events.onmessage = async (event) => {
+    if (event.data === 'rescan') {
+      location.reload();
+      return;
+    }
+    if (event.data !== 'reload') return;
+    const savedY = window.scrollY;
+    const response = await fetch(location.pathname, { cache: 'no-store' });
+    const text = await response.text();
+    const next = new DOMParser().parseFromString(text, 'text/html');
+    const currentMain = document.querySelector('main');
+    const nextMain = next.querySelector('main');
+    if (currentMain && nextMain) currentMain.innerHTML = nextMain.innerHTML;
+    const currentNav = document.querySelector('[data-markview-nav]');
+    const nextNav = next.querySelector('[data-markview-nav]');
+    if (currentNav && nextNav) {
+      const openDirs = new Set(
+        Array.from(currentNav.querySelectorAll('details[open]')).map((el) => el.dataset.markviewDir)
+      );
+      currentNav.innerHTML = nextNav.innerHTML;
+      currentNav.querySelectorAll('details').forEach((el) => {
+        el.open = openDirs.has(el.dataset.markviewDir);
+      });
+    }
+    const currentFooter = document.querySelector('footer');
+    const nextFooter = next.querySelector('footer');
+    if (currentFooter && nextFooter) currentFooter.innerHTML = nextFooter.innerHTML;
+    if (next.title) document.title = next.title;
+    updateModifiedTimes();
+    updateRefreshTime();
+    window.scrollTo(0, savedY);
+  };
+})();
+</script>
+</body>
+</html>

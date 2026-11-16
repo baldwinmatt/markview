@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader};
 use std::net::TcpStream;
-use std::path::PathBuf;
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use markview::annotations::{self, Error, Request, TextProjection, FORM_CAP};
 use markview::DestinationKind;
@@ -409,62 +409,157 @@ pub fn handle(
     }
 }
 
-pub fn script(route: &str, token: Option<&str>, port: u16) -> String {
+/// The review script and stylesheet, served from the reserved prefix so the
+/// browser caches them instead of every page carrying ~18 KB inline.
+pub fn static_asset(target: &str) -> Option<(&'static str, &'static str)> {
+    match target.split('?').next() {
+        Some("/_markview/review.js") => {
+            Some(("text/javascript; charset=utf-8", annotations::REVIEW_SCRIPT))
+        }
+        Some("/_markview/review.css") => {
+            Some(("text/css; charset=utf-8", annotations::REVIEW_STYLE))
+        }
+        _ => None,
+    }
+}
+
+/// The URLs carry a digest of the content, so a response can be cached for
+/// good and a new markview build is still picked up at once.
+pub const STATIC_CACHE: &str = "Cache-Control: public, max-age=31536000, immutable\r\n";
+
+fn static_version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION.get_or_init(|| {
+        annotations::source_revision(
+            &[annotations::REVIEW_SCRIPT, annotations::REVIEW_STYLE].concat(),
+        )
+    })
+}
+
+/// What a page needs to show annotations: the cached stylesheet and script,
+/// and the call that connects them to this route. `nonce_attr` is the
+/// ` nonce="..."` attribute a token-bearing page's policy requires.
+pub fn hooks(route: &str, token: Option<&str>, port: u16, nonce_attr: &str) -> String {
+    let version = static_version();
     format!(
-        "{}\n(() => {{
-          const route = {};
-          const token = {};
-          markviewServeReview(route, token, {port});
-        }})();",
-        annotations::REVIEW_SCRIPT,
+        "<link rel=\"stylesheet\" href=\"/_markview/review.css?v={version}\">
+<script{nonce_attr} src=\"/_markview/review.js?v={version}\"></script>
+<script{nonce_attr}>(() => {{
+  const route = {};
+  const token = {};
+  markviewServeReview(route, token, {port});
+}})();</script>",
         annotations::json_string(route),
         token.map_or("null".to_owned(), annotations::json_string),
     )
 }
 
-pub fn watch_stores(shared: SharedConfig, clients: Clients) -> notify::Result<()> {
+/// Whether `document` has an annotation store file right now.
+pub fn has_store(document: &Path) -> bool {
+    annotations::resolve(document)
+        .and_then(|location| annotations::snapshot(&location))
+        .is_ok_and(|store| store.is_some())
+}
+
+/// The annotation store watches for served documents, shared between the
+/// connection threads and the thread that turns store events into reloads.
+pub struct Stores {
+    watcher: Mutex<annotations::StoreWatcher>,
+    /// Documents whose page went out without review hooks. Such a page does
+    /// not listen for `annotations` events, so when its first store appears
+    /// only a full reload can show the comments.
+    plain: Mutex<HashSet<PathBuf>>,
+    /// How often the event thread has woken up, for the idle test.
+    #[cfg(test)]
+    pub wakeups: std::sync::atomic::AtomicUsize,
+}
+
+impl Stores {
+    /// Notes that a page for `document` was served. Stores are watched from
+    /// the first time their document is served, not from startup: nobody can
+    /// be looking at annotations for a page that was never requested.
+    pub fn served(&self, document: &Path, hooks: bool) {
+        if let Ok(mut watcher) = self.watcher.lock() {
+            watcher.watch(document);
+        }
+        if !hooks {
+            if let Ok(mut plain) = self.plain.lock() {
+                plain.insert(document.to_owned());
+            }
+        }
+    }
+
+    /// Forgets documents that a rescan dropped from the served set.
+    pub fn retain(&self, config: &ServeConfig) {
+        let served: HashSet<&Path> = config
+            .documents
+            .iter()
+            .map(|document| document.source_path.as_path())
+            .collect();
+        if let Ok(mut watcher) = self.watcher.lock() {
+            watcher.retain(|path| served.contains(path));
+        }
+        if let Ok(mut plain) = self.plain.lock() {
+            plain.retain(|path| served.contains(path.as_path()));
+        }
+    }
+}
+
+pub fn watch_stores(shared: SharedConfig, clients: Clients) -> notify::Result<Arc<Stores>> {
     let (tx, rx) = mpsc::channel();
-    let mut watcher = annotations::StoreWatcher::new(move |event| {
+    let watcher = annotations::StoreWatcher::new(move |event| {
         if let Ok(event) = event {
             let _ = tx.send(event);
         }
     })?;
-    let documents = || -> Vec<PathBuf> {
-        shared
-            .read()
-            .expect("config lock")
-            .documents
-            .iter()
-            .map(|doc| doc.source_path.clone())
-            .collect()
-    };
-    watcher.sync(documents());
-    std::thread::spawn(move || loop {
-        let mut events = Vec::new();
-        match rx.recv_timeout(Duration::from_millis(300)) {
-            Ok(event) => {
+    let stores = Arc::new(Stores {
+        watcher: Mutex::new(watcher),
+        plain: Mutex::new(HashSet::new()),
+        #[cfg(test)]
+        wakeups: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let thread_stores = stores.clone();
+    // No timer: the thread sleeps until a watched directory changes.
+    std::thread::spawn(move || {
+        while let Ok(event) = rx.recv() {
+            let mut events = vec![event];
+            while let Ok(event) = rx.recv_timeout(WATCH_DEBOUNCE) {
                 events.push(event);
-                while let Ok(event) = rx.recv_timeout(WATCH_DEBOUNCE) {
-                    events.push(event);
-                }
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-        }
-        let config = shared.read().expect("config lock").clone();
-        watcher.sync(config.documents.iter().map(|doc| doc.source_path.clone()));
-        for changed in watcher.changed(&events) {
-            if let Some(route) = config.document_route_for_path(&changed) {
-                broadcast_reload(&clients, ReloadKind::Annotations(route.to_owned()));
+            #[cfg(test)]
+            thread_stores
+                .wakeups
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let config = shared.read().expect("config lock").clone();
+            let changed = match thread_stores.watcher.lock() {
+                Ok(mut watcher) => watcher.changed(&events),
+                Err(_) => break,
+            };
+            for document in changed {
+                let Some(route) = config.document_route_for_path(&document) else {
+                    continue;
+                };
+                let first_store = has_store(&document)
+                    && thread_stores
+                        .plain
+                        .lock()
+                        .is_ok_and(|mut plain| plain.remove(&document));
+                let reload = if first_store {
+                    ReloadKind::Structure
+                } else {
+                    ReloadKind::Annotations(route.to_owned())
+                };
+                broadcast_reload(&clients, reload);
             }
         }
     });
-    Ok(())
+    Ok(stores)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     const SOURCE: &str = concat!(
         "# Review fixture\n\n",
@@ -477,6 +572,61 @@ mod tests {
         "[^n]: Footnote *prose*.\n\n",
         "â€™ `two\nlines` with NEL\u{85}space\n",
     );
+
+    fn many_documents(count: usize) -> (tempfile::TempDir, Vec<PathBuf>) {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..count {
+            let folder = dir.path().join(format!("section-{:02}", index % 20));
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(
+                folder.join(format!("doc-{index}.md")),
+                format!("# Doc {index}\n"),
+            )
+            .unwrap();
+        }
+        let root = dir.path().to_path_buf();
+        (dir, vec![root])
+    }
+
+    #[test]
+    fn store_watching_adds_little_to_startup_for_many_documents() {
+        let (_dir, inputs) = many_documents(2_000);
+        let fastest = |work: &dyn Fn()| {
+            (0..3)
+                .map(|_| {
+                    let start = Instant::now();
+                    work();
+                    start.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        // Everything `--serve` did at startup before annotations existed.
+        let baseline = fastest(&|| {
+            ServeConfig::from_inputs(inputs.clone(), 0, true).unwrap();
+        });
+        let watched = fastest(&|| {
+            let config = ServeConfig::from_inputs(inputs.clone(), 0, true).unwrap();
+            let shared: SharedConfig = Arc::new(std::sync::RwLock::new(Arc::new(config)));
+            watch_stores(shared, Arc::new(Mutex::new(Vec::new()))).unwrap();
+        });
+        assert!(
+            watched < baseline * 3,
+            "startup with store watching took {watched:?}, {baseline:?} without"
+        );
+    }
+
+    #[test]
+    fn idle_store_watcher_never_wakes_up() {
+        use std::sync::atomic::Ordering;
+        let (_dir, inputs) = many_documents(3);
+        let config = ServeConfig::from_inputs(inputs, 0, true).unwrap();
+        let shared: SharedConfig = Arc::new(std::sync::RwLock::new(Arc::new(config)));
+        let stores = watch_stores(shared, Arc::new(Mutex::new(Vec::new()))).unwrap();
+        // More than three of the old 300 ms polling intervals.
+        std::thread::sleep(Duration::from_millis(1_000));
+        assert_eq!(stores.wakeups.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn token_comparison_examines_every_byte() {
@@ -519,8 +669,10 @@ mod tests {
         let html = super::super::render_file(
             &config,
             config.default_document().unwrap(),
-            Some(&nonce),
-            config.review_token.as_deref(),
+            Some(super::super::ReviewHooks {
+                nonce: Some(&nonce),
+                token: config.review_token.as_deref(),
+            }),
         )
         .unwrap();
         assert_eq!(
@@ -539,6 +691,22 @@ mod tests {
         assert!(reserved("/_markview/%25bad"));
         assert!(reserved("/foo/../_markview/anything"));
         assert!(!reserved("/nested/_markview/anything"));
+
+        // Pages link the cached script. The standalone fixture has no server
+        // to fetch it from, so it carries the script inline instead.
+        let external = format!(
+            r#"<script nonce="{nonce}" src="/_markview/review.js?v={}"></script>"#,
+            static_version()
+        );
+        assert!(html.contains(&external));
+        let html = html.replacen(
+            &external,
+            &format!(
+                r#"<script nonce="{nonce}">{}</script>"#,
+                annotations::REVIEW_SCRIPT
+            ),
+            1,
+        );
 
         if let Some(path) = std::env::var_os("MARKVIEW_REVIEW_BROWSER_FIXTURE") {
             let projection = TextProjection::new(SOURCE);

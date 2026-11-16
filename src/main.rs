@@ -322,8 +322,15 @@ fn serve_markdown(
     let bound_port = config.port;
     let clients = Arc::new(Mutex::new(Vec::new()));
     let shared: SharedConfig = Arc::new(RwLock::new(Arc::new(config)));
-    let _watcher = watch_root(shared.clone(), inputs, bound_port, recurse, clients.clone())?;
-    serve_annotations::watch_stores(shared.clone(), clients.clone())?;
+    let stores = serve_annotations::watch_stores(shared.clone(), clients.clone())?;
+    let _watcher = watch_root(
+        shared.clone(),
+        inputs,
+        bound_port,
+        recurse,
+        clients.clone(),
+        stores.clone(),
+    )?;
 
     println!(
         "Serving on http://localhost:{} — press Ctrl+C to stop",
@@ -343,9 +350,10 @@ fn serve_markdown(
             Ok(stream) => {
                 let shared = shared.clone();
                 let clients = clients.clone();
+                let stores = stores.clone();
                 thread::spawn(move || {
                     let config = shared.read().expect("config lock").clone();
-                    if let Err(error) = handle_connection(stream, &config, clients) {
+                    if let Err(error) = handle_connection(stream, &config, clients, &stores) {
                         eprintln!("markview: serve error: {error}");
                     }
                 });
@@ -1172,6 +1180,7 @@ fn watch_root(
     port: u16,
     recurse: bool,
     clients: Clients,
+    stores: Arc<serve_annotations::Stores>,
 ) -> notify::Result<RecommendedWatcher> {
     let (root, mode) = {
         let config = shared.read().expect("config lock");
@@ -1201,7 +1210,7 @@ fn watch_root(
             while let Ok(event) = changes_rx.recv_timeout(WATCH_DEBOUNCE) {
                 events.push(event);
             }
-            handle_fs_events(events, &shared, &clients, &inputs, port, recurse);
+            handle_fs_events(events, &shared, &clients, &stores, &inputs, port, recurse);
         }
     });
 
@@ -1212,6 +1221,7 @@ fn handle_fs_events(
     events: Vec<notify::Event>,
     shared: &SharedConfig,
     clients: &Clients,
+    stores: &Arc<serve_annotations::Stores>,
     inputs: &[PathBuf],
     port: u16,
     recurse: bool,
@@ -1287,9 +1297,10 @@ fn handle_fs_events(
         // there's nothing to invalidate here even if `asset_changed` too.
         let shared = shared.clone();
         let clients = clients.clone();
+        let stores = stores.clone();
         let inputs = inputs.to_vec();
         thread::spawn(move || {
-            rescan_and_reload(shared, clients, inputs, port, recurse, current);
+            rescan_and_reload(shared, clients, &stores, inputs, port, recurse, current);
         });
     } else {
         if asset_changed {
@@ -1304,6 +1315,7 @@ fn handle_fs_events(
 fn rescan_and_reload(
     shared: SharedConfig,
     clients: Clients,
+    stores: &serve_annotations::Stores,
     inputs: Vec<PathBuf>,
     port: u16,
     recurse: bool,
@@ -1317,6 +1329,9 @@ fn rescan_and_reload(
             } else {
                 ReloadKind::Structure
             };
+            // The document set changed: stop watching stores of documents
+            // that are no longer served.
+            stores.retain(&fresh);
             *shared.write().expect("config lock") = Arc::new(fresh);
             reload_kind
         }
@@ -1345,6 +1360,7 @@ fn handle_connection(
     mut stream: TcpStream,
     config: &ServeConfig,
     clients: Clients,
+    stores: &serve_annotations::Stores,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -1356,6 +1372,29 @@ fn handle_connection(
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let request_path = parts.next().unwrap_or("/");
+    if let Some((content_type, body)) = serve_annotations::static_asset(request_path) {
+        // Static and public, so it is read as leniently as any page asset.
+        let result = if matches!(method, "GET" | "HEAD") {
+            write_response_headers(
+                &mut stream,
+                "200 OK",
+                content_type,
+                body.as_bytes(),
+                method == "HEAD",
+                serve_annotations::STATIC_CACHE,
+            )
+        } else {
+            write_response(
+                &mut stream,
+                "405 Method Not Allowed",
+                "text/plain; charset=utf-8",
+                "Method not allowed",
+                false,
+            )
+        };
+        drain_request(&stream, &mut reader);
+        return result;
+    }
     if serve_annotations::reserved(request_path) {
         let result =
             match serve_annotations::HttpRequest::parse(&request_line, &mut reader, deadline) {
@@ -1413,7 +1452,7 @@ fn handle_connection(
             "/" => match config.default_document() {
                 Some(document) => {
                     let token = token(&mut reader);
-                    serve_document(&mut stream, config, document, head_only, token)
+                    serve_document(&mut stream, config, stores, document, head_only, token)
                 }
                 None => write_404(&mut stream, head_only),
             },
@@ -1424,7 +1463,7 @@ fn handle_connection(
             _ => {
                 if let Some(document) = config.document_by_route(route) {
                     let token = token(&mut reader);
-                    serve_document(&mut stream, config, document, head_only, token)
+                    serve_document(&mut stream, config, stores, document, head_only, token)
                 } else if let Some(asset) = config.asset_by_route(route) {
                     serve_asset(&mut stream, config, &asset, head_only)
                 } else {
@@ -1498,6 +1537,7 @@ fn serve_favicon(stream: &mut TcpStream, config: &ServeConfig, head_only: bool) 
 fn serve_document(
     stream: &mut TcpStream,
     config: &ServeConfig,
+    stores: &serve_annotations::Stores,
     document: &ServedDocument,
     head_only: bool,
     token: Option<&str>,
@@ -1507,7 +1547,17 @@ fn serve_document(
         .as_ref()
         .map(|_| annotations::random_hex())
         .transpose()?;
-    match render_file(config, document, nonce.as_deref(), token) {
+    // A page needs the review script when comments can be added to it
+    // (`--annotate`) or it already has some. Any other page is exactly what
+    // it was before annotations existed.
+    let review = (config.review_token.is_some()
+        || serve_annotations::has_store(&document.source_path))
+    .then_some(ReviewHooks {
+        nonce: nonce.as_deref(),
+        token,
+    });
+    stores.served(&document.source_path, review.is_some());
+    match render_file(config, document, review) {
         Ok(html) => {
             let policy = nonce.map(|nonce| format!("Content-Security-Policy: default-src 'self'; script-src 'nonce-{nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' https: http: data:; object-src 'none'; base-uri 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'none'\r\n"));
             write_response_headers(
@@ -1611,11 +1661,18 @@ fn serve_events(mut stream: TcpStream, clients: Clients) -> io::Result<()> {
     Ok(())
 }
 
+/// Present when a page carries the review script: the policy nonce of a
+/// token-bearing page, and the write token if the client may have it.
+#[derive(Clone, Copy)]
+struct ReviewHooks<'a> {
+    nonce: Option<&'a str>,
+    token: Option<&'a str>,
+}
+
 fn render_file(
     config: &ServeConfig,
     served: &ServedDocument,
-    nonce: Option<&str>,
-    token: Option<&str>,
+    review: Option<ReviewHooks<'_>>,
 ) -> io::Result<String> {
     if validated_served_path(&config.root, &served.source_path).is_none() {
         return Err(io::Error::new(
@@ -1643,9 +1700,7 @@ fn render_file(
                 rewritten_reference(config, served, destination, &assets)
             }
         }),
-        &revision,
-        nonce,
-        token,
+        review.map(|hooks| (revision.as_str(), hooks)),
     ))
 }
 
@@ -1864,9 +1919,7 @@ fn inject_serve_shell(
     active_route: &str,
     modified_at: Option<u128>,
     html: &str,
-    revision: &str,
-    nonce: Option<&str>,
-    token: Option<&str>,
+    review: Option<(&str, ReviewHooks<'_>)>,
 ) -> String {
     let nav = render_nav(config, active_route);
     let modified_attr = modified_at
@@ -1906,29 +1959,19 @@ fn inject_serve_shell(
   updateModifiedTimes();
   updateRefreshTime();
   const events = new EventSource('/events');
-  events.addEventListener('annotations', (event) => {
-    if (event.data === window.markviewReviewRoute) window.markviewReviewRefresh();
-  });
-  let refresh = 0;
   events.onmessage = async (event) => {
     if (event.data === 'rescan') {
       location.reload();
       return;
     }
     if (event.data !== 'reload') return;
-    const sequence = ++refresh;
     const savedY = window.scrollY;
     const response = await fetch(location.pathname, { cache: 'no-store' });
     const text = await response.text();
     const next = new DOMParser().parseFromString(text, 'text/html');
     const currentMain = document.querySelector('main');
     const nextMain = next.querySelector('main');
-    if (sequence !== refresh || !response.ok) return;
-    if (currentMain && nextMain) {
-      currentMain.innerHTML = nextMain.innerHTML;
-      currentMain.dataset.sourceRevision = nextMain.dataset.sourceRevision;
-      window.markviewReviewRefresh();
-    }
+    if (currentMain && nextMain) currentMain.innerHTML = nextMain.innerHTML;
     const currentNav = document.querySelector('[data-markview-nav]');
     const nextNav = next.querySelector('[data-markview-nav]');
     if (currentNav && nextNav) {
@@ -2151,21 +2194,59 @@ fn inject_serve_shell(
             .replacen("</main>", "</main></div>", 1),
         NavLayout::Empty | NavLayout::Tabs => html.replacen("<main>", &format!("{nav}\n<main>"), 1),
     };
+    let Some((revision, hooks)) = review else {
+        return html.replace("</body>", &format!("{footer}\n{script}\n</body>"));
+    };
     let html = html.replacen(
         "<main>",
         &format!(r#"<main data-source-revision="{revision}">"#),
         1,
     );
-    let review = serve_annotations::script(active_route, token, config.port);
-    let nonce_attr = nonce.map_or(String::new(), |nonce| format!(r#" nonce="{nonce}""#));
-    let script = script.replacen("<script>", &format!("<script{nonce_attr}>"), 1);
-    html.replace(
-        "</body>",
-        &format!(
-            "{footer}\n<style>{}</style>\n<script{nonce_attr}>{review}</script>\n{script}\n</body>",
-            annotations::REVIEW_STYLE
+    let nonce_attr = hooks
+        .nonce
+        .map_or(String::new(), |nonce| format!(r#" nonce="{nonce}""#));
+    let review = serve_annotations::hooks(active_route, hooks.token, config.port, &nonce_attr);
+    let script = review_reload_script(script, &nonce_attr);
+    html.replace("</body>", &format!("{footer}\n{review}\n{script}\n</body>"))
+}
+
+/// The live-reload script of a page that shows annotations. It differs from
+/// the plain one in three places: it listens for `annotations` events, it
+/// refreshes the comments after patching the document, and it drops a reload
+/// that a newer one has overtaken, since each reload now ends in a fetch.
+fn review_reload_script(script: &str, nonce_attr: &str) -> String {
+    let edits = [
+        ("<script>", format!("<script{nonce_attr}>")),
+        (
+            "  events.onmessage = async (event) => {\n",
+            "  events.addEventListener('annotations', (event) => {
+    if (event.data === window.markviewReviewRoute) window.markviewReviewRefresh();
+  });
+  let refresh = 0;
+  events.onmessage = async (event) => {\n"
+                .to_owned(),
         ),
-    )
+        (
+            "    const savedY = window.scrollY;\n",
+            "    const sequence = ++refresh;\n    const savedY = window.scrollY;\n".to_owned(),
+        ),
+        (
+            "    if (currentMain && nextMain) currentMain.innerHTML = nextMain.innerHTML;\n",
+            "    if (sequence !== refresh || !response.ok) return;
+    if (currentMain && nextMain) {
+      currentMain.innerHTML = nextMain.innerHTML;
+      currentMain.dataset.sourceRevision = nextMain.dataset.sourceRevision;
+      window.markviewReviewRefresh();
+    }\n"
+            .to_owned(),
+        ),
+    ];
+    let mut script = script.to_owned();
+    for (anchor, replacement) in edits {
+        assert_eq!(script.matches(anchor).count(), 1, "reload script anchor");
+        script = script.replacen(anchor, &replacement, 1);
+    }
+    script
 }
 
 /// Low-level "what's this file's mtime" primitive shared by every caller
@@ -2481,6 +2562,7 @@ mod serve_nav_tests {
                 vec![event],
                 &shared_for_event,
                 &clients_for_event,
+                &test_stores(),
                 &[input],
                 0,
                 true,
@@ -2515,6 +2597,7 @@ mod serve_nav_tests {
             ],
             &shared,
             &clients,
+            &test_stores(),
             &[dir.path().to_path_buf()],
             0,
             true,
@@ -2561,6 +2644,7 @@ mod serve_nav_tests {
             events,
             &shared,
             &clients,
+            &test_stores(),
             &[dir.path().to_path_buf()],
             0,
             true,
@@ -2614,12 +2698,27 @@ mod serve_nav_tests {
             attrs: notify::event::EventAttributes::new(),
         };
 
-        handle_fs_events(vec![event], &shared, &clients, &[], 0, false);
+        handle_fs_events(
+            vec![event],
+            &shared,
+            &clients,
+            &test_stores(),
+            &[],
+            0,
+            false,
+        );
 
         assert_eq!(
             client_rx.recv_timeout(Duration::from_secs(1)),
             Ok(ReloadKind::Content)
         );
+    }
+
+    fn test_stores() -> Arc<serve_annotations::Stores> {
+        let shared: SharedConfig = Arc::new(RwLock::new(Arc::new(
+            ServeConfig::from_inputs(vec![PathBuf::from("README.md")], 0, false).unwrap(),
+        )));
+        serve_annotations::watch_stores(shared, Arc::new(Mutex::new(Vec::new()))).unwrap()
     }
 
     fn served_doc(route_path: &str) -> ServedDocument {

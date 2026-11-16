@@ -2146,6 +2146,167 @@ fn serve_annotations_delivers_the_error_when_rejecting_a_large_post() {
     assert!(!dir.path().join(".markview").exists());
 }
 
+/// A copy of `tests/fixtures/serve-baseline`, whose rendered default page
+/// before annotations existed is `tests/fixtures/serve-baseline.expected.html`.
+fn baseline_site() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let site = dir.path().join("site");
+    std::fs::create_dir(&site).unwrap();
+    for name in ["README.md", "guide.md", "chart.png"] {
+        std::fs::copy(
+            std::path::Path::new("tests/fixtures/serve-baseline").join(name),
+            site.join(name),
+        )
+        .unwrap();
+    }
+    (dir, site)
+}
+
+/// Replaces the document's mtime, the only part of a page that varies.
+fn without_timestamp(body: &str) -> String {
+    let marker = "data-timestamp-ms=\"";
+    let (before, rest) = body.split_once(marker).expect("modified timestamp");
+    let (digits, after) = rest.split_once('"').unwrap();
+    assert!(digits.bytes().all(|byte| byte.is_ascii_digit()));
+    format!("{before}{marker}TIMESTAMP\"{after}")
+}
+
+const BASELINE_HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\nContent-Length: 11157\r\nConnection: close";
+const BASELINE_BODY: &str = include_str!("fixtures/serve-baseline.expected.html");
+
+#[test]
+fn serve_page_without_annotations_is_byte_identical_to_before_the_feature() {
+    let (_dir, site) = baseline_site();
+    let server = ServeProcess::start_dir(&site);
+    let response = http_get(server.port, "/");
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    assert_eq!(head, BASELINE_HEAD);
+    assert_eq!(without_timestamp(body), BASELINE_BODY);
+}
+
+#[test]
+fn serve_injects_review_hooks_only_where_they_are_needed() {
+    let (dir, site) = baseline_site();
+    let store = dir.path().join("site/.markview/annotations");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        store.join("guide.md"),
+        "## a1 [open] document\n\nExpand this.\n",
+    )
+    .unwrap();
+    let hooks = [
+        "<main data-source-revision=\"",
+        "<link rel=\"stylesheet\" href=\"/_markview/review.css?v=",
+        " src=\"/_markview/review.js?v=",
+        "markviewServeReview(route, token, ",
+        "events.addEventListener('annotations'",
+    ];
+
+    // Read-only serving: only the document that has a store pays for review.
+    let read_only = ServeProcess::start_dir(&site);
+    let plain = http_get(read_only.port, "/");
+    let (head, body) = plain.split_once("\r\n\r\n").unwrap();
+    assert_eq!(head, BASELINE_HEAD);
+    assert_eq!(without_timestamp(body), BASELINE_BODY);
+    let annotated = http_get(read_only.port, "/guide.md");
+    for hook in hooks {
+        assert!(annotated.contains(hook), "{hook}: {annotated}");
+    }
+    assert!(annotated.contains("const token = null"));
+    assert!(!annotated.contains("Content-Security-Policy"));
+
+    // `--annotate`: every page can take a first comment.
+    let writable =
+        ServeProcess::try_start_with_env(&[&site], 0, false, false, false, None, true).unwrap();
+    for route in ["/", "/guide.md"] {
+        let page = http_get_local(writable.port, route);
+        for hook in hooks {
+            assert!(page.contains(hook), "{route}, {hook}");
+        }
+        assert_eq!(review_token(&page).len(), 48);
+        let nonce = page
+            .split("script-src 'nonce-")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+            .expect("script nonce in the policy");
+        assert!(page.contains(&format!(
+            "<script nonce=\"{nonce}\" src=\"/_markview/review.js?v="
+        )));
+        assert!(!page.contains("<script>") && !page.contains("<script src"));
+    }
+
+    // The script and stylesheet are fetched once and cached, not inlined.
+    for port in [read_only.port, writable.port] {
+        let page = http_get_local(port, "/guide.md");
+        assert!(!page.contains("function createMarkviewReview"));
+        assert!(!page.contains(".markview-review-toolbar"));
+        for (name, content_type, source) in [
+            (
+                "review.js",
+                "text/javascript; charset=utf-8",
+                include_str!("../src/annotations/review.js"),
+            ),
+            (
+                "review.css",
+                "text/css; charset=utf-8",
+                include_str!("../src/annotations/review.css"),
+            ),
+        ] {
+            let link = page
+                .split(&format!("\"/_markview/{name}?v="))
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .map(|version| format!("/_markview/{name}?v={version}"))
+                .expect("versioned link");
+            // Fetched like any other page asset, whatever the Host.
+            let response = raw_http(
+                port,
+                &format!("GET {link} HTTP/1.1\nHost: other.localhost\n\n"),
+            );
+            let (head, body) = response.split_once("\r\n\r\n").unwrap();
+            assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+            assert!(head.contains(&format!("\r\nContent-Type: {content_type}\r\n")));
+            assert!(
+                head.contains("\r\nCache-Control: public, max-age=31536000, immutable\r\n"),
+                "{head}"
+            );
+            assert_eq!(body, source);
+            let head_only = http_request(port, "HEAD", &link);
+            assert!(head_only.starts_with("HTTP/1.1 200 OK"));
+            assert!(head_only.ends_with("\r\n\r\n"));
+        }
+    }
+}
+
+#[test]
+fn serve_reloads_a_plain_page_when_its_first_annotation_appears() {
+    let (dir, site) = baseline_site();
+    let server = ServeProcess::start_dir(&site);
+    // Served without review hooks, so only a full reload can add them.
+    assert!(!http_get(server.port, "/guide.md").contains("/_markview/review.js"));
+    let mut events = open_reload_stream(server.port);
+    let store = dir.path().join("site/.markview/annotations");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        store.join("guide.md"),
+        "## a1 [open] document\n\nExpand this.\n",
+    )
+    .unwrap();
+    let event = read_until(&mut events, "data: rescan", Duration::from_secs(8));
+    assert!(event.contains("data: rescan"), "{event}");
+    assert!(http_get(server.port, "/guide.md").contains("/_markview/review.js"));
+
+    // Once the page has its hooks, later store changes only refresh comments.
+    std::fs::write(
+        store.join("guide.md"),
+        "## a1 [resolved] document\n\nExpand this.\n",
+    )
+    .unwrap();
+    let event = read_until(&mut events, "data: /guide.md", Duration::from_secs(8));
+    assert!(event.contains("event: annotations"), "{event}");
+    assert!(!event.contains("data: rescan"), "{event}");
+}
+
 #[test]
 fn serve_annotations_accepts_only_loopback_host_spellings() {
     let dir = tempfile::tempdir().unwrap();

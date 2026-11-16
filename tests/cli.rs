@@ -1963,6 +1963,122 @@ fn serve_annotations_rejects_a_body_that_exceeds_the_read_deadline() {
     assert!(!dir.path().join(".markview").exists());
 }
 
+/// Sends raw request bytes and returns the response up to the end of its
+/// head, which is all a never-ending `/events` stream can give.
+fn raw_response_head(port: u16, request: &[u8]) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    stream.write_all(request).unwrap();
+    read_until(&mut stream, "\r\n\r\n", Duration::from_secs(8))
+}
+
+#[test]
+fn serve_mode_reads_ordinary_requests_as_leniently_as_before_annotations() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = dir.path().join("doc.md");
+    std::fs::write(&doc, "# Doc\n\n![a](a.png)\n").unwrap();
+    std::fs::write(dir.path().join("a.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+    // `--annotate` must not make pages, assets or `/events` any stricter.
+    let server =
+        ServeProcess::try_start_with_env(&[&doc], 0, false, false, false, None, true).unwrap();
+    let cookie = "a".repeat(40_000);
+    for route in ["/", "/a.png", "/events"] {
+        let cases: [(&str, Vec<u8>); 4] = [
+            (
+                "bare LF line endings",
+                format!("GET {route} HTTP/1.1\nHost: localhost\n\n").into_bytes(),
+            ),
+            (
+                "Latin-1 header byte",
+                [
+                    format!("GET {route} HTTP/1.1\r\nHost: localhost\r\nUser-Agent: caf")
+                        .as_bytes(),
+                    b"\xe9\r\n\r\n",
+                ]
+                .concat(),
+            ),
+            (
+                "40 KB cookie",
+                format!("GET {route} HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie}\r\n\r\n")
+                    .into_bytes(),
+            ),
+            (
+                "HTTP/1.0 request line",
+                format!("GET {route} HTTP/1.0\r\n\r\n").into_bytes(),
+            ),
+        ];
+        for (name, request) in cases {
+            // Repeated: an unread request must not reset the connection.
+            for attempt in 0..5 {
+                let response = raw_response_head(server.port, &request);
+                assert!(
+                    response.starts_with("HTTP/1.1 200 OK"),
+                    "{route}, {name}, attempt {attempt}: {response:?}"
+                );
+            }
+        }
+    }
+
+    // Headers that arrive after the strict reader's 3 s deadline: an ordinary
+    // route never waits for them.
+    let mut slow = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    slow.set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    slow.write_all(b"GET / HTTP/1.1\r\n").unwrap();
+    std::thread::sleep(Duration::from_millis(3_500));
+    let response = read_until(&mut slow, "\r\n\r\n", Duration::from_secs(8));
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response:?}");
+}
+
+#[test]
+fn serve_annotations_endpoint_keeps_its_strict_request_parser() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = dir.path().join("doc.md");
+    std::fs::write(&doc, "# Doc\n").unwrap();
+    let server = ServeProcess::start(&doc);
+    let host = format!("localhost:{}", server.port);
+    let route = "/_markview/annotations?doc=%2Fdoc.md";
+    let ok = raw_response_head(
+        server.port,
+        format!("GET {route} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes(),
+    );
+    assert!(ok.starts_with("HTTP/1.1 200 OK"), "{ok:?}");
+    let cases: [(&str, Vec<u8>); 5] = [
+        (
+            "duplicate Content-Length",
+            format!("GET {route} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n")
+                .into_bytes(),
+        ),
+        (
+            "bare LF line endings",
+            format!("GET {route} HTTP/1.1\nHost: {host}\n\n").into_bytes(),
+        ),
+        (
+            "non-UTF-8 header",
+            [
+                format!("GET {route} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: caf").as_bytes(),
+                b"\xe9\r\n\r\n",
+            ]
+            .concat(),
+        ),
+        (
+            "fragment in target",
+            format!("GET {route}#top HTTP/1.1\r\nHost: {host}\r\n\r\n").into_bytes(),
+        ),
+        (
+            "space in target",
+            format!("GET /_markview/annotations?doc=/doc .md HTTP/1.1\r\nHost: {host}\r\n\r\n")
+                .into_bytes(),
+        ),
+    ];
+    for (name, request) in cases {
+        let response = raw_response_head(server.port, &request);
+        assert!(response.starts_with("HTTP/1.1 400"), "{name}: {response:?}");
+    }
+}
+
 fn raw_http(port: u16, request: &str) -> String {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream

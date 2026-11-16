@@ -125,9 +125,18 @@ fn read_line(
 }
 
 impl HttpRequest {
-    pub fn read(reader: &mut BufReader<TcpStream>, deadline: Instant) -> io::Result<Self> {
-        let mut budget = HEAD_CAP;
-        let line = read_line(reader, deadline, &mut budget)?;
+    /// Strictly parses a request to the reserved prefix: `request_line` as
+    /// already read from the connection, then the headers from `reader`.
+    /// Ordinary routes never come here; they only need the request line.
+    pub fn parse(
+        request_line: &str,
+        reader: &mut BufReader<TcpStream>,
+        deadline: Instant,
+    ) -> io::Result<Self> {
+        let mut budget = HEAD_CAP
+            .checked_sub(request_line.len())
+            .ok_or_else(bad_request)?;
+        let line = request_line.strip_suffix("\r\n").ok_or_else(bad_request)?;
         let mut parts = line.split(' ');
         let (Some(method), Some(target), Some("HTTP/1.1" | "HTTP/1.0"), None) =
             (parts.next(), parts.next(), parts.next(), parts.next())

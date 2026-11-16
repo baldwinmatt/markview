@@ -3,7 +3,7 @@ mod serve_annotations;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::fd::{AsFd, OwnedFd};
@@ -1329,68 +1329,103 @@ fn handle_connection(
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    let request = match serve_annotations::HttpRequest::read(&mut reader, deadline) {
-        Ok(request) => request,
-        Err(_) => {
-            return write_response(
+    // Pages, assets and `/events` need only the method and target, so the
+    // request line is read leniently and their headers are never parsed. The
+    // strict reader is for the reserved prefix alone, which accepts writes.
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let request_path = parts.next().unwrap_or("/");
+    if serve_annotations::reserved(request_path) {
+        return match serve_annotations::HttpRequest::parse(&request_line, &mut reader, deadline) {
+            Ok(request) => {
+                serve_annotations::handle(&mut stream, &mut reader, config, &request, deadline)
+            }
+            Err(_) => write_response(
                 &mut stream,
                 "400 Bad Request",
                 "text/plain; charset=utf-8",
                 "Malformed request",
                 false,
-            )
-        }
-    };
-    let method = request.method.as_str();
-    let request_path = request.target.as_str();
-    if serve_annotations::reserved(request_path) {
-        return serve_annotations::handle(&mut stream, &mut reader, config, &request, deadline);
-    }
-    if !matches!(method, "GET" | "HEAD") {
-        return write_response(
-            &mut stream,
-            "405 Method Not Allowed",
-            "text/plain; charset=utf-8",
-            "Method not allowed",
-            method == "HEAD",
-        );
+            ),
+        };
     }
     let head_only = method == "HEAD";
     let route = config.route_for_request(request_path);
     let route = route.as_deref().unwrap_or("");
-    match route {
-        "/" => {
-            if let Some(document) = config.default_document() {
-                serve_document(&mut stream, config, document, head_only)
-            } else {
-                write_404(&mut stream, head_only)
+    if method == "GET" && route == "/events" {
+        return match serve_events(stream, clients) {
+            Ok(()) => Ok(()),
+            Err(error) if is_client_disconnect(&error) => {
+                if std::env::var_os("MARKVIEW_LOG_EVENT_DISCONNECTS").is_some() {
+                    eprintln!("markview: /events client disconnected");
+                }
+                Ok(())
             }
-        }
-        "/events" => {
-            if head_only {
+            Err(error) => Err(error),
+        };
+    }
+    let result = if !matches!(method, "GET" | "HEAD") {
+        write_response(
+            &mut stream,
+            "405 Method Not Allowed",
+            "text/plain; charset=utf-8",
+            "Method not allowed",
+            false,
+        )
+    } else {
+        match route {
+            "/" => match config.default_document() {
+                Some(document) => serve_document(&mut stream, config, document, head_only),
+                None => write_404(&mut stream, head_only),
+            },
+            "/events" => {
                 write_bytes_response(&mut stream, "200 OK", "text/event-stream", &[], true)
-            } else {
-                match serve_events(stream, clients) {
-                    Ok(()) => Ok(()),
-                    Err(error) if is_client_disconnect(&error) => {
-                        if std::env::var_os("MARKVIEW_LOG_EVENT_DISCONNECTS").is_some() {
-                            eprintln!("markview: /events client disconnected");
-                        }
-                        Ok(())
-                    }
-                    Err(error) => Err(error),
+            }
+            "/favicon.ico" => serve_favicon(&mut stream, config, head_only),
+            _ => {
+                if let Some(document) = config.document_by_route(route) {
+                    serve_document(&mut stream, config, document, head_only)
+                } else if let Some(asset) = config.asset_by_route(route) {
+                    serve_asset(&mut stream, config, &asset, head_only)
+                } else {
+                    write_404(&mut stream, head_only)
                 }
             }
         }
-        "/favicon.ico" => serve_favicon(&mut stream, config, head_only),
-        _ => {
-            if let Some(document) = config.document_by_route(route) {
-                serve_document(&mut stream, config, document, head_only)
-            } else if let Some(asset) = config.asset_by_route(route) {
-                serve_asset(&mut stream, config, &asset, head_only)
-            } else {
-                write_404(&mut stream, head_only)
+    };
+    drain_request(&stream, &mut reader);
+    result
+}
+
+/// How much unread request the server discards after answering, and for how
+/// long, before it closes the connection.
+const DRAIN_CAP: usize = 256 * 1024;
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Lets the client read the whole response. Closing a socket that still holds
+/// unread request bytes (headers that were never parsed, or a body that was
+/// refused) resets the connection, and the client can lose the response. So
+/// finish the response, then discard what the client sent until it closes.
+fn drain_request(stream: &TcpStream, reader: &mut BufReader<TcpStream>) {
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let deadline = std::time::Instant::now() + DRAIN_TIMEOUT;
+    let mut remaining = DRAIN_CAP;
+    while remaining > 0 {
+        let timeout = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|timeout| !timeout.is_zero());
+        if timeout.is_none() || stream.set_read_timeout(timeout).is_err() {
+            break;
+        }
+        match reader.fill_buf() {
+            Ok(unread) if !unread.is_empty() => {
+                let count = unread.len().min(remaining);
+                reader.consume(count);
+                remaining -= count;
             }
+            _ => break,
         }
     }
 }

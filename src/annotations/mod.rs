@@ -9,9 +9,9 @@ mod store;
 mod unsupported;
 mod watch;
 
-#[cfg(unix)]
-pub use paths::read_canonical_source;
-pub use paths::{read_source, resolve, Location};
+pub use paths::{
+    read_canonical_source, read_canonical_source_limited, read_source, resolve, Location,
+};
 pub use projection::{collapse, TextProjection};
 pub use store::{Annotation, Status, Store};
 pub use watch::StoreWatcher;
@@ -231,7 +231,15 @@ fn json_optional(value: Option<&str>) -> String {
 }
 
 pub fn json_string(value: &str) -> String {
-    let mut output = String::from("\"");
+    let mut output = String::with_capacity(value.len() + 2);
+    push_json_string(&mut output, value);
+    output
+}
+
+/// Appends `value` to `output` as a JSON string, escaped for embedding in
+/// HTML as well.
+pub fn push_json_string(output: &mut String, value: &str) {
+    output.push('"');
     for ch in value.chars() {
         match ch {
             '"' => output.push_str("\\\""),
@@ -246,7 +254,6 @@ pub fn json_string(value: &str) -> String {
         }
     }
     output.push('"');
-    output
 }
 
 fn parse_snapshot(location: &Location, bytes: Option<&[u8]>) -> Result<Store, Error> {
@@ -284,6 +291,9 @@ struct CacheState {
     documents: Mutex<Vec<CachedDocument>>,
     projections: AtomicUsize,
     resolutions: AtomicUsize,
+    /// Held while a projection is built, so that concurrent requests for one
+    /// cold revision wait for the first build instead of repeating it.
+    building: Mutex<()>,
 }
 
 impl fmt::Debug for ReviewCache {
@@ -349,12 +359,23 @@ impl ReviewCache {
     }
 
     /// The projection of `source`, built only if its revision is not cached.
-    fn projection(&self, location: &Location, source: &str) -> Arc<TextProjection> {
+    /// Concurrent callers share one build.
+    pub fn projection(&self, location: &Location, source: &str) -> Arc<TextProjection> {
         let revision = source_revision(source);
-        self.lookup(location, &revision, |cached| {
-            Some(cached.projection.clone())
-        })
-        .unwrap_or_else(|| {
+        let cached = || {
+            self.lookup(location, &revision, |cached| {
+                Some(cached.projection.clone())
+            })
+        };
+        if let Some(projection) = cached() {
+            return projection;
+        }
+        let _building = self
+            .0
+            .building
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cached().unwrap_or_else(|| {
             self.0.projections.fetch_add(1, Ordering::Relaxed);
             let projection = Arc::new(TextProjection::new(source));
             self.remember(location, &projection, None);

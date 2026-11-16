@@ -1102,3 +1102,46 @@ fn alert_offsets_are_the_ones_pinned_for_the_dom_walk() {
         );
     }
 }
+
+#[test]
+fn concurrent_cold_projections_of_one_revision_are_built_once() {
+    let dir = tempdir().unwrap();
+    let doc = dir.path().join("doc.md");
+    let source = "# Big\n\n".to_owned() + &"words and *more* words\n\n".repeat(20_000);
+    fs::write(&doc, &source).unwrap();
+    let location = resolve(&doc).unwrap();
+    let cache = ReviewCache::default();
+    let barrier = std::sync::Barrier::new(8);
+    let projections: Vec<_> = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    cache.projection(&location, &source)
+                })
+            })
+            .collect();
+        threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect()
+    });
+    assert_eq!(cache.work().0, 1);
+    assert!(projections
+        .iter()
+        .all(|projection| Arc::ptr_eq(projection, &projections[0])));
+}
+
+#[test]
+fn limited_source_reads_refuse_a_file_over_the_limit_by_its_size() {
+    let dir = tempdir().unwrap();
+    let doc = dir.path().join("doc.md");
+    fs::write(&doc, "0123456789").unwrap();
+    let doc = resolve(&doc).unwrap().document;
+    assert_eq!(
+        read_canonical_source_limited(&doc, 10).unwrap(),
+        "0123456789"
+    );
+    let error = read_canonical_source_limited(&doc, 9).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
+}

@@ -61,3 +61,25 @@ impl Parent {
 pub fn read_source(_location: &Location) -> io::Result<String> {
     Err(unsupported())
 }
+
+/// Reads the file without the symlink confinement unix has: this platform
+/// cannot write annotations, but it can still serve documents.
+pub fn read_canonical_source(path: &Path) -> io::Result<String> {
+    read_canonical_source_limited(path, u64::MAX)
+}
+
+pub fn read_canonical_source_limited(path: &Path, limit: u64) -> io::Result<String> {
+    use std::io::Read;
+    let too_large = || io::Error::new(io::ErrorKind::FileTooLarge, "document is too large");
+    let file = File::open(path)?;
+    if file.metadata()?.len() > limit {
+        return Err(too_large());
+    }
+    let mut source = String::new();
+    file.take(limit.saturating_add(1))
+        .read_to_string(&mut source)?;
+    if source.len() as u64 > limit {
+        return Err(too_large());
+    }
+    Ok(source)
+}

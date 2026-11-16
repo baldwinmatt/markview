@@ -3489,7 +3489,8 @@ fn agent_api_lists_and_fetches_only_served_documents() {
     let path = format!("{api}/document?doc=%2Fa%2520%252B%2520b%2525.md");
     let response = http_get_local(port, &path);
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-    assert!(response.contains("Cache-Control: no-store"), "{response}");
+    assert!(response.contains("Cache-Control: no-cache"), "{response}");
+    assert!(response.contains("ETag: \""), "{response}");
     assert!(response
         .contains(r##""markdown":"# Example\u000d\u000a\u000d\u000a**bold**\u000d\u000a""##));
     assert!(response.contains(r#""projected_text":"Example bold""#));

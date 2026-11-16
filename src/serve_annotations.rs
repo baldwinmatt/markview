@@ -239,6 +239,7 @@ impl HttpRequest {
                     | "transfer-encoding"
                     | "x-markview-token"
                     | "authorization"
+                    | "if-none-match"
             ) && headers
                 .insert(key, value.trim_matches([' ', '\t']).to_owned())
                 .is_some()
@@ -399,6 +400,10 @@ pub fn handle(
         .split_once('?')
         .unwrap_or((&request.target, ""));
     let api = path.strip_prefix(serve_api::PREFIX);
+    if api.is_some() {
+        // A client that stops reading must not hold a worker on a large body.
+        stream.set_write_timeout(Some(serve_api::WRITE_TIMEOUT))?;
+    }
     if matches!(api, Some("documents" | "document")) {
         if !matches!(request.method.as_str(), "GET" | "HEAD") {
             return fail(stream, "405 Method Not Allowed", "method not allowed");
@@ -420,19 +425,48 @@ pub fn handle(
         let Some(document) = initial.document_for_route(&route) else {
             return fail(stream, "404 Not Found", "document is unavailable");
         };
-        return match serve_api::source(&initial, document) {
-            Ok(body) => json_response(stream, "200 OK", &body, head),
+        let loaded = match serve_api::load(&initial, document) {
+            Ok(loaded) => loaded,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fail(stream, "404 Not Found", "document is unavailable")
+                return fail(stream, "404 Not Found", "document is unavailable")
+            }
+            Err(error) if error.kind() == io::ErrorKind::FileTooLarge => {
+                return fail(stream, "413 Payload Too Large", "document is too large")
             }
             Err(error) => {
                 eprintln!(
                     "markview: cannot read {}: {error}",
                     document.source_path.display()
                 );
-                fail(stream, "500 Internal Server Error", "cannot read document")
+                return fail(stream, "500 Internal Server Error", "cannot read document");
             }
         };
+        let headers = format!(
+            "ETag: \"{}\"\r\nCache-Control: no-cache\r\n",
+            loaded.revision
+        );
+        if request
+            .header("if-none-match")
+            .is_some_and(|value| serve_api::etag_matches(value, &loaded.revision))
+        {
+            return write_response_headers(
+                stream,
+                "304 Not Modified",
+                "application/json; charset=utf-8",
+                b"",
+                true,
+                &headers,
+            );
+        }
+        let body = serve_api::body(&initial, document, &loaded);
+        return write_response_headers(
+            stream,
+            "200 OK",
+            "application/json; charset=utf-8",
+            body.as_bytes(),
+            head,
+            &headers,
+        );
     }
     let path = match api {
         Some("annotations") => ENDPOINT,

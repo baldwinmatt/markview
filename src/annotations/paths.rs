@@ -338,22 +338,33 @@ pub fn read_source(location: &Location) -> io::Result<String> {
 
 /// Reads a canonical document path without following symlinks in any component.
 pub fn read_canonical_source(path: &Path) -> io::Result<String> {
+    read_canonical_source_limited(path, u64::MAX)
+}
+
+/// Like `read_canonical_source`, but refuses a file larger than `limit` bytes
+/// with `ErrorKind::FileTooLarge`: by its size before reading it, and by
+/// bounding the read in case the file grows meanwhile.
+pub fn read_canonical_source_limited(path: &Path, limit: u64) -> io::Result<String> {
+    let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
     let parent = path
         .parent()
         .filter(|_| path.is_absolute())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "expected an absolute file path",
-            )
-        })?;
+        .ok_or_else(|| invalid("expected an absolute file path"))?;
+    let filename = path
+        .file_name()
+        .ok_or_else(|| invalid("expected a file path"))?;
     let parent = canonical_directory(parent)?;
-    let mut file = regular(open_at(
-        &parent,
-        path.file_name().expect("source filename"),
-        libc::O_RDONLY,
-    )?)?;
+    let mut file = regular(open_at(&parent, filename, libc::O_RDONLY)?)?;
+    let too_large = || io::Error::new(io::ErrorKind::FileTooLarge, "document is too large");
+    if file.metadata()?.len() > limit {
+        return Err(too_large());
+    }
     let mut source = String::new();
-    file.read_to_string(&mut source)?;
+    (&mut file)
+        .take(limit.saturating_add(1))
+        .read_to_string(&mut source)?;
+    if source.len() as u64 > limit {
+        return Err(too_large());
+    }
     Ok(source)
 }

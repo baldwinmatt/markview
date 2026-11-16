@@ -285,7 +285,20 @@ function createPage({revision = 'source-1', storage = new Map()} = {}) {
     prompt() { throw new Error('window.prompt must not be used'); },
   };
   page.window = window;
+  // Timers run only when a test says time has passed: `page.advance(ms)`.
+  const timers = new Map();
+  let now = 0;
+  let nextTimer = 1;
+  page.advance = ms => {
+    now += ms;
+    for (const [id, timer] of [...timers].sort((a, b) => a[1].at - b[1].at)) {
+      if (timer.at > now || !timers.delete(id)) continue;
+      timer.run();
+    }
+  };
   page.context = vm.createContext({
+    setTimeout: (run, delay = 0) => { timers.set(nextTimer, {at: now + delay, run}); return nextTimer++; },
+    clearTimeout: id => { timers.delete(id); },
     document,
     window,
     URLSearchParams,

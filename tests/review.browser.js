@@ -48,13 +48,15 @@
       'The Copy button is not shown on devices without hover');
     require(within('print').some(rule => rule.selectorText.includes('.markview-copy-code') && rule.style.display === 'none'),
       'The Copy button is printed');
+    // Read from the rule, not from the computed style of a focused button:
+    // whether `:focus` applies in a headless window varies from run to run.
+    require(copyRules.some(rule => rule.selectorText?.split(',').some(part => part.trim() === '.markview-copy-code:focus') && shows(rule)),
+      'The Copy button stays hidden with keyboard focus');
+    const resting = getComputedStyle(copyButtons[2]);
     if (!matchMedia('(hover: none)').matches) {
-      document.body.focus();
-      require(getComputedStyle(copyButtons[0]).opacity === '0', 'The Copy button is visible before hover or focus');
-      copyButtons[0].focus();
-      require(getComputedStyle(copyButtons[0]).opacity === '1', 'The Copy button stays hidden with keyboard focus');
-      copyButtons[0].blur();
+      require(resting.opacity === '0' && resting.pointerEvents === 'none', 'The Copy button is visible before hover or focus');
     }
+    require(resting.userSelect === 'none', 'The Copy button can be selected with the code');
     let copied = '';
     Object.defineProperty(navigator, 'clipboard', {configurable: true, value: {writeText: async text => { copied = text; }}});
     copyButtons[1].focus();
@@ -62,6 +64,20 @@
     await Promise.resolve();
     require(copyButtons[1].textContent === 'Copied' && copied === payloads[1] &&
       document.activeElement === copyButtons[1], 'Clipboard copy changed the payload or focus');
+    // A selection dragged across a code block takes the code, not the label
+    // of the button that floats over it, whatever the label says just now.
+    for (const button of copyButtons.slice(0, 2)) {
+      const block = button.parentElement;
+      const across = document.createRange();
+      across.setStartBefore(block);
+      across.setEndAfter(block);
+      selection.removeAllRanges();
+      selection.addRange(across);
+      const picked = selection.toString();
+      selection.removeAllRanges();
+      require(picked.includes(block.querySelector('code').textContent.trim()) && !/Cop(y|ied)/.test(picked),
+        'A selection across a code block includes the Copy label: ' + JSON.stringify(picked));
+    }
     Object.defineProperty(navigator, 'clipboard', {configurable: true, value: {writeText: async () => { throw new Error('blocked'); }}});
     copyButtons[2].click();
     await Promise.resolve();

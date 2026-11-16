@@ -1236,6 +1236,7 @@ test('Copy sends the exact code text, reports the result on the button and annou
   await page.settle();
   assert.deepEqual(page.copied, ['\tlet ready = true;\n']);
   assert.equal(rust.textContent, 'Copied');
+  page.advance(200);
   assert.equal(page.announced().textContent, 'Copied');
   focused(page, rust);
 
@@ -1243,8 +1244,58 @@ test('Copy sends the exact code text, reports the result on the button and annou
   diff.click();
   await page.settle();
   assert.equal(diff.textContent, 'Copy failed');
+  page.advance(200);
   assert.equal(page.announced().textContent, 'Copy failed');
   assert.equal(rust.textContent, 'Copied', 'one button does not speak for another');
+});
+
+test('a Copy button shows its result for a while and then offers to copy again', async () => {
+  const page = codePage();
+  const [button] = page.copyButtons();
+  button.click();
+  await page.settle();
+  assert.equal(button.textContent, 'Copied');
+  page.advance(1000);
+  assert.equal(button.textContent, 'Copied', 'long enough to be read');
+  page.advance(4000);
+  assert.equal(button.textContent, 'Copy');
+
+  // A second copy starts the wait again, so the first one's timer does not
+  // cut the new result short.
+  button.click();
+  await page.settle();
+  page.advance(1500);
+  button.click();
+  await page.settle();
+  page.advance(1500);
+  assert.equal(button.textContent, 'Copied');
+  page.advance(4000);
+  assert.equal(button.textContent, 'Copy');
+  assert.deepEqual(page.copied.length, 3);
+});
+
+test('each copy result is announced, including the same result twice in a row', async () => {
+  const page = codePage();
+  const [button] = page.copyButtons();
+  const spoken = [];
+  // A live region speaks when its text changes: record every change.
+  const status = page.announced();
+  let text = status.textContent;
+  Object.defineProperty(status, 'textContent', {
+    get: () => text,
+    set(value) { if (value !== text && value) spoken.push(value); text = value; },
+  });
+  button.click();
+  await page.settle();
+  page.advance(200);
+  assert.deepEqual(spoken, ['Copied']);
+  // The same words again. Writing them over themselves would be silent, and
+  // clearing and writing in one task is a change no reader ever sees.
+  button.click();
+  await page.settle();
+  assert.equal(text, '', 'cleared first, in its own task');
+  page.advance(200);
+  assert.deepEqual(spoken, ['Copied', 'Copied']);
 });
 
 test('a second click while the clipboard is busy copies nothing more', async () => {
@@ -1261,6 +1312,16 @@ test('a second click while the clipboard is busy copies nothing more', async () 
   await page.settle();
   assert.equal(button.getAttribute('aria-busy'), null);
   assert.equal(button.textContent, 'Copied');
+});
+
+test('the Copy button cannot be selected along with the code', () => {
+  // The rule is read from the stylesheet as written. What a browser makes
+  // of it (a selection across a block has no "Copy" in it) is checked in
+  // tests/review.browser.js.
+  const css = require('node:fs').readFileSync(require('node:path').join(__dirname, '../src/annotations/copy.css'), 'utf8');
+  const rule = /\.markview-copy-code \{([^}]*)\}/.exec(css)[1];
+  assert.match(rule, /(^|\s)user-select: none;/);
+  assert.match(rule, /-webkit-user-select: none;/);
 });
 
 test('attaching again after a refresh adds buttons only to blocks that lack one', () => {

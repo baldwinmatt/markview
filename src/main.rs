@@ -1338,18 +1338,24 @@ fn handle_connection(
     let method = parts.next().unwrap_or("");
     let request_path = parts.next().unwrap_or("/");
     if serve_annotations::reserved(request_path) {
-        return match serve_annotations::HttpRequest::parse(&request_line, &mut reader, deadline) {
-            Ok(request) => {
-                serve_annotations::handle(&mut stream, &mut reader, config, &request, deadline)
-            }
-            Err(_) => write_response(
-                &mut stream,
-                "400 Bad Request",
-                "text/plain; charset=utf-8",
-                "Malformed request",
-                false,
-            ),
-        };
+        let result =
+            match serve_annotations::HttpRequest::parse(&request_line, &mut reader, deadline) {
+                Ok(request) => {
+                    serve_annotations::handle(&mut stream, &mut reader, config, &request, deadline)
+                }
+                Err(_) => write_response(
+                    &mut stream,
+                    "400 Bad Request",
+                    "text/plain; charset=utf-8",
+                    "Malformed request",
+                    false,
+                ),
+            };
+        // A refused POST is answered before its body is read. Without the
+        // drain, a body larger than the socket buffer resets the connection
+        // and the page reports "Failed to fetch" instead of the error.
+        drain_request(&stream, &mut reader);
+        return result;
     }
     let head_only = method == "HEAD";
     let route = config.route_for_request(request_path);

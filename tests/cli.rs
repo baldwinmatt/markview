@@ -2079,6 +2079,64 @@ fn serve_annotations_endpoint_keeps_its_strict_request_parser() {
     }
 }
 
+#[test]
+fn serve_annotations_delivers_the_error_when_rejecting_a_large_post() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = dir.path().join("doc.md");
+    std::fs::write(&doc, "# Doc\n").unwrap();
+    let server =
+        ServeProcess::try_start_with_env(&[&doc], 0, false, false, false, None, true).unwrap();
+    let port = server.port;
+    let token = review_token(&http_get(port, "/"));
+    let body = format!("op=add&doc=%2Fdoc.md&body={}", "x".repeat(150_000));
+    let request = |host: &str, token: &str, content_type: &str| {
+        format!(
+            "POST /_markview/annotations HTTP/1.1\r\nHost: {host}\r\nContent-Type: {content_type}\r\nX-Markview-Token: {token}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let local = format!("localhost:{port}");
+    let form = "application/x-www-form-urlencoded";
+    for (name, request, status, error) in [
+        (
+            "wrong token",
+            request(&local, "guessed", form),
+            "HTTP/1.1 403",
+            r#"{"error":"invalid annotation token"}"#,
+        ),
+        (
+            "bad framing",
+            request(&local, &token, "text/plain"),
+            "HTTP/1.1 400",
+            r#"{"error":"invalid annotation request framing"}"#,
+        ),
+        (
+            "bad Host",
+            request(&format!("evil.test:{port}"), &token, form),
+            "HTTP/1.1 403",
+            r#"{"error":"invalid Host"}"#,
+        ),
+    ] {
+        // The server answers before reading the body. Every attempt must
+        // still deliver the whole response instead of a connection reset.
+        let delivered = (0..20)
+            .filter(|_| {
+                let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(8)))
+                    .unwrap();
+                let _ = stream.write_all(request.as_bytes());
+                let mut response = Vec::new();
+                let _ = stream.read_to_end(&mut response);
+                let response = String::from_utf8_lossy(&response);
+                response.starts_with(status) && response.ends_with(error)
+            })
+            .count();
+        assert_eq!(delivered, 20, "{name}: complete responses out of 20");
+    }
+    assert!(!dir.path().join(".markview").exists());
+}
+
 fn raw_http(port: u16, request: &str) -> String {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream

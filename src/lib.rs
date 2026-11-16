@@ -2167,13 +2167,20 @@ impl Renderer {
     }
 
     fn push_text(&mut self, text: &str) {
-        // The parser can emit an unmatched opening bracket separately.
-        let literal_alert_marker = self.quote_depth > 0
-            && text.starts_with('!')
+        let mut words = text.split_whitespace();
+        // The parser hands over an unmatched `[` as a text of its own, and
+        // a `!` written right after it starts the next text. Wherever that
+        // happens (a paragraph, a list item, a quote at any depth), the two
+        // were one word: put the first word back against the bracket, with
+        // no space and no line break between them.
+        if text.starts_with('!')
             && !self.pending_space
-            && last_visible_char(&self.line) == Some('[');
-        for (index, word) in text.split_whitespace().enumerate() {
-            self.push_word(word, index == 0 && literal_alert_marker);
+            && last_visible_char(&self.line) == Some('[')
+        {
+            self.line.push_str(words.next().unwrap_or_default());
+        }
+        for word in words {
+            self.push_word(word);
         }
 
         self.pending_space = text.chars().last().is_some_and(char::is_whitespace);
@@ -2183,23 +2190,20 @@ impl Renderer {
         }
     }
 
-    fn push_word(&mut self, word: &str, join_bracket: bool) {
+    fn push_word(&mut self, word: &str) {
         let indent = self.indent();
         let limit = self.options.width.max(indent.len() + 20);
         let has_visible_text = line_has_visible_text(&self.line);
         let projected =
             visible_len(&self.line) + word.chars().count() + usize::from(has_visible_text);
 
-        if projected > limit && has_visible_text && !join_bracket {
+        if projected > limit && has_visible_text {
             self.flush_line();
         }
 
         if !line_has_visible_text(&self.line) {
             self.line.push_str(&indent);
-        } else if !join_bracket
-            && !line_ends_with_visible_space(&self.line)
-            && !attaches_to_previous(word)
-        {
+        } else if !line_ends_with_visible_space(&self.line) && !attaches_to_previous(word) {
             self.line.push(' ');
         }
 
@@ -2767,8 +2771,18 @@ mod tests {
         );
     }
 
+    /// The `<main>` of a rendered page, and the page's stylesheet.
+    fn rendered(source: &str) -> (String, String) {
+        let html = render_html(source);
+        let between = |open: &str, close: &str| {
+            let (_, rest) = html.split_once(open).expect(open);
+            rest.split_once(close).expect(close).0.trim().to_owned()
+        };
+        (between("<main>", "</main>"), between("<style>", "</style>"))
+    }
+
     #[test]
-    fn github_alerts_keep_visible_titles_and_nested_content() {
+    fn github_alerts_render_a_titled_block_that_the_same_page_styles() {
         for (marker, title) in [
             ("NOTE", "Note"),
             ("TIP", "Tip"),
@@ -2777,15 +2791,52 @@ mod tests {
             ("CAUTION", "Caution"),
         ] {
             let source = format!("> [!{marker}]\n> Body **text**\n>\n> - Nested\n");
-            let html = render_html(&source);
             let kind = marker.to_ascii_lowercase();
-            assert!(html.contains(&format!(r#"<blockquote class="markdown-alert-{kind}">"#)));
-            assert!(html.contains(&format!(
-                r#"data-markview-review-exclude><strong>{title}</strong>"#
+            let (main, style) = rendered(&source);
+            // The whole block: the marker is gone, the title is generated
+            // and kept out of annotations, and the content is ordinary.
+            assert_eq!(
+                main,
+                format!(
+                    concat!(
+                        "<blockquote class=\"markdown-alert-{kind}\">\n",
+                        "<p class=\"markdown-alert-title\" data-markview-review-exclude>",
+                        "<strong>{title}</strong></p>\n",
+                        "<p>Body <strong>text</strong></p>\n",
+                        "<ul>\n<li>Nested</li>\n</ul>\n",
+                        "</blockquote>"
+                    ),
+                    kind = kind,
+                    title = title
+                )
+            );
+            // Every class this document was rendered with is one the page's
+            // own stylesheet selects, so the block cannot be left unstyled
+            // by a renamed class on either side.
+            let classes: Vec<&str> = main
+                .split("class=\"")
+                .skip(1)
+                .map(|rest| rest.split('"').next().unwrap())
+                .collect();
+            assert_eq!(
+                classes,
+                [&format!("markdown-alert-{kind}"), "markdown-alert-title"]
+            );
+            for class in classes {
+                assert!(style.contains(&format!(".{class} {{")), "{class}");
+            }
+            // The kind's accent is the one its rule names, defined for the
+            // light and the dark theme, and print draws a border without it.
+            assert!(style.contains(&format!(
+                ".markdown-alert-{kind} {{ --alert-accent: var(--alert-{kind}); }}"
             )));
-            assert!(html.contains("<li>Nested</li>"));
-            assert!(html.contains("border-left: 4px solid #000"));
-            assert!(html.contains(&format!("--alert-{kind}:")));
+            assert_eq!(style.matches(&format!("--alert-{kind}: #")).count(), 2);
+            let print = style.split("@media print").last().unwrap();
+            assert!(print.contains(
+                "blockquote[class^=\"markdown-alert-\"] { border-left: 4px solid #000; background: none; }"
+            ));
+            assert!(print.contains(".markdown-alert-title { color: #000; }"));
+
             let terminal = render(
                 &source,
                 RenderOptions {
@@ -2793,14 +2844,44 @@ mod tests {
                     ..RenderOptions::default()
                 },
             );
-            assert!(
-                terminal.contains(&format!("{BOLD}> {title}{RESET}\n")),
-                "{terminal:?}"
+            assert_eq!(
+                terminal,
+                format!("{BOLD}> {title}{RESET}\n> Body {BOLD}text{RESET}\n\n> - Nested\n")
             );
         }
+        // An unknown marker is not an alert: an ordinary quote, text intact.
         let unknown = "> [!FOO]\n> Body\n";
-        assert!(render_html(unknown).contains("<blockquote>\n<p>[!FOO]"));
-        assert!(plain(unknown).contains("> [!FOO]"));
+        let (main, _) = rendered(unknown);
+        assert_eq!(main, "<blockquote>\n<p>[!FOO]\nBody</p>\n</blockquote>");
+        assert_eq!(plain(unknown), "> [!FOO] Body\n");
+        // And a document without one has no alert markup at all.
+        assert!(!rendered("> Just a quote\n").0.contains("markdown-alert"));
+    }
+
+    #[test]
+    fn a_bang_stays_attached_to_the_bracket_before_it_at_any_depth() {
+        // The parser hands over an unmatched `[` as a text of its own, and
+        // the `!` that followed it starts the next. They were written as one
+        // word, in a quote or out of one.
+        for (source, expected) in [
+            ("Wow [!really nice\n", "Wow [!really nice\n"),
+            ("- [!NOTE]\n", "- [!NOTE]\n"),
+            ("> Wow [!really nice\n", "> Wow [!really nice\n"),
+            ("> > Wow [!really nice\n", "> > Wow [!really nice\n"),
+            (
+                "> - [!NOTE] in a quoted list\n",
+                "> - [!NOTE] in a quoted list\n",
+            ),
+            // A space the author wrote is still a space.
+            ("x [ !spaced\n", "x [ !spaced\n"),
+        ] {
+            assert_eq!(plain(source), expected, "{source:?}");
+        }
+        // A real alert is recognised where it always was.
+        assert_eq!(
+            plain("> [!NOTE]\n> Body\n"),
+            format!("{BOLD}> Note{RESET}\n> Body\n")
+        );
     }
 
     #[test]

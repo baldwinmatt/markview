@@ -1043,3 +1043,38 @@ fn alert_projection_excludes_marker_and_preserves_source_lines() {
     assert_eq!(projection.lines(0..8), (2, 2));
     assert_eq!(projection.lines(8..14), (4, 4));
 }
+
+#[test]
+fn alert_offsets_are_the_ones_pinned_for_the_dom_walk() {
+    // tests/review.test.cjs walks the DOM of this same document and must
+    // land on the same offsets. It cannot ask Rust, so both sides are held
+    // to the literals below: this test fails if the projection, the
+    // rendered alert, or the copy in the script test moves.
+    let source = "Before.\n\n> [!NOTE]\n> Alert **prose**.\n\nAfter alert.\n";
+    let projection = TextProjection::new(source);
+    let text = projection.text();
+    assert_eq!(text, "Before. Alert prose. After alert.");
+    // The marker line and the generated title count for nothing.
+    assert_eq!(projection.quote(7..18).as_deref(), Some("Alert prose."));
+    assert_eq!(projection.quote(18..29).as_deref(), Some("After alert."));
+    assert_eq!(projection.lines(7..18), (4, 4));
+    assert_eq!(projection.lines(18..29), (6, 6));
+
+    let page = crate::render_html(source);
+    let main = page
+        .split_once("<main>")
+        .and_then(|(_, rest)| rest.split_once("</main>"))
+        .expect("rendered main")
+        .0
+        .replace('\n', "");
+    let script = include_str!("../../tests/review.test.cjs");
+    for pinned in [
+        format!("const alertParity = {{text: '{text}', alert: [7, 18], after: [18, 29]}};"),
+        format!("const alertHtml = '{main}';"),
+    ] {
+        assert!(
+            script.contains(&pinned),
+            "tests/review.test.cjs lacks: {pinned}"
+        );
+    }
+}

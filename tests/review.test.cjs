@@ -635,6 +635,62 @@ test('a selection round-trips through offsets, including across elements', () =>
   }
 });
 
+// Pinned from the Rust side by `alert_offsets_are_the_ones_pinned_for_the_dom_walk`
+// in src/annotations/tests.rs, which renders and projects this document:
+//
+//     Before.
+//
+//     > [!NOTE]
+//     > Alert **prose**.
+//
+//     After alert.
+//
+// `alertHtml` is the <main> Markview renders for it, `text` is the Rust
+// projection, and the pairs are the offsets of the alert's prose and of the
+// paragraph after it. Change them only together with that test.
+const alertParity = {text: 'Before. Alert prose. After alert.', alert: [7, 18], after: [18, 29]};
+const alertHtml = '<p>Before.</p><blockquote class="markdown-alert-note"><p class="markdown-alert-title" data-markview-review-exclude><strong>Note</strong></p><p>Alert <strong>prose</strong>.</p></blockquote><p>After alert.</p>';
+
+// The HTML of a stub element, for comparing a hand-built tree with markup.
+function serialize(node) {
+  if (node.nodeType === 3) return node.data;
+  const tag = node.tagName.toLowerCase();
+  const attributes = (node.className ? ` class="${node.className}"` : '') + Object.keys(node.attributes).map(name => ' ' + name).join('');
+  return `<${tag}${attributes}>${node.childNodes.map(serialize).join('')}</${tag}>`;
+}
+
+test('offsets in and after a GitHub alert are the Rust projection\'s: the generated title counts for nothing', () => {
+  const page = createPage();
+  const {h} = page;
+  const title = h('p', {class: 'markdown-alert-title'}, h('strong', {}, 'Note'));
+  title.setAttribute('data-markview-review-exclude', '');
+  const prose = h('p', {}, 'Alert ', h('strong', {}, 'prose'), '.');
+  const after = h('p', {}, 'After alert.');
+  page.main.append(h('p', {}, 'Before.'), h('blockquote', {class: 'markdown-alert-note'}, title, prose), after);
+  assert.equal(page.main.childNodes.map(serialize).join(''), alertHtml, 'the tree under test is what Markview renders');
+
+  const points = page.context.markviewReviewText(page.main);
+  assert.equal(points.map((point, index) => (index && point.gap ? ' ' : '') + point.scalar).join(''), alertParity.text);
+  const selected = (startNode, startOffset, endNode, endOffset) =>
+    page.context.markviewReviewSelection(page.main, selectionBetween(page, startNode, startOffset, endNode, endOffset).selection);
+  // Text after the alert: its offsets are not shifted by "Note".
+  const afterText = after.childNodes[0];
+  assert.deepEqual({...selected(afterText, 0, afterText, afterText.data.length)},
+    {quote: 'After alert.', start: alertParity.after[0], end: alertParity.after[1]});
+  // The alert's own prose.
+  const [first, , last] = prose.childNodes;
+  assert.deepEqual({...selected(first, 0, last, 1)}, {quote: 'Alert prose.', start: alertParity.alert[0], end: alertParity.alert[1]});
+  // A selection that starts in the title quotes only document text, and
+  // one that stays inside the title selects nothing.
+  const titleText = title.querySelector('strong').childNodes[0];
+  assert.deepEqual({...selected(titleText, 0, last, 1)}, {quote: 'Alert prose.', start: alertParity.alert[0], end: alertParity.alert[1]});
+  assert.equal(selected(titleText, 0, titleText, 4), null);
+  // And offsets turn back into the same DOM positions.
+  const range = page.context.markviewReviewRange(points, alertParity.after);
+  assert.ok(range.startContainer === afterText && range.endContainer === afterText);
+  assert.deepEqual([range.startOffset, range.endOffset], [0, 12]);
+});
+
 test('overlapping open comments are all highlighted and resolved ones are not', async () => {
   const page = await servePage(() => response(200, review('store-1', [
     comment('a1', {range: [0, 9], quote: 'first sec', lines: [1, 1]}),

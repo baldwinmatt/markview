@@ -324,3 +324,30 @@ fn readme_states_the_api_contract_precisely() {
         assert!(text.contains(claim), "README Agent HTTP API: {claim}");
     }
 }
+
+#[test]
+fn the_credential_model_and_its_threat_model_are_stated() {
+    let spec = normalized("ANNOTATIONS_SPEC.md");
+    for claim in [
+        "The threat model is local web attackers",
+        "a hostile page in the user's browser, DNS rebinding and another site's script",
+        "Other processes of the same user are out of scope",
+        "A token with fewer than 8 distinct digits is refused at startup",
+    ] {
+        assert!(spec.contains(claim), "ANNOTATIONS_SPEC.md: {claim}");
+    }
+    let readme = agent_api_section()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for claim in [
+        "`mode`",
+        "`serve`, `annotate` or `review`",
+        "local web attackers",
+        "Other processes of the same user are out of scope",
+        "fewer than 8 distinct digits",
+        "MARKVIEW_API_TOKEN=$(openssl rand -hex 32)",
+    ] {
+        assert!(readme.contains(claim), "README Agent HTTP API: {claim}");
+    }
+}

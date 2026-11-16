@@ -340,6 +340,17 @@ struct ApiAccess<'a> {
 }
 
 impl ServeSession {
+    /// How the server was started, as the API catalog names it.
+    fn mode(&self) -> &'static str {
+        if self.blocking_review {
+            "review"
+        } else if self.review_token.is_some() {
+            "annotate"
+        } else {
+            "serve"
+        }
+    }
+
     /// The API's write access, or `None` while its writes are disabled. The
     /// catalog reports it and the write gate enforces it, from this alone.
     fn api_access(&self) -> Option<ApiAccess<'_>> {

@@ -3527,7 +3527,7 @@ fn agent_api_saves_revision_bound_comments_and_finishes_a_review() {
     let dir = tempfile::tempdir().unwrap();
     let source = "# Doc\n\n**😀 anchor**\n";
     std::fs::write(dir.path().join("sample.md"), source).unwrap();
-    let token = "a1".repeat(32);
+    let token = test_token("a1");
     let mut server = start_review_with_env(
         dir.path(),
         "sample.md",
@@ -3953,6 +3953,11 @@ fn review_signals_cancel_without_losing_comments() {
     }
 }
 
+/// A valid API token that differs by `seed` (two hex digits) from the others.
+fn test_token(seed: &str) -> String {
+    format!("{seed}{}", "0123456789abcdef".repeat(4))[..64].to_owned()
+}
+
 /// Starts `--serve --annotate` on `dir` with `MARKVIEW_API_TOKEN` set.
 fn start_api_server(dir: &std::path::Path, token: &str, recurse: bool) -> ServeProcess {
     let mut cmd = std::process::Command::new(cargo_bin("markview"));
@@ -3986,7 +3991,7 @@ fn api_write_waiting_on_a_store_lock_does_not_stall_a_rescan_or_other_requests()
     let dir = tempfile::tempdir().unwrap();
     let source = "# Home\n";
     std::fs::write(dir.path().join("README.md"), source).unwrap();
-    let token = "b2".repeat(32);
+    let token = test_token("b2");
     let server = start_api_server(dir.path(), &token, true);
     let port = server.port;
 
@@ -4101,7 +4106,7 @@ fn a_malformed_api_token_stops_annotate_and_review_with_a_clear_message() {
 fn startup_says_whether_api_writes_are_enabled_or_the_token_is_ignored() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.md"), "# A\n").unwrap();
-    let token = "a1".repeat(32);
+    let token = test_token("a1");
 
     let mut cmd = serve_annotate_command(dir.path(), &["--serve", "--annotate"]);
     cmd.env("MARKVIEW_API_TOKEN", &token);
@@ -4248,7 +4253,7 @@ fn an_add_with_a_client_id_is_applied_once_however_often_it_is_sent() {
     let dir = tempfile::tempdir().unwrap();
     let source = "# Home\n\ntext\n";
     std::fs::write(dir.path().join("README.md"), source).unwrap();
-    let token = "c3".repeat(32);
+    let token = test_token("c3");
     let server = start_api_server(dir.path(), &token, false);
     let port = server.port;
     let bearer = format!("Authorization: Bearer {token}");
@@ -4283,7 +4288,7 @@ fn an_add_can_be_conditional_on_the_store_revision() {
     let dir = tempfile::tempdir().unwrap();
     let source = "# Home\n\ntext\n";
     std::fs::write(dir.path().join("README.md"), source).unwrap();
-    let token = "d4".repeat(32);
+    let token = test_token("d4");
     let server = start_api_server(dir.path(), &token, false);
     let port = server.port;
     let bearer = format!("Authorization: Bearer {token}");
@@ -4314,7 +4319,7 @@ fn an_add_whose_client_disconnected_is_not_doubled_by_the_retry() {
     let dir = tempfile::tempdir().unwrap();
     let source = "# Home\n\ntext\n";
     std::fs::write(dir.path().join("README.md"), source).unwrap();
-    let token = "e5".repeat(32);
+    let token = test_token("e5");
     let server = start_api_server(dir.path(), &token, false);
     let port = server.port;
     let store = dir.path().join(".markview/annotations");
@@ -4357,7 +4362,7 @@ fn an_add_whose_client_disconnected_is_not_doubled_by_the_retry() {
 fn bearer_credentials_follow_the_header_grammar() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("README.md"), "# Home\n").unwrap();
-    let token = "f6".repeat(32);
+    let token = test_token("f6");
     let server = start_api_server(dir.path(), &token, false);
     let port = server.port;
     // Passes authentication, then fails validation: no revision.
@@ -4394,7 +4399,7 @@ fn bearer_credentials_follow_the_header_grammar() {
 fn duplicate_authorization_headers_get_a_json_error_like_every_other_refusal() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("README.md"), "# Home\n").unwrap();
-    let token = "f6".repeat(32);
+    let token = test_token("f6");
     let server = start_api_server(dir.path(), &token, false);
     let port = server.port;
     let response = post_form(
@@ -4415,7 +4420,7 @@ fn duplicate_authorization_headers_get_a_json_error_like_every_other_refusal() {
 fn api_routes_that_do_not_exist_are_404_for_every_method() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("README.md"), "# Home\n").unwrap();
-    let token = "f6".repeat(32);
+    let token = test_token("f6");
     let server = start_api_server(dir.path(), &token, false);
     let port = server.port;
     let bearer = format!("Authorization: Bearer {token}");
@@ -4466,7 +4471,7 @@ fn api_writes_with_a_wrong_or_missing_credential_store_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let source = "# Home\n";
     std::fs::write(dir.path().join("README.md"), source).unwrap();
-    let token = "a7".repeat(32);
+    let token = test_token("a7");
     let server = start_api_server(dir.path(), &token, false);
     let port = server.port;
     let revision = markview::annotations::source_revision(source);
@@ -4474,7 +4479,7 @@ fn api_writes_with_a_wrong_or_missing_credential_store_nothing() {
     let page = http_get_local(port, "/");
     for credential in [
         String::new(),
-        format!("Authorization: Bearer {}", "b8".repeat(32)),
+        format!("Authorization: Bearer {}", test_token("b8")),
         format!("X-Markview-Token: {}", review_token(&page)),
     ] {
         let response = post_form(port, "/_markview/api/v1/annotations", &credential, &form);
@@ -4503,7 +4508,7 @@ fn serve_annotate_accepts_api_writes_without_a_review_session() {
     let dir = tempfile::tempdir().unwrap();
     let source = "# Home\n\nbody text\n";
     std::fs::write(dir.path().join("README.md"), source).unwrap();
-    let token = "a7".repeat(32);
+    let token = test_token("a7");
     let server = start_api_server(dir.path(), &token, false);
     let port = server.port;
     let api = "/_markview/api/v1";
@@ -4539,7 +4544,7 @@ fn api_edits_resolves_and_deletes_against_the_store_revision() {
     let dir = tempfile::tempdir().unwrap();
     let source = "# Home\n\nbody text\n";
     std::fs::write(dir.path().join("README.md"), source).unwrap();
-    let token = "a7".repeat(32);
+    let token = test_token("a7");
     let server = start_api_server(dir.path(), &token, false);
     let port = server.port;
     let api = "/_markview/api/v1/annotations";
@@ -4597,7 +4602,7 @@ fn a_review_accepts_exactly_one_of_two_simultaneous_verdicts() {
     let dir = tempfile::tempdir().unwrap();
     let source = "# Doc\n";
     std::fs::write(dir.path().join("sample.md"), source).unwrap();
-    let token = "a7".repeat(32);
+    let token = test_token("a7");
     let mut server = start_review_with_env(
         dir.path(),
         "sample.md",
@@ -4653,7 +4658,7 @@ fn api_v1_responses_have_exactly_these_keys() {
     let dir = tempfile::tempdir().unwrap();
     let source = "# Doc\n\nalpha beta\n";
     std::fs::write(dir.path().join("sample.md"), source).unwrap();
-    let token = "a7".repeat(32);
+    let token = test_token("a7");
     let server = start_review_with_env(
         dir.path(),
         "sample.md",
@@ -4667,7 +4672,7 @@ fn api_v1_responses_have_exactly_these_keys() {
 
     assert_eq!(
         body(http_get_local(port, &format!("{api}/documents"))),
-        r#"{"api_version":1,"default_document":"/sample.md","can_annotate":true,"can_finish":true,"documents":[{"route":"/sample.md"}]}"#
+        r#"{"api_version":1,"mode":"review","default_document":"/sample.md","can_annotate":true,"can_finish":true,"documents":[{"route":"/sample.md"}]}"#
     );
     assert_eq!(
         body(http_get_local(
@@ -4721,7 +4726,7 @@ fn the_documented_anchor_offsets_count_every_scalar_that_is_not_unicode_whitespa
     let dir = tempfile::tempdir().unwrap();
     let source = "alpha\u{1f}beta gamma\n";
     std::fs::write(dir.path().join("README.md"), source).unwrap();
-    let token = "a9".repeat(32);
+    let token = test_token("a9");
     let server = start_api_server(dir.path(), &token, false);
     let port = server.port;
     let api = "/_markview/api/v1";
@@ -4744,4 +4749,135 @@ fn the_documented_anchor_offsets_count_every_scalar_that_is_not_unicode_whitespa
     let right = add(10, 15);
     assert!(right.starts_with("HTTP/1.1 200"), "{right}");
     assert!(right.contains(r#""range":[10,15]"#), "{right}");
+}
+
+#[test]
+fn a_predictable_api_token_stops_the_server_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.md"), "# A\n").unwrap();
+    for token in ["0".repeat(64), "ab".repeat(32), "0123".repeat(16)] {
+        for mode in [["--serve", "--annotate"], ["--review", "--no-open"]] {
+            let mut child = serve_annotate_command(dir.path(), &mode)
+                .env("MARKVIEW_API_TOKEN", &token)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let until = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break Some(status);
+                }
+                if Instant::now() > until {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            let status = status.unwrap_or_else(|| panic!("{token} {mode:?} started"));
+            assert_eq!(status.code(), Some(1), "{token} {mode:?}: {stderr}");
+            assert!(stderr.contains("too predictable"), "{stderr}");
+            assert!(stderr.contains("openssl rand -hex 32"), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn the_catalog_names_the_mode_so_review_without_a_token_is_not_just_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("sample.md"), "# Doc\n").unwrap();
+    let catalog = |port| http_get_local(port, "/_markview/api/v1/documents");
+
+    let plain = ServeProcess::start(&dir.path().join("sample.md"));
+    let response = catalog(plain.port);
+    assert!(response.contains(r#""mode":"serve""#), "{response}");
+    assert!(response.contains(r#""can_annotate":false"#), "{response}");
+
+    let token = test_token("a1");
+    let annotate = start_api_server(dir.path(), &token, false);
+    let response = catalog(annotate.port);
+    assert!(response.contains(r#""mode":"annotate""#), "{response}");
+
+    let review = start_review(dir.path(), &[]);
+    let response = catalog(review.port);
+    assert!(response.contains(r#""mode":"review""#), "{response}");
+    assert!(
+        response.contains(r#""can_annotate":false,"can_finish":false"#),
+        "{response}"
+    );
+    let with_token = start_review_with_env(
+        dir.path(),
+        "sample.md",
+        &[],
+        &[("MARKVIEW_API_TOKEN", &token)],
+    );
+    let response = catalog(with_token.port);
+    assert!(response.contains(r#""mode":"review""#), "{response}");
+    assert!(
+        response.contains(r#""can_annotate":true,"can_finish":true"#),
+        "{response}"
+    );
+}
+
+#[test]
+fn the_api_token_never_appears_in_a_page_a_response_or_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "# Doc\n\nsome text\n";
+    std::fs::write(dir.path().join("sample.md"), source).unwrap();
+    let token = test_token("a1");
+    let server = start_review_with_env(
+        dir.path(),
+        "sample.md",
+        &[],
+        &[("MARKVIEW_API_TOKEN", &token)],
+    );
+    let port = server.port;
+    let api = "/_markview/api/v1";
+    let revision = markview::annotations::source_revision(source);
+    let bearer = format!("Authorization: Bearer {token}");
+    let mut responses = vec![
+        http_get_local(port, "/"),
+        http_get_local(port, "/_markview/review.js"),
+        http_get_local(port, "/sample.md"),
+        http_get_local(port, &format!("{api}/documents")),
+        http_get_local(port, &format!("{api}/document?doc=%2Fsample.md")),
+        http_get_local(port, &format!("{api}/annotations?doc=%2Fsample.md")),
+        http_get_local(port, &format!("{api}/review")),
+        http_get_local(port, &format!("{api}/nope")),
+        post_form(port, &format!("{api}/annotations"), "", "op=add"),
+        post_form(
+            port,
+            &format!("{api}/annotations"),
+            &format!("Authorization: Bearer {}", test_token("b2")),
+            "op=add",
+        ),
+        post_form(
+            port,
+            &format!("{api}/annotations"),
+            &bearer,
+            "op=add&body=x",
+        ),
+        post_form(
+            port,
+            &format!("{api}/annotations"),
+            &bearer,
+            &format!("op=add&doc=%2Fsample.md&body=Fine&source_revision={revision}"),
+        ),
+    ];
+    responses.push(raw_http(
+        port,
+        &format!("POST {api}/annotations HTTP/1.1\r\nHost: localhost:{port}\r\nAuthorization: Bearer {token}\r\nAuthorization: Bearer {token}\r\n\r\n"),
+    ));
+    for response in &responses {
+        assert!(!response.contains(&token), "{response}");
+    }
+    assert!(!server.stderr_so_far().contains(&token));
 }

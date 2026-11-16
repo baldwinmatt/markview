@@ -30,26 +30,40 @@ pub fn token_variable_set() -> bool {
     token_variable().is_some()
 }
 
+/// Fewer distinct digits than this and a 64-digit token is not random: a
+/// repeated character or a short pattern. Random tokens fall below it with
+/// odds of about one in a hundred million.
+const MIN_DISTINCT_DIGITS: usize = 8;
+
+fn token_problem(value: &str) -> Option<&'static str> {
+    let valid = value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+    if !valid {
+        return Some("MARKVIEW_API_TOKEN must contain 64 lowercase hex digits");
+    }
+    let mut seen = [false; 128];
+    value
+        .bytes()
+        .for_each(|byte| seen[usize::from(byte)] = true);
+    (seen.iter().filter(|seen| **seen).count() < MIN_DISTINCT_DIGITS).then_some(
+        "MARKVIEW_API_TOKEN is too predictable: use 64 random hex digits, for example `openssl rand -hex 32`",
+    )
+}
+
 pub fn configured_token() -> io::Result<Option<String>> {
     let Some(value) = token_variable() else {
         return Ok(None);
     };
-    value
+    let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+    let value = value
         .into_string()
-        .ok()
-        .filter(|value| {
-            value.len() == 64
-                && value
-                    .bytes()
-                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-        })
-        .map(Some)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "MARKVIEW_API_TOKEN must contain 64 lowercase hex digits",
-            )
-        })
+        .map_err(|_| invalid("MARKVIEW_API_TOKEN must contain 64 lowercase hex digits"))?;
+    match token_problem(&value) {
+        Some(message) => Err(invalid(message)),
+        None => Ok(Some(value)),
+    }
 }
 
 pub fn catalog(config: &ServeConfig) -> String {
@@ -58,8 +72,9 @@ pub fn catalog(config: &ServeConfig) -> String {
         .map_or_else(|| "null".to_owned(), |doc| json_string(&doc.route_path));
     let access = config.session.api_access();
     let (can_annotate, can_finish) = (access.is_some(), access.is_some_and(|a| a.finish));
+    let mode = config.session.mode();
     let mut body = format!(
-        r#"{{"api_version":{API_VERSION},"default_document":{default},"can_annotate":{can_annotate},"can_finish":{can_finish},"documents":["#
+        r#"{{"api_version":{API_VERSION},"mode":"{mode}","default_document":{default},"can_annotate":{can_annotate},"can_finish":{can_finish},"documents":["#
     );
     for (index, doc) in config.documents.iter().enumerate() {
         if index > 0 {

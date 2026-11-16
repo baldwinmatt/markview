@@ -107,7 +107,7 @@ API uses the server's document allowlist and requires a `Host` of
 
 | Method and path relative to the API base | Response or operation |
 | --- | --- |
-| `GET /documents` | `api_version` (`1`), `documents` in served order, each with its `route`, `default_document` (a route), and the `can_annotate` and `can_finish` flags. |
+| `GET /documents` | `api_version` (`1`), `mode`, `documents` in served order, each with its `route`, `default_document` (a route), and the `can_annotate` and `can_finish` flags. |
 | `GET /document?doc=…` | `route`, current `title`, raw `markdown`, `source_revision`, and `projected_text` for anchoring comments. Sends an `ETag`. |
 | `GET /annotations?doc=…` | `source_revision`, `store_revision`, and `annotations`, open and resolved. Each has `id`, `status`, `body`, `quote`, `lines`, `section`, `attached`, `range` and `client_id`. |
 | `POST /annotations` | Add, edit, resolve or delete a saved comment. Returns the updated annotation response. |
@@ -137,6 +137,19 @@ random 64-character lowercase hex string (for example, generate it with
 token. All POST requests use `Authorization: Bearer <token>` and
 `application/x-www-form-urlencoded` bodies. An empty variable counts as unset;
 any other malformed value stops the server at startup.
+
+The token protects against local web attackers: a hostile page in your
+browser, DNS rebinding and other sites' scripts, none of which can read it
+or send it. Other processes of the same user are out of scope, since they can
+read the server's environment and your files anyway. Because every server
+started with the variable accepts it, and it authorizes the human verdict,
+generate a fresh token for each run, for example
+`MARKVIEW_API_TOKEN=$(openssl rand -hex 32) markview --review docs/`. A token
+with fewer than 8 distinct digits (all zeros, a repeated pair) is refused at
+startup.
+
+The catalog's `mode` is `serve`, `annotate` or `review`, so a client can tell
+a read-only `--serve` from a `--review` that has no token.
 
 `can_annotate` and `can_finish` report what this server accepts from the
 caller: `can_annotate` is `true` when a credential was configured and the

@@ -3020,6 +3020,7 @@ fn serve_mode_daemon_passes_annotate_to_the_background_server() {
     let file = dir.path().join("README.md");
     std::fs::write(&file, "# Daemonized\n").unwrap();
     let output = std::process::Command::new(cargo_bin("markview"))
+        .env_remove("MARKVIEW_API_TOKEN")
         .current_dir(dir.path())
         .args(["--serve", "--annotate", "--daemon", "--port", "0"])
         .arg(&file)
@@ -3130,7 +3131,7 @@ impl ServeProcess {
         annotate: bool,
     ) -> Result<Self, String> {
         let mut cmd = std::process::Command::new(cargo_bin("markview"));
-        cmd.arg("--serve");
+        cmd.env_remove("MARKVIEW_API_TOKEN").arg("--serve");
         if annotate {
             cmd.arg("--annotate");
         }
@@ -3621,6 +3622,7 @@ fn agent_api_saves_revision_bound_comments_and_finishes_a_review() {
 
 fn start_review_of(cwd: &std::path::Path, input: &str, options: &[&str]) -> ServeProcess {
     let child = std::process::Command::new(cargo_bin("markview"))
+        .env_remove("MARKVIEW_API_TOKEN")
         .current_dir(cwd)
         .args(["--review", "--no-open", input])
         .args(options)
@@ -3678,6 +3680,7 @@ fn start_review_with_fd_limit(
 ) -> Option<ServeProcess> {
     let spare = if spare { "exec 9</dev/null; " } else { "" };
     let child = std::process::Command::new("sh")
+        .env_remove("MARKVIEW_API_TOKEN")
         .current_dir(cwd)
         .arg("-c")
         .arg(format!(
@@ -4054,4 +4057,112 @@ fn api_write_waiting_on_a_store_lock_does_not_stall_a_rescan_or_other_requests()
     assert!(std::fs::read_to_string(store.join("README.md"))
         .unwrap()
         .contains("Queued"));
+}
+
+fn serve_annotate_command(dir: &std::path::Path, args: &[&str]) -> std::process::Command {
+    let mut cmd = std::process::Command::new(cargo_bin("markview"));
+    cmd.args(args).args(["--port", "0"]).arg(dir);
+    cmd
+}
+
+/// Polls the server's stderr until it contains `needle`.
+fn stderr_within(server: &ServeProcess, needle: &str, limit: Duration) -> bool {
+    let until = Instant::now() + limit;
+    while Instant::now() < until {
+        if server.stderr_so_far().contains(needle) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    server.stderr_so_far().contains(needle)
+}
+
+#[test]
+fn an_empty_api_token_variable_counts_as_unset() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.md"), "# A\n").unwrap();
+    let mut cmd = serve_annotate_command(dir.path(), &["--serve", "--annotate"]);
+    cmd.env("MARKVIEW_API_TOKEN", "");
+    let server = ServeProcess::launch(cmd).unwrap();
+    let catalog = http_get_local(server.port, "/_markview/api/v1/documents");
+    assert!(catalog.contains(r#""can_annotate":false"#), "{catalog}");
+    assert!(!server.stderr_so_far().contains("MARKVIEW_API_TOKEN"));
+}
+
+#[test]
+fn a_malformed_api_token_stops_annotate_and_review_with_a_clear_message() {
+    use std::os::unix::ffi::OsStringExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.md"), "# A\n").unwrap();
+    let bad: Vec<std::ffi::OsString> = vec![
+        "A1".repeat(32).into(),
+        format!("{}a", "a1".repeat(31)).into(),
+        "zz".repeat(32).into(),
+        "a1".repeat(33).into(),
+        std::ffi::OsString::from_vec(vec![0xff; 64]),
+    ];
+    for value in &bad {
+        for mode in [["--serve", "--annotate"], ["--review", "--no-open"]] {
+            let output = serve_annotate_command(dir.path(), &mode)
+                .env("MARKVIEW_API_TOKEN", value)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{value:?} {mode:?}: {stderr}"
+            );
+            assert!(
+                stderr.contains("MARKVIEW_API_TOKEN must contain 64 lowercase hex digits"),
+                "{stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn startup_says_whether_api_writes_are_enabled_or_the_token_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.md"), "# A\n").unwrap();
+    let token = "a1".repeat(32);
+
+    let mut cmd = serve_annotate_command(dir.path(), &["--serve", "--annotate"]);
+    cmd.env("MARKVIEW_API_TOKEN", &token);
+    let server = ServeProcess::launch(cmd).unwrap();
+    assert!(stderr_within(
+        &server,
+        "API writes enabled",
+        Duration::from_secs(5)
+    ));
+    assert!(!server.stderr_so_far().contains(&token));
+
+    // Plain --serve ignores the variable, even a malformed one.
+    let mut cmd = serve_annotate_command(dir.path(), &["--serve"]);
+    cmd.env("MARKVIEW_API_TOKEN", "bad");
+    let server = ServeProcess::launch(cmd).unwrap();
+    assert!(stderr_within(
+        &server,
+        "MARKVIEW_API_TOKEN is set but ignored",
+        Duration::from_secs(5)
+    ));
+}
+
+#[test]
+fn disabled_api_writes_say_how_to_enable_them() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.md"), "# A\n").unwrap();
+    let server = ServeProcess::start(&dir.path().join("a.md"));
+    let port = server.port;
+    let response = raw_http(
+        port,
+        &format!("POST /_markview/api/v1/annotations HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    assert!(
+        response.contains(
+            "API writes are disabled: set MARKVIEW_API_TOKEN and use --annotate or --review"
+        ),
+        "{response}"
+    );
 }

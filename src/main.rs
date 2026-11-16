@@ -452,6 +452,7 @@ fn serve_markdown(
     if annotate {
         config.session.api_token = serve_api::configured_token()?;
     }
+    let api_writes = config.session.api_token.is_some();
     // Said once, at startup: a rescan builds a fresh config but stays quiet.
     for directory in &config.reserved {
         eprintln!(
@@ -493,6 +494,14 @@ fn serve_markdown(
     } else {
         println!("Serving on http://localhost:{bound_port} — press Ctrl+C to stop");
         io::stdout().flush()?;
+    }
+    if api_writes {
+        eprintln!("markview: API writes enabled ({})", serve_api::TOKEN_ENV);
+    } else if !annotate && serve_api::token_variable_set() {
+        eprintln!(
+            "markview: {} is set but ignored: API writes need --annotate or --review",
+            serve_api::TOKEN_ENV
+        );
     }
 
     if open {

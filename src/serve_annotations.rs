@@ -450,7 +450,8 @@ pub fn handle(
     let body = if request.method == "POST" {
         if api.is_some() {
             let Some(expected) = initial.session.api_token.as_deref() else {
-                return fail(stream, "403 Forbidden", "API writes are disabled");
+                return fail(stream, "403 Forbidden", "API writes are disabled: set MARKVIEW_API_TOKEN and use --annotate or --review",
+                );
             };
             let presented = request
                 .header("authorization")

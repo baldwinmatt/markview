@@ -8,8 +8,18 @@ use super::{title_for_source, validated_served_path, ServeConfig, ServedDocument
 pub const PREFIX: &str = "/_markview/api/v1/";
 pub const TOKEN_ENV: &str = "MARKVIEW_API_TOKEN";
 
+/// The variable's value, with an empty one counting as unset.
+fn token_variable() -> Option<std::ffi::OsString> {
+    std::env::var_os(TOKEN_ENV).filter(|value| !value.is_empty())
+}
+
+/// Whether the environment names a token at all, valid or not.
+pub fn token_variable_set() -> bool {
+    token_variable().is_some()
+}
+
 pub fn configured_token() -> io::Result<Option<String>> {
-    let Some(value) = std::env::var_os(TOKEN_ENV) else {
+    let Some(value) = token_variable() else {
         return Ok(None);
     };
     value

@@ -990,6 +990,32 @@ impl ServeConfig {
             .find(|document| document.route_path == route)
     }
 
+    /// The served document a route names, with `/` naming the default page.
+    /// A route is a key into the served allowlist: it is compared as sent
+    /// and never joined to a path, so another spelling of it names nothing.
+    fn document_for_route(&self, route: &str) -> Option<&ServedDocument> {
+        if route == "/" {
+            self.default_document()
+        } else {
+            self.document_by_route(route)
+        }
+    }
+
+    /// Where `document` and its annotation store are, provided it is still
+    /// the file that was allowlisted: the same canonical path under the
+    /// root, not a symlink that now leads somewhere else. Everything that
+    /// reads or writes a review for a served document starts here.
+    fn served_location(&self, document: &ServedDocument) -> io::Result<annotations::Location> {
+        let path = validated_served_path(&self.root, &document.source_path)
+            .filter(|path| path == &document.source_path)
+            .ok_or_else(|| io::Error::other("served document is unavailable"))?;
+        let location = annotations::resolve(&path)?;
+        if location.document != path {
+            return Err(io::Error::other("served document changed location"));
+        }
+        Ok(location)
+    }
+
     fn document_route_for_path(&self, path: &Path) -> Option<&str> {
         self.documents
             .iter()

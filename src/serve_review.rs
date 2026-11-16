@@ -1,7 +1,5 @@
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
@@ -9,7 +7,7 @@ use std::time::SystemTime;
 
 use markview::annotations::{self, Error, Location, Review, Status, TextProjection};
 
-use super::{format_annotations, validated_served_path, ServeConfig, ServedDocument};
+use super::{format_annotations, ServeConfig, ServedDocument};
 
 pub const ENDPOINT: &str = "/_markview/review";
 const CHANGED: Error =
@@ -359,12 +357,13 @@ impl Session {
         if fields.remove("op").as_deref() != Some("finish") || !fields.is_empty() {
             return Err(invalid);
         }
-        let page = if doc == "/" {
-            config.default_document()
-        } else {
-            config.document_by_route(&doc)
-        }
-        .ok_or(CHANGED)?;
+        // The same check a page's annotations go through: a route that is
+        // not on the allowlist, or whose file is no longer the one that was
+        // allowlisted, is not a page a verdict can be given from.
+        let page = config
+            .document_for_route(&doc)
+            .filter(|page| config.served_location(page).is_ok())
+            .ok_or(CHANGED)?;
         let snapshot = Snapshot::capture(config)?;
         if snapshot.revision != wanted_revision
             || !snapshot.documents.iter().any(|doc| {
@@ -519,10 +518,8 @@ fn store_problem(
     )
 }
 
-/// Where a served document and its store are, if the document is still the
-/// file that was allowlisted.
 fn locate(config: &ServeConfig, doc: &ServedDocument) -> Result<Location, Error> {
-    let unavailable = |error: io::Error| {
+    config.served_location(doc).map_err(|error| {
         DocumentProblem::wrap(
             config,
             doc,
@@ -531,17 +528,7 @@ fn locate(config: &ServeConfig, doc: &ServedDocument) -> Result<Location, Error>
             error.into(),
             UNREADABLE,
         )
-    };
-    let path = validated_served_path(&config.root, &doc.source_path)
-        .filter(|path| path == &doc.source_path)
-        .ok_or_else(|| unavailable(io::Error::other("served document is unavailable")))?;
-    let location = annotations::resolve(&path).map_err(unavailable)?;
-    if location.document != path {
-        return Err(unavailable(io::Error::other(
-            "served document changed location",
-        )));
-    }
-    Ok(location)
+    })
 }
 
 fn read_located(
@@ -582,17 +569,41 @@ fn document_revisions(config: &ServeConfig, doc: &ServedDocument) -> Result<Revi
     ))
 }
 
+/// The review revision: one digest over the default page, the served routes
+/// and paths in served order, and each document's source and store revision.
+///
+/// It is opaque and lives only inside one process: a page reads it from the
+/// summary and hands it back with the verdict. It still uses the module's
+/// FNV-1a digest, like every other revision, instead of `DefaultHasher`,
+/// whose output Rust does not promise to keep.
 fn collection_revision(
     config: &ServeConfig,
     revisions: impl Iterator<Item = Result<Revisions, Error>>,
 ) -> Result<String, Error> {
-    let mut hash = DefaultHasher::new();
-    config.default_document.hash(&mut hash);
-    config.documents.len().hash(&mut hash);
+    let mut fields = vec![
+        config
+            .default_document
+            .as_os_str()
+            .as_encoded_bytes()
+            .to_vec(),
+        config.documents.len().to_string().into_bytes(),
+    ];
     for (doc, revisions) in config.documents.iter().zip(revisions) {
-        (&doc.route_path, &doc.source_path, revisions?).hash(&mut hash);
+        let (source, store) = revisions?;
+        fields.extend([
+            doc.route_path.clone().into_bytes(),
+            doc.source_path.as_os_str().as_encoded_bytes().to_vec(),
+            source.into_bytes(),
+            store.into_bytes(),
+        ]);
     }
-    Ok(format!("{:016x}", hash.finish()))
+    // No field can hold a NUL (a path, a route, digits), so one after each
+    // keeps two different lists of fields from spelling the same bytes.
+    let parts: Vec<&[u8]> = fields
+        .iter()
+        .flat_map(|field| [field.as_slice(), &[0][..]])
+        .collect();
+    Ok(annotations::revision(&parts))
 }
 
 #[cfg(test)]
@@ -789,6 +800,36 @@ mod tests {
             summary.join().unwrap().unwrap();
             assert!(admitted.is_ok(), "the save queued behind the summary");
         });
+    }
+
+    #[test]
+    fn review_revision_follows_the_collection_and_nothing_else() {
+        let fixture = Fixture::new();
+        let explicit = |files: &[&PathBuf]| {
+            let files = files.iter().map(|file| (*file).clone()).collect();
+            let config = ServeConfig::from_inputs(files, 0, false).unwrap();
+            Snapshot::capture(&config).unwrap().revision
+        };
+        let both = explicit(&[&fixture.first, &fixture.nested]);
+        // A digest in the form of every other revision, the same each time.
+        assert_eq!(both.len(), 16);
+        assert!(both
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')));
+        assert_eq!(both, explicit(&[&fixture.first, &fixture.nested]));
+        // Which documents are served, in which order, and which is the
+        // default page are all part of what the reviewer confirmed.
+        let reversed = explicit(&[&fixture.nested, &fixture.first]);
+        let one = explicit(&[&fixture.first]);
+        assert_ne!(both, reversed);
+        assert_ne!(both, one);
+        assert_ne!(reversed, one);
+        // So is every document's source and store.
+        fs::write(&fixture.nested, "# Next, edited\n").unwrap();
+        let edited = explicit(&[&fixture.first, &fixture.nested]);
+        assert_ne!(both, edited);
+        Fixture::write_store(&fixture.first, "## a1 [open] document\n\nNew\n");
+        assert_ne!(edited, explicit(&[&fixture.first, &fixture.nested]));
     }
 
     #[test]

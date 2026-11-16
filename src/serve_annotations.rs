@@ -9,8 +9,8 @@ use markview::annotations::{self, Error, Request, FORM_CAP};
 use markview::DestinationKind;
 
 use super::{
-    broadcast_reload, decode_repeated, serve_review, validated_served_path, write_response_headers,
-    Clients, ReloadKind, ServeConfig, SharedConfig, WATCH_DEBOUNCE,
+    broadcast_reload, decode_repeated, serve_review, write_response_headers, Clients, ReloadKind,
+    ServeConfig, SharedConfig, WATCH_DEBOUNCE,
 };
 
 const ENDPOINT: &str = "/_markview/annotations";
@@ -257,31 +257,10 @@ impl HttpRequest {
     }
 }
 
-/// The served document a route names. Routes are generated from the served
-/// allowlist, never joined to a path.
-fn served<'a>(config: &'a ServeConfig, route: &str) -> Option<&'a super::ServedDocument> {
-    if route == "/" {
-        config.default_document()
-    } else {
-        config.document_by_route(route)
-    }
-}
-
 fn document(config: &ServeConfig, route: &str) -> Option<annotations::Location> {
-    location(config, served(config, route)?)
-}
-
-fn location(
-    config: &ServeConfig,
-    document: &super::ServedDocument,
-) -> Option<annotations::Location> {
-    let canonical = validated_served_path(&config.root, &document.source_path)?;
-    if canonical != document.source_path {
-        return None;
-    }
-    annotations::resolve(&canonical)
+    config
+        .served_location(config.document_for_route(route)?)
         .ok()
-        .filter(|location| location.document == canonical)
 }
 
 /// The review a page asks for when it loads. A failure names the document
@@ -292,16 +271,16 @@ fn page_review(
     document: &super::ServedDocument,
 ) -> Result<annotations::Review, Error> {
     use serve_review::DocumentProblem;
-    let Some(location) = location(config, document) else {
-        return Err(DocumentProblem::wrap(
+    let location = config.served_location(document).map_err(|error| {
+        DocumentProblem::wrap(
             config,
             document,
             "document",
             &document.source_path,
-            io::Error::from(io::ErrorKind::NotFound).into(),
+            error.into(),
             "404 Not Found",
-        ));
-    };
+        )
+    })?;
     let source = annotations::read_source(&location).map_err(|error| {
         DocumentProblem::wrap(
             config,
@@ -485,7 +464,7 @@ pub fn handle(
             else {
                 return fail(stream, "400 Bad Request", "expected a document route");
             };
-            let Some(document) = served(&initial, &route) else {
+            let Some(document) = initial.document_for_route(&route) else {
                 return fail(
                     stream,
                     "404 Not Found",
@@ -564,53 +543,66 @@ fn respond_error(
     }
 }
 
-/// The review script and stylesheet, served from the reserved prefix so the
-/// browser caches them instead of every page carrying ~18 KB inline.
-pub fn static_asset(target: &str) -> Option<(&'static str, &'static str)> {
-    match target.split('?').next() {
-        Some("/_markview/review.js") => {
-            Some(("text/javascript; charset=utf-8", annotations::REVIEW_SCRIPT))
-        }
-        Some("/_markview/review.css") => {
-            Some(("text/css; charset=utf-8", annotations::REVIEW_STYLE))
-        }
-        Some("/_markview/copy.js") => {
-            Some(("text/javascript; charset=utf-8", annotations::COPY_SCRIPT))
-        }
-        Some("/_markview/copy.css") => Some(("text/css; charset=utf-8", annotations::COPY_STYLE)),
-        Some("/_markview/verdict.js") => Some(("text/javascript; charset=utf-8", VERDICT_SCRIPT)),
-        _ => None,
-    }
-}
+const SCRIPT: &str = "text/javascript; charset=utf-8";
+const STYLE: &str = "text/css; charset=utf-8";
 
-const VERDICT_SCRIPT: &str = include_str!("annotations/verdict.js");
+/// Every static asset under the reserved prefix: its route, media type and
+/// body. This table is the only list of them. It decides what is served,
+/// what each `?v=` digest covers, and what the browser harness inlines, so
+/// an asset added here is served and versioned without another edit.
+const ASSETS: &[Asset] = &[
+    ("/_markview/review.js", SCRIPT, annotations::REVIEW_SCRIPT),
+    ("/_markview/review.css", STYLE, annotations::REVIEW_STYLE),
+    ("/_markview/verdict.js", SCRIPT, annotations::VERDICT_SCRIPT),
+    ("/_markview/copy.js", SCRIPT, annotations::COPY_SCRIPT),
+    ("/_markview/copy.css", STYLE, annotations::COPY_STYLE),
+];
+
+type Asset = (&'static str, &'static str, &'static str);
+
+/// Served from the reserved prefix so the browser caches each asset instead
+/// of every page carrying it inline.
+pub fn static_asset(target: &str) -> Option<(&'static str, &'static str)> {
+    let path = target.split('?').next()?;
+    ASSETS
+        .iter()
+        .find(|(route, ..)| *route == path)
+        .map(|(_, mime, body)| (*mime, *body))
+}
 
 /// The URLs carry a digest of the content, so a response can be cached for
 /// good and a new markview build is still picked up at once.
 pub const STATIC_CACHE: &str = "Cache-Control: public, max-age=31536000, immutable\r\n";
 
-fn digest(bodies: &[&str]) -> String {
+/// Whether an asset belongs to the copy controls. Every page links those,
+/// and only pages with review hooks link the rest.
+fn copy_asset(route: &str) -> bool {
+    route.starts_with("/_markview/copy.")
+}
+
+/// The digest shared by the copy assets (`copy`) or by the review assets.
+/// The two are versioned apart: a digest that covered both would change the
+/// bytes of a plain page whenever review.js, review.css or verdict.js is
+/// edited.
+fn digest(assets: &[Asset], copy: bool) -> String {
+    let bodies: Vec<&str> = assets
+        .iter()
+        .filter(|(route, ..)| copy_asset(route) == copy)
+        .map(|(.., body)| *body)
+        .collect();
     annotations::source_revision(&bodies.concat())
 }
 
-/// Versions the review assets. Only pages that carry review hooks link them.
-fn static_version() -> &'static str {
-    static VERSION: OnceLock<String> = OnceLock::new();
-    VERSION.get_or_init(|| {
-        digest(&[
-            annotations::REVIEW_SCRIPT,
-            annotations::REVIEW_STYLE,
-            VERDICT_SCRIPT,
-        ])
-    })
-}
-
-/// Versions the copy assets on their own. Every page links them, so a digest
-/// that also covered the review scripts would change the bytes of a plain
-/// page whenever review.js, review.css or verdict.js is edited.
-fn copy_version() -> &'static str {
-    static VERSION: OnceLock<String> = OnceLock::new();
-    VERSION.get_or_init(|| digest(&[annotations::COPY_SCRIPT, annotations::COPY_STYLE]))
+/// The versioned URL a page links `route` with. Only assets in the table
+/// can be linked.
+fn asset_url(route: &str) -> String {
+    static VERSIONS: OnceLock<[String; 2]> = OnceLock::new();
+    assert!(
+        ASSETS.iter().any(|(known, ..)| *known == route),
+        "{route} is not a static asset"
+    );
+    let versions = VERSIONS.get_or_init(|| [digest(ASSETS, false), digest(ASSETS, true)]);
+    format!("{route}?v={}", versions[usize::from(copy_asset(route))])
 }
 
 /// What a page needs to show annotations: the cached stylesheet and script,
@@ -623,31 +615,36 @@ pub fn hooks(
     nonce_attr: &str,
     blocking: bool,
 ) -> String {
-    let version = static_version();
     let verdict = if blocking {
-        format!(r#"<script{nonce_attr} src="/_markview/verdict.js?v={version}"></script>"#)
+        format!(
+            r#"<script{nonce_attr} src="{}"></script>"#,
+            asset_url("/_markview/verdict.js")
+        )
     } else {
         String::new()
     };
     format!(
-        "<link rel=\"stylesheet\" href=\"/_markview/review.css?v={version}\">
-<script{nonce_attr} src=\"/_markview/review.js?v={version}\"></script>
+        "<link rel=\"stylesheet\" href=\"{}\">
+<script{nonce_attr} src=\"{}\"></script>
 {verdict}
 <script{nonce_attr}>(() => {{
   const route = {};
   const token = {};
   markviewServeReview(route, token, {port}, {blocking});
 }})();</script>",
+        asset_url("/_markview/review.css"),
+        asset_url("/_markview/review.js"),
         annotations::json_string(route),
         token.map_or("null".to_owned(), annotations::json_string),
     )
 }
 
 pub fn copy_hooks(nonce_attr: &str) -> String {
-    let version = copy_version();
     format!(
-        r#"<link rel="stylesheet" href="/_markview/copy.css?v={version}">
-<script{nonce_attr} src="/_markview/copy.js?v={version}"></script>"#
+        r#"<link rel="stylesheet" href="{}">
+<script{nonce_attr} src="{}"></script>"#,
+        asset_url("/_markview/copy.css"),
+        asset_url("/_markview/copy.js"),
     )
 }
 
@@ -1057,6 +1054,124 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn finish_and_annotations_refuse_the_same_document_routes() {
+        let server = LocalReview::start(64, |_| {});
+        let finish = |doc: &str| {
+            let form = format!(
+                "op=finish&verdict=approved&review_revision=unconfirmed&doc={doc}&source_revision=none"
+            );
+            server.response("POST /_markview/review", Some(&form)).0
+        };
+        let list = |doc: &str| {
+            server
+                .response(&format!("GET /_markview/annotations?doc={doc}"), None)
+                .0
+        };
+        let add = |doc: &str| {
+            let form = format!("op=edit&id=a1&store_revision=none&body=x&doc={doc}");
+            server
+                .response("POST /_markview/annotations", Some(&form))
+                .0
+        };
+        // Both endpoints take a route as an allowlist key. A route that is
+        // spelled another way is not the key: neither endpoint resolves it.
+        // What differs is only how each one says no: the annotations of an
+        // unknown document are not found, and a finish for one is a conflict
+        // that sends the page back to the collection.
+        for alias in [
+            "/./doc.md",
+            "/doc.md/",
+            "//doc.md",
+            "doc.md",
+            "/DOC.md",
+            "/sub/../doc.md",
+            "/doc.md%3Fx",
+            "/other.md",
+        ] {
+            assert_eq!(list(alias), "HTTP/1.1 404 Not Found", "{alias}");
+            assert_eq!(add(alias), "HTTP/1.1 404 Not Found", "{alias}");
+            assert_eq!(finish(alias), "HTTP/1.1 409 Conflict", "{alias}");
+        }
+        // The real routes are known to both. (The revisions above are not
+        // the confirmed ones, so the finish is still a conflict; the edit
+        // finds no store to change.)
+        for route in ["/", "/doc.md"] {
+            assert_eq!(list(route), "HTTP/1.1 200 OK", "{route}");
+            assert_eq!(add(route), "HTTP/1.1 409 Conflict", "{route}");
+        }
+
+        // The served file becomes a symlink to a file outside the collection.
+        // Its route is still on the allowlist, but it no longer names the
+        // file that was allowlisted, and both endpoints say what they say
+        // for a route they do not know.
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("elsewhere.md");
+        std::fs::write(&target, "# Elsewhere\n").unwrap();
+        let served = server.shared.read().unwrap().documents[0]
+            .source_path
+            .clone();
+        std::fs::remove_file(&served).unwrap();
+        std::os::unix::fs::symlink(&target, &served).unwrap();
+        for route in ["/", "/doc.md"] {
+            assert_eq!(list(route), "HTTP/1.1 404 Not Found", "{route}");
+            assert_eq!(add(route), "HTTP/1.1 404 Not Found", "{route}");
+            assert_eq!(finish(route), "HTTP/1.1 409 Conflict", "{route}");
+        }
+    }
+
+    #[test]
+    fn every_static_asset_is_served_linked_and_part_of_its_own_digest() {
+        let (page, _) = review_page();
+        let plain = copy_hooks("");
+        for asset @ (route, mime, body) in ASSETS {
+            // Served, whatever version the URL carries.
+            assert_eq!(static_asset(route), Some((*mime, *body)));
+            assert_eq!(
+                static_asset(&format!("{route}?v=0123456789abcdef")),
+                Some((*mime, *body))
+            );
+            // Linked from a review page with its digest, and from a plain
+            // page only if it is one of the copy assets.
+            let copy = copy_asset(route);
+            let url = asset_url(route);
+            assert!(page.contains(&format!("\"{url}\"")), "{url}");
+            assert_eq!(plain.contains(&format!("\"{url}\"")), copy, "{url}");
+            assert!(url.ends_with(&format!("?v={}", digest(ASSETS, copy))));
+            // Part of that digest: without it, or with one more byte in it,
+            // the digest differs. The other group's digest never notices.
+            let without: Vec<Asset> = ASSETS
+                .iter()
+                .filter(|other| other != &asset)
+                .copied()
+                .collect();
+            let longer: &'static str = String::leak(format!("{body}\n"));
+            let edited: Vec<Asset> = ASSETS
+                .iter()
+                .map(|other| {
+                    if other == asset {
+                        (*route, *mime, longer)
+                    } else {
+                        *other
+                    }
+                })
+                .collect();
+            for changed in [&without, &edited] {
+                assert_ne!(digest(changed, copy), digest(ASSETS, copy), "{route}");
+                assert_eq!(digest(changed, !copy), digest(ASSETS, !copy), "{route}");
+            }
+        }
+        // A new review asset is versioned by being in the table, and leaves
+        // the copy digest, and so every plain page, as it was.
+        let mut more = ASSETS.to_vec();
+        more.push(("/_markview/review-extra.js", SCRIPT, "// new"));
+        assert_ne!(digest(&more, false), digest(ASSETS, false));
+        assert_eq!(digest(&more, true), digest(ASSETS, true));
+        assert_eq!(static_asset("/_markview/review-extra.js"), None);
+        assert_eq!(static_asset("/_markview/"), None);
+    }
+
     #[test]
     fn token_comparison_examines_every_byte() {
         let token = "0123456789abcdef".repeat(3);
@@ -1130,8 +1245,8 @@ mod tests {
 
         // The review script is linked, with the nonce, not inlined.
         assert!(html.contains(&format!(
-            r#"<script nonce="{nonce}" src="/_markview/review.js?v={}"></script>"#,
-            static_version()
+            r#"<script nonce="{nonce}" src="{}"></script>"#,
+            asset_url("/_markview/review.js")
         )));
         // For a look at the harness in a browser window.
         if let Some(path) = std::env::var_os("MARKVIEW_REVIEW_BROWSER_FIXTURE") {
@@ -1161,35 +1276,24 @@ window.EventSource = class extends EventTarget {{
 <script>window.untrustedScriptRan = true;</script>"#
         );
         let mut html = html.replacen("<head>", &format!("<head>{setup}"), 1);
-        for (name, source) in [
-            ("copy.js", annotations::COPY_SCRIPT),
-            ("review.js", annotations::REVIEW_SCRIPT),
-            ("verdict.js", VERDICT_SCRIPT),
-        ] {
-            let version = if name == "copy.js" {
-                copy_version()
+        // Every asset the page links, inlined: a file has no server to ask.
+        // Stylesheets too, so the page is laid out as a served one is.
+        for (route, mime, body) in ASSETS {
+            let url = asset_url(route);
+            let name = route.rsplit('/').next().unwrap();
+            let (link, inline) = if *mime == SCRIPT {
+                (
+                    format!(r#"<script nonce="{nonce}" src="{url}"></script>"#),
+                    format!(r#"<script nonce="{nonce}">{body}</script>"#),
+                )
             } else {
-                static_version()
+                (
+                    format!(r#"<link rel="stylesheet" href="{url}">"#),
+                    format!(r#"<style data-markview-style="{name}">{body}</style>"#),
+                )
             };
-            let link =
-                format!(r#"<script nonce="{nonce}" src="/_markview/{name}?v={version}"></script>"#);
-            assert!(html.contains(&link), "{name} is not linked");
-            html = html.replace(
-                &link,
-                &format!(r#"<script nonce="{nonce}">{source}</script>"#),
-            );
-        }
-        // The stylesheets too, so the page is laid out as a served one is.
-        for (name, version, source) in [
-            ("review.css", static_version(), annotations::REVIEW_STYLE),
-            ("copy.css", copy_version(), annotations::COPY_STYLE),
-        ] {
-            let link = format!(r#"<link rel="stylesheet" href="/_markview/{name}?v={version}">"#);
-            assert!(html.contains(&link), "{name} is not linked");
-            html = html.replace(
-                &link,
-                &format!(r#"<style data-markview-style="{name}">{source}</style>"#),
-            );
+            assert!(html.contains(&link), "{route} is not linked");
+            html = html.replace(&link, &inline);
         }
         let harness = include_str!("../tests/review.browser.js");
         html.replace(

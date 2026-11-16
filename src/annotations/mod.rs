@@ -26,6 +26,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const REVIEW_SCRIPT: &str = include_str!("review.js");
 pub const REVIEW_STYLE: &str = include_str!("review.css");
+/// The verdict bar of `markview --review`, loaded after the review script.
+pub const VERDICT_SCRIPT: &str = include_str!("verdict.js");
 pub const COPY_SCRIPT: &str = include_str!("copy.js");
 pub const COPY_STYLE: &str = include_str!("copy.css");
 pub const FORM_CAP: usize = 160 * 1024;
@@ -73,7 +75,10 @@ pub fn random_hex() -> io::Result<String> {
 /// `source_revision` and `start` are persisted in git-tracked store files and
 /// trusted by `locate`, so the algorithm is fixed here instead of borrowing
 /// `std::hash::DefaultHasher`, which may change between Rust releases.
-fn revision(parts: &[&[u8]]) -> String {
+///
+/// The parts are hashed as one run of bytes. A caller whose parts could be
+/// split differently and still spell the same bytes separates them itself.
+pub fn revision(parts: &[&[u8]]) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in parts.iter().flat_map(|part| part.iter()) {
         hash ^= u64::from(*byte);

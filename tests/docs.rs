@@ -131,3 +131,49 @@ fn review_workflow_is_documented_for_reviewers_and_agents() {
     let roadmap = fs::read_to_string("ROADMAP.md").expect("read ROADMAP.md");
     assert!(roadmap.contains("[Review workflow specification](REVIEW_WORKFLOW_SPEC.md)"));
 }
+
+#[test]
+fn plain_page_claims_match_what_a_plain_page_carries() {
+    // A page without annotations is no longer the page served before
+    // annotations existed: it has copy controls, alert styles and a merged
+    // live-reload script. No document may still promise identical bytes.
+    for file in [
+        "ANNOTATIONS_SPEC.md",
+        "ARCHITECTURE.md",
+        "ANNOTATIONS_TICKETS.md",
+        "README.md",
+        "src/main.rs",
+        "src/serve_annotations.rs",
+    ] {
+        let text = fs::read_to_string(file).expect("read file").to_lowercase();
+        for (number, line) in text.lines().enumerate() {
+            let identical = ["byte-identi", "byte identi", "byte for byte"]
+                .iter()
+                .any(|claim| line.contains(claim))
+                || line.contains("exactly what") && line.contains("before annotations");
+            let lines: Vec<_> = text
+                .lines()
+                .skip(number.saturating_sub(1))
+                .take(3)
+                .collect();
+            assert!(
+                !(identical && lines.iter().any(|near| near.contains("annotation"))),
+                "{file}:{}: {line}",
+                number + 1
+            );
+        }
+    }
+    // What they say instead, and where the copy assets' own version is noted.
+    for file in ["ANNOTATIONS_SPEC.md", "ARCHITECTURE.md"] {
+        let text = fs::read_to_string(file).expect("read file");
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for claim in [
+            "carries no review machinery",
+            "copy controls, alert styles and live-reload shell",
+            "`tests/fixtures/serve-baseline.expected.html`",
+            "versioned independently",
+        ] {
+            assert!(text.contains(claim), "{file}: {claim}");
+        }
+    }
+}

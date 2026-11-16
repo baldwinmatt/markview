@@ -1825,8 +1825,9 @@ fn serve_document(
         .map(|_| annotations::random_hex())
         .transpose()?;
     // A page needs the review script when comments can be added to it
-    // (`--annotate`) or it already has some. Any other page is exactly what
-    // it was before annotations existed.
+    // (`--annotate`) or it already has some. Any other page carries no
+    // review machinery: its extras are the copy controls, alert styles and
+    // live-reload shell, pinned by tests/fixtures/serve-baseline.expected.html.
     let review = (config.session.review_token.is_some()
         || serve_annotations::has_store(&document.source_path))
     .then_some(ReviewHooks {
@@ -2208,6 +2209,9 @@ fn nav_layout_for(mode: ServeMode, document_count: usize) -> NavLayout {
     }
 }
 
+/// Wraps a rendered document in what every served page has: the navigation,
+/// the footer, the copy controls and the live-reload script. `review` adds
+/// the review hooks; without it the page carries no review machinery.
 fn inject_serve_shell(
     config: &ServeConfig,
     active_route: &str,

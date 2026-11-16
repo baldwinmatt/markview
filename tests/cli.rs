@@ -2171,7 +2171,7 @@ fn serve_mode_blocks_executable_destinations_but_keeps_data_images() {
     let server = ServeProcess::start_with_files(&[doc.as_path(), other.as_path()]);
     let page = http_get(server.port, "/");
 
-    // Byte for byte what the server rendered before annotations existed.
+    // Safe destinations are rendered as written, and document links rewritten.
     assert!(
         page.contains(concat!(
             r#"<p><a href="mailto:a@example.com">mail</a> <a href="tel:+15550100">phone</a> "#,
@@ -2472,8 +2472,10 @@ fn serve_annotations_delivers_the_error_when_rejecting_a_large_post() {
     assert!(!dir.path().join(".markview").exists());
 }
 
-/// A copy of `tests/fixtures/serve-baseline`, whose rendered default page
-/// with the copy controls and without annotation hooks is `tests/fixtures/serve-baseline.expected.html`.
+/// A copy of `tests/fixtures/serve-baseline`. Its default page, served
+/// without annotations, is `tests/fixtures/serve-baseline.expected.html`: no
+/// review machinery, only the copy controls, alert styles and live-reload
+/// shell.
 fn baseline_site() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let site = dir.path().join("site");
@@ -2535,6 +2537,38 @@ fn serve_page_without_annotations_matches_the_plain_page_fixture() {
     let (head, body) = response.split_once("\r\n\r\n").unwrap();
     assert_eq!(head, BASELINE_HEAD);
     assert_eq!(plain_page_body(body), BASELINE_BODY);
+}
+
+#[test]
+fn plain_page_carries_copy_controls_and_no_review_machinery() {
+    let (_dir, site) = baseline_site();
+    let server = ServeProcess::start_dir(&site);
+    let page = http_get(server.port, "/");
+    let (head, body) = page.split_once("\r\n\r\n").unwrap();
+    for review in [
+        "/_markview/review.js",
+        "/_markview/review.css",
+        "/_markview/verdict.js",
+        "markviewServeReview(",
+        "createMarkviewVerdict",
+        "data-source-revision",
+        "data-markview-route",
+        "nonce=",
+    ] {
+        assert!(!body.contains(review), "{review}");
+    }
+    // No token, so no policy and no nonce to carry.
+    assert!(!head.contains("Content-Security-Policy"), "{head}");
+    // Its extras: the copy controls, the alert styles, the live-reload shell.
+    assert_eq!(body.matches("/_markview/copy.css?v=").count(), 1);
+    assert_eq!(body.matches("/_markview/copy.js?v=").count(), 1);
+    assert!(body.contains(".markdown-alert-note"));
+    assert!(body.contains("new EventSource('/events')"));
+    assert_eq!(
+        body.matches("<script").count(),
+        2,
+        "copy.js and live reload"
+    );
 }
 
 #[test]

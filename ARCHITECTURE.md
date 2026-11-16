@@ -140,9 +140,13 @@ browser fails instead.
 
 A served page carries the review script only when it can use it: always with
 `--annotate`, otherwise only for a document that has a store. Any other page
-is byte-identical to the pre-annotation output, which
-`tests/fixtures/serve-baseline.expected.html` pins. The script and stylesheet
-are static, cacheable routes under the reserved `/_markview/` prefix. Both
+carries no review machinery; its extras are the copy controls, alert styles
+and live-reload shell, pinned by `tests/fixtures/serve-baseline.expected.html`.
+The scripts and stylesheets are static, cacheable routes under the reserved
+`/_markview/` prefix, each linked with a digest of its content. The copy
+assets are versioned independently of the review assets: their digest covers
+`copy.js` and `copy.css` alone, so editing `review.js`, `review.css` or
+`verdict.js` leaves the bytes of a plain page unchanged. Both
 frontends use the same directory watch planner to observe creation,
 replacement, deletion, and changes in store precedence. Serve starts watching
 a document's store the first time the document is served and blocks on watch

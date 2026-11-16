@@ -295,8 +295,9 @@ struct ServeConfig {
     documents: Vec<ServedDocument>,
     default_document: PathBuf,
     port: u16,
-    review_token: Option<String>,
-    blocking_review: bool,
+    /// What was decided when the server started. A rescan builds a fresh
+    /// config and carries this across whole.
+    session: ServeSession,
     /// Projections and resolved reviews of recently requested documents.
     review_cache: annotations::ReviewCache,
     /// What the blocking review's verdict bar shows for the collection.
@@ -304,7 +305,6 @@ struct ServeConfig {
     /// Directories under the root that are not served because their route
     /// would fall under the reserved `/_markview/` prefix.
     reserved: Vec<PathBuf>,
-    rescan_id: u64,
     mode: ServeMode,
     sidebar_nav: Option<NavDir>,
     /// Memoized `scan_assets()` result, invalidated by comparing each served
@@ -313,6 +313,19 @@ struct ServeConfig {
     /// `SharedConfig`), so this only needs to survive edits to already-known
     /// documents within one config generation, not additions/removals.
     asset_cache: Mutex<Option<AssetCache>>,
+}
+
+/// The part of a `ServeConfig` that belongs to the running server rather
+/// than to one scan of the inputs. `publish_rescan` copies the struct, not
+/// its fields, so a field added here cannot be forgotten there.
+#[derive(Debug, Clone, Default)]
+struct ServeSession {
+    /// The write token of `--annotate` and `--review`.
+    review_token: Option<String>,
+    /// Whether this is `--review`, which watches every document's store.
+    blocking_review: bool,
+    /// Which scan published this config. Later scans have higher numbers.
+    rescan_id: u64,
 }
 
 #[derive(Debug)]
@@ -430,8 +443,8 @@ fn serve_markdown(
     )>,
 ) -> Result<Option<serve_review::AcceptedReview>, Box<dyn std::error::Error>> {
     let mut config = ServeConfig::from_inputs(inputs.clone(), port, recurse)?;
-    config.blocking_review = review.is_some();
-    config.review_token = annotate.then(annotations::random_hex).transpose()?;
+    config.session.blocking_review = review.is_some();
+    config.session.review_token = annotate.then(annotations::random_hex).transpose()?;
     // Said once, at startup: a rescan builds a fresh config but stays quiet.
     for directory in &config.reserved {
         eprintln!(
@@ -458,9 +471,7 @@ fn serve_markdown(
     let clients = Arc::new(Mutex::new(Vec::new()));
     let shared: SharedConfig = Arc::new(RwLock::new(Arc::new(config)));
     let stores = serve_annotations::watch_stores(shared.clone(), clients.clone())?;
-    if review.is_some() {
-        stores.watch_collection(&shared.read().expect("config lock"));
-    }
+    stores.sync(&shared);
     let _watcher = watch_root(
         shared.clone(),
         inputs,
@@ -830,12 +841,10 @@ impl ServeConfig {
             documents: build.documents,
             default_document: build.default_document,
             port,
-            review_token: None,
-            blocking_review: false,
+            session: ServeSession::default(),
             review_cache: annotations::ReviewCache::default(),
             review_summary: serve_review::SummaryCache::default(),
             reserved: build.reserved,
-            rescan_id: 0,
             mode: build.mode,
             sidebar_nav,
             asset_cache: Mutex::new(None),
@@ -1561,24 +1570,26 @@ fn publish_rescan(
     mut fresh: ServeConfig,
     rescan_id: u64,
 ) {
-    let mut published = shared.write().expect("config lock");
-    // An earlier scan may finish after a newer one on the background workers.
-    if rescan_id <= published.rescan_id {
-        return;
-    }
-    fresh.rescan_id = rescan_id;
-    fresh.review_token.clone_from(&published.review_token);
-    let reload = if nav_layout(&published) == nav_layout(&fresh) {
-        ReloadKind::Content
-    } else {
-        ReloadKind::Structure
+    let reload = {
+        // Held for the swap alone: every request waits on this lock.
+        let mut published = shared.write().expect("config lock");
+        // An earlier scan may finish after a newer one on the background workers.
+        if rescan_id <= published.session.rescan_id {
+            return;
+        }
+        fresh.session = ServeSession {
+            rescan_id,
+            ..published.session.clone()
+        };
+        let reload = if nav_layout(&published) == nav_layout(&fresh) {
+            ReloadKind::Content
+        } else {
+            ReloadKind::Structure
+        };
+        *published = Arc::new(fresh);
+        reload
     };
-    fresh.blocking_review = published.blocking_review;
-    stores.retain(&fresh);
-    if fresh.blocking_review {
-        stores.watch_collection(&fresh);
-    }
-    *published = Arc::new(fresh);
+    stores.sync(shared);
     broadcast_reload(clients, reload);
 }
 
@@ -1682,7 +1693,7 @@ fn handle_connection(
     // Reached through any other Host the page is read-only, so a page that
     // rebinds its own name to this server finds no token to harvest.
     let token = |reader: &mut BufReader<TcpStream>| {
-        config.review_token.as_deref().filter(|_| {
+        config.session.review_token.as_deref().filter(|_| {
             serve_annotations::lenient_host(reader, deadline)
                 .is_some_and(|host| serve_annotations::loopback_host(&host, config.port))
         })
@@ -1808,6 +1819,7 @@ fn serve_document(
     review: bool,
 ) -> io::Result<()> {
     let nonce = config
+        .session
         .review_token
         .as_ref()
         .map(|_| annotations::random_hex())
@@ -1815,7 +1827,7 @@ fn serve_document(
     // A page needs the review script when comments can be added to it
     // (`--annotate`) or it already has some. Any other page is exactly what
     // it was before annotations existed.
-    let review = (config.review_token.is_some()
+    let review = (config.session.review_token.is_some()
         || serve_annotations::has_store(&document.source_path))
     .then_some(ReviewHooks {
         nonce: nonce.as_deref(),
@@ -1855,7 +1867,7 @@ fn serve_document(
 /// as a document must not be able to act as that origin. `sandbox` gives it
 /// an opaque origin and no script; images and downloads are unaffected.
 fn asset_policy(config: &ServeConfig) -> &'static str {
-    if config.review_token.is_some() {
+    if config.session.review_token.is_some() {
         "Content-Security-Policy: sandbox\r\n"
     } else {
         ""
@@ -2789,7 +2801,7 @@ mod serve_nav_tests {
         let inputs = vec![dir.path().to_owned()];
         fs::write(dir.path().join("README.md"), "# Home").unwrap();
         let mut original = ServeConfig::from_inputs(inputs.clone(), 0, false).unwrap();
-        original.review_token = Some("session".to_owned());
+        original.session.review_token = Some("session".to_owned());
         let shared: SharedConfig = Arc::new(RwLock::new(Arc::new(original)));
         let (tx, rx) = mpsc::channel();
         let clients = Arc::new(Mutex::new(vec![(0, tx)]));
@@ -2800,9 +2812,61 @@ mod serve_nav_tests {
         publish_rescan(&shared, &clients, &test_stores(), older, 1);
         let config = shared.read().unwrap();
         assert!(config.document_by_route("/next.md").is_some());
-        assert_eq!(config.review_token.as_deref(), Some("session"));
+        assert_eq!(config.session.review_token.as_deref(), Some("session"));
         assert_eq!(rx.try_recv(), Ok(ReloadKind::Structure));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn rescan_syncs_store_watches_without_holding_the_config_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let inputs = vec![dir.path().to_owned()];
+        fs::write(dir.path().join("README.md"), "# Home").unwrap();
+        fs::write(dir.path().join("old.md"), "# Old").unwrap();
+        let mut original = ServeConfig::from_inputs(inputs.clone(), 0, false).unwrap();
+        original.session.review_token = Some("session".to_owned());
+        original.session.blocking_review = true;
+        let old = original
+            .document_by_route("/old.md")
+            .unwrap()
+            .source_path
+            .clone();
+        let shared: SharedConfig = Arc::new(RwLock::new(Arc::new(original)));
+        let clients = Arc::new(Mutex::new(Vec::new()));
+        let stores = test_stores();
+        stores.sync(&shared);
+        assert!(stores.watches(&old));
+
+        // Whether a request could read the config each time the watches
+        // were synced: store work stats and opens directories, and must not
+        // stall every connection behind the write lock.
+        let readable = Arc::new(Mutex::new(Vec::new()));
+        let (observed, config) = (readable.clone(), shared.clone());
+        stores.on_sync(move || observed.lock().unwrap().push(config.try_read().is_ok()));
+
+        fs::remove_file(dir.path().join("old.md")).unwrap();
+        fs::write(dir.path().join("next.md"), "# Next").unwrap();
+        let fresh = ServeConfig::from_inputs(inputs, 0, false).unwrap();
+        publish_rescan(&shared, &clients, &stores, fresh, 7);
+
+        let readable = readable.lock().unwrap();
+        assert!(!readable.is_empty(), "the rescan did not sync the watches");
+        assert!(
+            readable.iter().all(|readable| *readable),
+            "store work ran under the config write lock"
+        );
+        // The session's own state survives the swap...
+        let config = shared.read().unwrap();
+        assert_eq!(config.session.review_token.as_deref(), Some("session"));
+        assert!(config.session.blocking_review);
+        assert_eq!(config.session.rescan_id, 7);
+        // ...and the watches follow the published collection.
+        let next = &config.document_by_route("/next.md").unwrap().source_path;
+        assert!(
+            stores.watches(next),
+            "a blocking review watches every store"
+        );
+        assert!(!stores.watches(&old), "a dropped document is forgotten");
     }
 
     #[test]

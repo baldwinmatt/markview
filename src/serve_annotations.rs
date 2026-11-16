@@ -369,10 +369,14 @@ pub fn handle(
             fail(stream, "405 Method Not Allowed", "method not allowed")
         };
     }
-    let body = if request.method == "POST" && initial.review_token.is_some() {
+    let body = if request.method == "POST" && initial.session.review_token.is_some() {
         if !token_matches(
             request.header("x-markview-token"),
-            initial.review_token.as_deref().expect("checked token"),
+            initial
+                .session
+                .review_token
+                .as_deref()
+                .expect("checked token"),
         ) {
             return fail(stream, "403 Forbidden", "invalid annotation token");
         }
@@ -616,6 +620,9 @@ pub struct Stores {
     /// How often the event thread has woken up, for the idle test.
     #[cfg(test)]
     pub wakeups: std::sync::atomic::AtomicUsize,
+    /// Called whenever the watches are brought in line with a collection.
+    #[cfg(test)]
+    on_sync: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 impl Stores {
@@ -633,26 +640,49 @@ impl Stores {
         }
     }
 
-    /// A blocking review shows counts for the whole collection, even when
-    /// the reviewer has only opened one document.
-    pub fn watch_collection(&self, config: &ServeConfig) {
-        if let Ok(mut watcher) = self.watcher.lock() {
-            for document in &config.documents {
-                watcher.watch(&document.source_path);
-            }
+    fn note_sync(&self) {
+        #[cfg(test)]
+        if let Some(hook) = self.on_sync.lock().expect("hook lock").as_ref() {
+            hook();
         }
     }
 
-    /// Forgets documents that a rescan dropped from the served set.
-    pub fn retain(&self, config: &ServeConfig) {
+    #[cfg(test)]
+    pub fn on_sync(&self, hook: impl Fn() + Send + 'static) {
+        *self.on_sync.lock().expect("hook lock") = Some(Box::new(hook));
+    }
+
+    /// Whether the store of `document` is being watched.
+    #[cfg(test)]
+    pub fn watches(&self, document: &Path) -> bool {
+        self.watcher.lock().expect("watcher lock").watches(document)
+    }
+
+    /// Brings the watches in line with the published collection: forgets
+    /// documents a rescan dropped and, under a blocking review, watches every
+    /// document, because its bar counts comments on pages nobody has opened.
+    ///
+    /// The collection is read here, under the watcher lock, instead of being
+    /// passed in: two rescans can finish close together, and whichever syncs
+    /// last must leave the watches matching the newest collection.
+    pub fn sync(&self, shared: &SharedConfig) {
+        self.note_sync();
+        let Ok(mut watcher) = self.watcher.lock() else {
+            return;
+        };
+        let config = shared.read().expect("config lock").clone();
         let served: HashSet<&Path> = config
             .documents
             .iter()
             .map(|document| document.source_path.as_path())
             .collect();
-        if let Ok(mut watcher) = self.watcher.lock() {
-            watcher.retain(|path| served.contains(path));
+        watcher.retain(|path| served.contains(path));
+        if config.session.blocking_review {
+            for document in &config.documents {
+                watcher.watch(&document.source_path);
+            }
         }
+        drop(watcher);
         if let Ok(mut plain) = self.plain.lock() {
             plain.retain(|path| served.contains(path.as_path()));
         }
@@ -671,6 +701,8 @@ pub fn watch_stores(shared: SharedConfig, clients: Clients) -> notify::Result<Ar
         plain: Mutex::new(HashSet::new()),
         #[cfg(test)]
         wakeups: std::sync::atomic::AtomicUsize::new(0),
+        #[cfg(test)]
+        on_sync: Mutex::new(None),
     });
     let thread_stores = stores.clone();
     // No timer: the thread sleeps until a watched directory changes.
@@ -820,8 +852,8 @@ mod tests {
             let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
             let port = listener.local_addr().unwrap().port();
             let mut config = ServeConfig::from_inputs(vec![path], port, false).unwrap();
-            config.review_token = Some("token".to_owned());
-            config.blocking_review = true;
+            config.session.review_token = Some("token".to_owned());
+            config.session.blocking_review = true;
             prepare(&config);
             let shared: SharedConfig = Arc::new(std::sync::RwLock::new(Arc::new(config)));
             let clients: Clients = Arc::new(Mutex::new(Vec::new()));
@@ -1001,14 +1033,14 @@ mod tests {
         std::fs::write(&path, SOURCE).unwrap();
         std::fs::write(&target, "# Target").unwrap();
         let mut config = ServeConfig::from_inputs(vec![path, target], 7878, false).unwrap();
-        config.review_token = Some("test-only".to_owned());
+        config.session.review_token = Some("test-only".to_owned());
         let nonce = annotations::random_hex().unwrap();
         let html = super::super::render_file(
             &config,
             config.default_document().unwrap(),
             Some(super::super::ReviewHooks {
                 nonce: Some(&nonce),
-                token: config.review_token.as_deref(),
+                token: config.session.review_token.as_deref(),
                 blocking_review: true,
             }),
         )

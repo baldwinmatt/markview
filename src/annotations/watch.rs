@@ -108,6 +108,11 @@ impl StoreWatcher {
         self.add_directories(directories);
     }
 
+    /// Whether `document`'s store is watched.
+    pub fn watches(&self, document: &Path) -> bool {
+        self.documents.contains_key(document)
+    }
+
     /// Stops watching documents that `keep` rejects.
     pub fn retain(&mut self, keep: impl Fn(&Path) -> bool) {
         let before = self.documents.len();

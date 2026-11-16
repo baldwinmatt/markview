@@ -320,7 +320,7 @@ struct ServeConfig {
 /// The part of a `ServeConfig` that belongs to the running server rather
 /// than to one scan of the inputs. `publish_rescan` copies the struct, not
 /// its fields, so a field added here cannot be forgotten there.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ServeSession {
     /// The write token of `--annotate` and `--review`.
     review_token: Option<String>,
@@ -2744,6 +2744,7 @@ mod serve_nav_tests {
         fs::write(dir.path().join("old.md"), "# Old").unwrap();
         let mut original = ServeConfig::from_inputs(inputs.clone(), 0, false).unwrap();
         original.session.review_token = Some("session".to_owned());
+        original.session.api_token = Some("api".to_owned());
         original.session.blocking_review = true;
         let old = original
             .document_by_route("/old.md")
@@ -2776,9 +2777,15 @@ mod serve_nav_tests {
         );
         // The session's own state survives the swap...
         let config = shared.read().unwrap();
-        assert_eq!(config.session.review_token.as_deref(), Some("session"));
-        assert!(config.session.blocking_review);
-        assert_eq!(config.session.rescan_id, 7);
+        assert_eq!(
+            config.session,
+            ServeSession {
+                review_token: Some("session".to_owned()),
+                api_token: Some("api".to_owned()),
+                blocking_review: true,
+                rescan_id: 7,
+            }
+        );
         // ...and the watches follow the published collection.
         let next = &config.document_by_route("/next.md").unwrap().source_path;
         assert!(

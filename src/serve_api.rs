@@ -6,6 +6,8 @@ use markview::annotations::{self, json_string, push_json_string};
 use super::serve_annotations::read_served_source;
 use super::{ServeConfig, ServedDocument};
 
+/// The version of this API, as the catalog reports it and the path spells it.
+pub const API_VERSION: u32 = 1;
 pub const PREFIX: &str = "/_markview/api/v1/";
 /// The largest document `GET /document` will read, in bytes.
 pub const DOCUMENT_CAP: u64 = 16 * 1024 * 1024;
@@ -52,7 +54,7 @@ pub fn catalog(config: &ServeConfig, blocking: bool) -> String {
     let can_annotate = config.session.api_token.is_some();
     let can_finish = can_annotate && blocking;
     let mut body = format!(
-        r#"{{"default_document":{default},"can_annotate":{can_annotate},"can_finish":{can_finish},"documents":["#
+        r#"{{"api_version":{API_VERSION},"default_document":{default},"can_annotate":{can_annotate},"can_finish":{can_finish},"documents":["#
     );
     for (index, doc) in config.documents.iter().enumerate() {
         if index > 0 {

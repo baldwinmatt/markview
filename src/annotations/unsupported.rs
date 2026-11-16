@@ -45,6 +45,10 @@ impl Parent {
         match *self {}
     }
 
+    pub fn discard(&self, _lock: Option<&File>) {
+        match *self {}
+    }
+
     pub fn read(&self) -> io::Result<Option<Vec<u8>>> {
         match *self {}
     }

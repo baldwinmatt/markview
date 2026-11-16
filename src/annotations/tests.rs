@@ -513,3 +513,127 @@ fn stored_start_keeps_its_fast_path_after_reopening() {
     assert_eq!(review.annotations[0].range, Some(4..8));
     assert!(review.annotations[0].attached);
 }
+
+fn mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+#[test]
+fn replacing_a_store_keeps_its_permission_bits() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir().unwrap();
+    let doc = dir.path().join("doc.md");
+    fs::write(&doc, "text").unwrap();
+    let location = resolve(&doc).unwrap();
+    let review = mutate(&location, add("shared with the group")).unwrap();
+    fs::set_permissions(&location.path, fs::Permissions::from_mode(0o664)).unwrap();
+    mutate(
+        &location,
+        change(1, &review, Change::Status(Status::Resolved)),
+    )
+    .unwrap();
+    assert!(fs::read_to_string(&location.path)
+        .unwrap()
+        .contains("[resolved]"));
+    assert_eq!(mode(&location.path), 0o664);
+}
+
+#[test]
+fn umask_child() {
+    if let Some(path) = std::env::var_os("MARKVIEW_ANNOTATION_UMASK_DOCUMENT") {
+        let umask = std::env::var("MARKVIEW_ANNOTATION_UMASK").unwrap();
+        unsafe { libc::umask(libc::mode_t::from_str_radix(&umask, 8).unwrap()) };
+        mutate(&resolve(Path::new(&path)).unwrap(), add("first write")).unwrap();
+    }
+}
+
+#[test]
+fn new_store_files_follow_the_umask() {
+    // The umask is process-wide, so each case runs in its own child process.
+    for (umask, expected) in [("022", 0o644), ("027", 0o640)] {
+        let dir = tempdir().unwrap();
+        let doc = dir.path().join("doc.md");
+        fs::write(&doc, "text").unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "annotations::tests::umask_child"])
+            .env("MARKVIEW_ANNOTATION_UMASK_DOCUMENT", &doc)
+            .env("MARKVIEW_ANNOTATION_UMASK", umask)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let store = resolve(&doc).unwrap().path;
+        assert_eq!(mode(&store), expected, "store under umask {umask}");
+        assert_eq!(
+            mode(&store.with_file_name("doc.md.markview-lock")),
+            expected,
+            "lock under umask {umask}"
+        );
+    }
+}
+
+#[test]
+fn long_document_names_can_be_annotated() {
+    // `<name>.markview-lock` would be 262 bytes here, past the 255-byte limit.
+    let dir = tempdir().unwrap();
+    let name = format!("{}.md", "n".repeat(245));
+    assert_eq!(name.len(), 248);
+    let doc = dir.path().join(&name);
+    fs::write(&doc, "text").unwrap();
+    let location = resolve(&doc).unwrap();
+    let first = mutate(&location, add("first")).unwrap();
+    let second = mutate(
+        &location,
+        change(1, &first, Change::Edit("edited".to_owned())),
+    )
+    .unwrap();
+    assert_eq!(second.annotations[0].body, "edited");
+    let locks: Vec<_> = fs::read_dir(location.path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|entry| *entry != name)
+        .collect();
+    // One lock per document, reused across writes, still matching the
+    // documented `*.markview-lock` ignore pattern.
+    assert_eq!(locks.len(), 1, "{locks:?}");
+    assert!(locks[0].ends_with(".markview-lock"));
+}
+
+#[test]
+fn failed_first_write_leaves_no_new_directories() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir(root.join("sub")).unwrap();
+    fs::write(root.join(".git"), "gitdir: elsewhere").unwrap();
+    let doc = root.join("sub/doc.md");
+    fs::write(&doc, "text").unwrap();
+    let stale = resolve(&doc).unwrap();
+    assert_eq!(stale.root, root);
+    // A nearer store appears after the location was resolved, so the add is
+    // refused only after the directories for the old location were created.
+    fs::create_dir_all(root.join("sub/.markview/annotations")).unwrap();
+    assert!(matches!(
+        mutate(&stale, add("first")),
+        Err(Error::Conflict("annotation store moved"))
+    ));
+    assert!(!root.join(".markview").exists());
+    assert_eq!(
+        fs::read_dir(root.join("sub/.markview/annotations"))
+            .unwrap()
+            .count(),
+        0
+    );
+
+    // Directories that already existed are left alone, and a later write to
+    // the same location still works.
+    fs::remove_dir_all(root.join("sub/.markview")).unwrap();
+    fs::create_dir_all(root.join(".markview/annotations")).unwrap();
+    fs::create_dir_all(root.join("sub/.markview/annotations")).unwrap();
+    assert!(mutate(&stale, add("first")).is_err());
+    assert!(root.join(".markview/annotations").is_dir());
+    assert!(!root.join(".markview/annotations/sub").exists());
+    fs::remove_dir_all(root.join("sub/.markview")).unwrap();
+    assert_eq!(mutate(&stale, add("first")).unwrap().annotations.len(), 1);
+}

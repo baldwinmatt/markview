@@ -450,7 +450,19 @@ pub fn mutate(location: &Location, operation: Operation) -> Result<Review, Error
     let parent = location
         .parent(matches!(&operation, Operation::Add { .. }))?
         .ok_or(Error::Conflict("annotation store changed on disk"))?;
-    let _lock = parent.lock()?;
+    let lock = parent.lock().inspect_err(|_| parent.discard(None))?;
+    let result = mutate_locked(location, &parent, operation);
+    if result.is_err() {
+        parent.discard(Some(&lock));
+    }
+    result
+}
+
+fn mutate_locked(
+    location: &Location,
+    parent: &paths::Parent,
+    operation: Operation,
+) -> Result<Review, Error> {
     if resolve(&location.document)?.path != location.path {
         return Err(Error::Conflict("annotation store moved"));
     }

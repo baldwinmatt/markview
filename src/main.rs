@@ -24,11 +24,10 @@ use pulldown_cmark::{Event, Parser, Tag};
 
 fn main() -> ExitCode {
     match run() {
-        Ok(Some(output)) => {
+        Ok((output, status)) => {
             print!("{output}");
-            ExitCode::SUCCESS
+            status
         }
-        Ok(None) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("markview: {error}");
             ExitCode::FAILURE
@@ -36,15 +35,17 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
+/// What to print on stdout and how to exit. A run can print useful output
+/// and still fail, as an annotation listing does past a broken document.
+fn run() -> Result<(String, ExitCode), Box<dyn std::error::Error>> {
     let cli = Cli::parse(std::env::args().skip(1))?;
 
     if cli.help {
-        return Ok(Some(help().to_owned()));
+        return Ok((help().to_owned(), ExitCode::SUCCESS));
     }
 
     if cli.annotations {
-        return list_annotations(&cli.inputs, cli.include_resolved).map(Some);
+        return list_annotations(&cli.inputs, cli.include_resolved);
     }
 
     if let Some(port) = cli.serve {
@@ -57,7 +58,7 @@ fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
         } else {
             serve_markdown(inputs, port, cli.recurse, cli.open, cli.annotate)?;
         }
-        return Ok(None);
+        return Ok((String::new(), ExitCode::SUCCESS));
     }
 
     let markdown = match cli.input.as_deref() {
@@ -69,7 +70,7 @@ fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
         }
     };
 
-    Ok(Some(match cli.output {
+    let output = match cli.output {
         OutputFormat::Terminal => render(&markdown, cli.options),
         OutputFormat::Html => {
             let document = cli
@@ -79,14 +80,31 @@ fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| MarkdownDocument::new(&markdown));
             HtmlRenderer.render_document(&document)
         }
-    }))
+    };
+    Ok((output, ExitCode::SUCCESS))
 }
 
+/// Lists annotations for files and directories. A document that cannot be
+/// listed is reported on stderr as `error: <document>: <problem>` and the
+/// rest are still listed; the exit status then says the listing is incomplete.
 fn list_annotations(
     inputs: &[String],
     include_resolved: bool,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<(String, ExitCode), Box<dyn std::error::Error>> {
+    // Store paths are canonical. Shown relative to the working directory
+    // they can be pasted straight into an editor or another command.
+    let cwd = std::env::current_dir()
+        .and_then(|cwd| cwd.canonicalize())
+        .ok();
+    let relative = |path: &Path| -> String {
+        cwd.as_deref()
+            .and_then(|cwd| path.strip_prefix(cwd).ok())
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    };
     let mut output = String::new();
+    let mut failed = false;
     let mut seen = std::collections::HashSet::new();
     for input in inputs {
         let path = Path::new(input);
@@ -94,6 +112,11 @@ fn list_annotations(
             .metadata()
             .map_err(|error| format!("{input}: {error}"))?
             .is_dir();
+        if is_annotation_store(path) {
+            eprintln!("error: {input}: this is an annotation store, not a document; pass the Markdown file it annotates");
+            failed = true;
+            continue;
+        }
         let paths = if is_dir {
             collect_markdown_paths(path, true)?
         } else {
@@ -104,68 +127,129 @@ fn list_annotations(
             if !is_markdown_path(&file) {
                 return Err(format!("input is not Markdown: {}", file.display()).into());
             }
-            let location = annotations::resolve(&file)?;
-            if is_dir && annotations::snapshot(&location)?.is_none() {
-                continue;
-            }
-            has_stores = true;
-            if !seen.insert(location.document.clone()) {
-                continue;
-            }
-            let source = fs::read_to_string(&location.document)?;
-            let review = annotations::read(&location, &annotations::TextProjection::new(&source))?;
-            let _ = writeln!(output, "# Annotations: {}\nStore: {} (change `[open]` to `[resolved]` there once addressed)\n", file.display(), location.path.display());
-            let resolved = review
-                .annotations
-                .iter()
-                .filter(|record| record.status == annotations::Status::Resolved)
-                .count();
-            if resolved == review.annotations.len() {
-                let _ = writeln!(output, "No open annotations for {}.\n", file.display());
-            }
-            for record in review.annotations {
-                if record.status == annotations::Status::Resolved && !include_resolved {
-                    continue;
+            match document_annotations(&file, is_dir, include_resolved, &relative, &mut seen) {
+                Ok(Some(listing)) => {
+                    has_stores = true;
+                    output.push_str(&listing);
                 }
-                let _ = write!(output, "## a{} · ", record.id);
-                match record.lines {
-                    Some((first, last)) if first == last => {
-                        let _ = write!(output, "line {first}");
-                    }
-                    Some((first, last)) => {
-                        let _ = write!(output, "lines {first}-{last}");
-                    }
-                    None => output.push_str("document"),
+                Ok(None) => {}
+                Err(problem) => {
+                    has_stores = true;
+                    failed = true;
+                    eprintln!("error: {}: {problem}", file.display());
                 }
-                if let Some(section) = record.section {
-                    let _ = write!(output, " · {section}");
-                }
-                if !record.attached {
-                    output.push_str(" · detached");
-                }
-                if record.status == annotations::Status::Resolved {
-                    output.push_str(" · resolved");
-                }
-                output.push('\n');
-                if let Some(quote) = record.quote {
-                    let _ = writeln!(output, "> {quote}");
-                }
-                let _ = writeln!(output, "\n{}\n", record.body);
-            }
-            if !include_resolved && resolved > 0 {
-                let label = if resolved == 1 {
-                    "annotation"
-                } else {
-                    "annotations"
-                };
-                let _ = writeln!(output, "{resolved} resolved {label} not shown.\n");
             }
         }
         if !has_stores {
             let _ = writeln!(output, "No open annotations for {input}.");
         }
     }
-    Ok(output)
+    let status = if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    };
+    Ok((output, status))
+}
+
+/// Whether `path` lies in a `.markview/annotations` store. Listing one would
+/// resolve a second store for the store file itself.
+fn is_annotation_store(path: &Path) -> bool {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_owned());
+    let parts: Vec<_> = canonical.iter().collect();
+    parts
+        .windows(2)
+        .any(|pair| pair[0] == ".markview" && pair[1] == "annotations")
+}
+
+/// The listing for one document, or `None` when it has nothing to list: no
+/// store under a directory input, or a document already listed. The error
+/// says what is wrong and names the store when the store is at fault.
+fn document_annotations(
+    file: &Path,
+    from_directory: bool,
+    include_resolved: bool,
+    relative: &dyn Fn(&Path) -> String,
+    seen: &mut std::collections::HashSet<PathBuf>,
+) -> Result<Option<String>, String> {
+    let location = annotations::resolve(file).map_err(|error| error.to_string())?;
+    let store = relative(&location.path);
+    let in_store = |error: &dyn std::fmt::Display| format!("{store}: {error}");
+    let bytes = annotations::snapshot(&location).map_err(|error| in_store(&error))?;
+    if from_directory && bytes.is_none() {
+        return Ok(None);
+    }
+    if !seen.insert(location.document.clone()) {
+        return Ok(None);
+    }
+    let source = fs::read_to_string(&location.document).map_err(|error| {
+        if error.kind() == io::ErrorKind::InvalidData {
+            "the document is not valid UTF-8".to_owned()
+        } else {
+            error.to_string()
+        }
+    })?;
+    let review = annotations::read(&location, &annotations::TextProjection::new(&source))
+        .map_err(|error| in_store(&error))?;
+    for warning in annotations::store_warnings(&location, bytes.as_deref().unwrap_or_default()) {
+        let line = warning
+            .line
+            .map_or(String::new(), |line| format!(":{line}"));
+        eprintln!("warning: {store}{line}: {}", warning.message);
+    }
+
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "# Annotations: {}\nStore: {store} (change `[open]` to `[resolved]` there once addressed)\n",
+        file.display()
+    );
+    let resolved = review
+        .annotations
+        .iter()
+        .filter(|record| record.status == annotations::Status::Resolved)
+        .count();
+    if resolved == review.annotations.len() {
+        let _ = writeln!(output, "No open annotations for {}.\n", file.display());
+    }
+    for record in review.annotations {
+        if record.status == annotations::Status::Resolved && !include_resolved {
+            continue;
+        }
+        let _ = write!(output, "## a{} · ", record.id);
+        match record.lines {
+            Some((first, last)) if first == last => {
+                let _ = write!(output, "line {first}");
+            }
+            Some((first, last)) => {
+                let _ = write!(output, "lines {first}-{last}");
+            }
+            None => output.push_str("document"),
+        }
+        if let Some(section) = record.section {
+            let _ = write!(output, " · {section}");
+        }
+        if !record.attached {
+            output.push_str(" · detached");
+        }
+        if record.status == annotations::Status::Resolved {
+            output.push_str(" · resolved");
+        }
+        output.push('\n');
+        if let Some(quote) = record.quote {
+            let _ = writeln!(output, "> {quote}");
+        }
+        let _ = writeln!(output, "\n{}\n", record.body);
+    }
+    if !include_resolved && resolved > 0 {
+        let label = if resolved == 1 {
+            "annotation"
+        } else {
+            "annotations"
+        };
+        let _ = writeln!(output, "{resolved} resolved {label} not shown.\n");
+    }
+    Ok(Some(output))
 }
 
 #[derive(Debug)]

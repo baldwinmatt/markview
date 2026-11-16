@@ -408,12 +408,16 @@ pub enum CliError {
     MissingServeInput,
     LegacyServePortForm,
     AnnotationUsage(&'static str),
+    AnnotationConflict(&'static str),
 }
 
 impl std::fmt::Display for CliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AnnotationUsage(message) => f.write_str(message),
+            Self::AnnotationConflict(flag) => {
+                write!(f, "--annotations cannot be combined with {flag}")
+            }
             Self::MissingValue(flag) => write!(f, "missing value for {flag}"),
             Self::InvalidWidth(value) => write!(f, "invalid width: {value}"),
             Self::InvalidPort(value) => write!(f, "invalid port: {value}"),
@@ -471,6 +475,7 @@ impl Cli {
         let mut open = false;
         let mut daemon = false;
         let mut help = false;
+        let mut saw_width = false;
         let mut args = args.into_iter().map(Into::into);
 
         while let Some(arg) = args.next() {
@@ -504,16 +509,39 @@ impl Cli {
                 "-w" | "--width" => {
                     let value = args.next().ok_or(CliError::MissingValue("--width"))?;
                     options.width = parse_width(&value)?;
+                    saw_width = true;
                 }
                 _ if arg.starts_with("--width=") => {
                     let value = arg.trim_start_matches("--width=");
                     options.width = parse_width(value)?;
+                    saw_width = true;
                 }
                 _ if arg.starts_with("--serve=") => {
                     return Err(CliError::LegacyServePortForm);
                 }
                 _ if arg.starts_with('-') => return Err(CliError::UnknownArgument(arg)),
                 _ => inputs.push(arg),
+            }
+        }
+
+        if annotations {
+            // `--annotations` is its own mode. Name the flag that does not
+            // belong before any other check complains about what that flag
+            // itself is missing, such as an input for `--serve`.
+            let conflict = [
+                ("--serve", saw_serve),
+                ("--daemon", daemon),
+                ("--recurse", recurse),
+                ("--open", open),
+                ("--port", serve_port.is_some()),
+                ("--annotate", annotate),
+                ("--html", output == OutputFormat::Html),
+                ("--width", saw_width),
+            ]
+            .into_iter()
+            .find(|(_, present)| *present);
+            if let Some((flag, _)) = conflict {
+                return Err(CliError::AnnotationConflict(flag));
             }
         }
 
@@ -542,11 +570,6 @@ impl Cli {
         if include_resolved && !annotations {
             return Err(CliError::AnnotationUsage(
                 "--include-resolved requires --annotations",
-            ));
-        }
-        if annotations && (saw_serve || output == OutputFormat::Html) {
-            return Err(CliError::AnnotationUsage(
-                "--annotations cannot be combined with --serve or --html",
             ));
         }
         if annotations && inputs.is_empty() && !help {
@@ -618,7 +641,8 @@ Render options:
 
 Review options:
       --annotations      List open comments for Markdown files or directories
-      --include-resolved Include resolved comments after open comments
+      --include-resolved
+                         Include resolved comments after open comments
 
 Serve options (all require --serve):
       --annotate         Enable writing review comments from the browser

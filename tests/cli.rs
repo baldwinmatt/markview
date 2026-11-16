@@ -164,6 +164,288 @@ fn annotations_cli_lists_open_detached_and_resolved_for_files_and_directories() 
     }
 }
 
+/// Runs `markview --annotations` in `cwd`, returning (stdout, stderr, success).
+fn list_annotations_in(cwd: &std::path::Path, args: &[&str]) -> (String, String, bool) {
+    let output = std::process::Command::new(cargo_bin("markview"))
+        .arg("--annotations")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status.success(),
+    )
+}
+
+#[test]
+fn annotations_cli_prints_the_spec_layout_in_document_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let docs = dir.path().join("docs");
+    let store = dir.path().join(".markview/annotations/docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        docs.join("spec.md"),
+        "# Routing\n\nFirst line.\n\nFresh **source**.\n",
+    )
+    .unwrap();
+    // Stored out of order: a detached comment, a document comment, a text
+    // comment, a resolved one, and a second text comment earlier in the text.
+    std::fs::write(
+        store.join("spec.md"),
+        concat!(
+            "## a4 [open] line 9\n\n> gone\n\nDetached body\n\n",
+            "## a3 [open] document\n\nDocument body\n\n",
+            "## a1 [open] line 3\n\n> Fresh source\n\nSecond in the text\n\n",
+            "## a5 [resolved] document\n\nClosed body\n\n",
+            "## a2 [open] line 3\n\n> First line\n\nFirst in the text\n",
+        ),
+    )
+    .unwrap();
+
+    let (stdout, stderr, success) = list_annotations_in(dir.path(), &["docs/spec.md"]);
+    assert!(success, "{stderr}");
+    assert_eq!(stderr, "");
+    // Text comments in document order, then document comments, then detached.
+    assert_eq!(
+        stdout,
+        concat!(
+            "# Annotations: docs/spec.md\n",
+            "Store: .markview/annotations/docs/spec.md (change `[open]` to `[resolved]` there once addressed)\n",
+            "\n",
+            "## a2 · line 3 · Routing\n> First line\n\nFirst in the text\n\n",
+            "## a1 · line 5 · Routing\n> Fresh source\n\nSecond in the text\n\n",
+            "## a3 · document\n\nDocument body\n\n",
+            "## a4 · line 9 · detached\n> gone\n\nDetached body\n\n",
+            "1 resolved annotation not shown.\n\n",
+        )
+    );
+
+    // The same order reaches the browser panel through the JSON endpoint.
+    let server = ServeProcess::start(&docs.join("spec.md"));
+    let json = http_get_local(server.port, "/_markview/annotations?doc=%2Fspec.md");
+    let ids: Vec<_> = json
+        .split("{\"id\":\"")
+        .skip(1)
+        .map(|rest| rest.split('"').next().unwrap())
+        .collect();
+    assert_eq!(ids, ["a2", "a1", "a3", "a4", "a5"]);
+}
+
+#[test]
+fn annotations_cli_keeps_listing_past_a_broken_document() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let docs = dir.path().join("docs");
+    let store = dir.path().join(".markview/annotations/docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::create_dir_all(&store).unwrap();
+    let section = "## a1 [open] document\n\nNote\n";
+    for name in [
+        "a-good.md",
+        "b-not-utf8.md",
+        "c-symlink.md",
+        "d-directory.md",
+        "f-good.md",
+    ] {
+        std::fs::write(docs.join(name), "# Doc\n").unwrap();
+    }
+    std::fs::write(docs.join("e-bad-source.md"), b"# Doc \xff\n").unwrap();
+    for name in ["a-good.md", "e-bad-source.md", "f-good.md"] {
+        std::fs::write(store.join(name), section).unwrap();
+    }
+    std::fs::write(
+        store.join("b-not-utf8.md"),
+        b"## a1 [open] document\n\n\xff\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("elsewhere.md"), section).unwrap();
+    symlink(dir.path().join("elsewhere.md"), store.join("c-symlink.md")).unwrap();
+    std::fs::create_dir(store.join("d-directory.md")).unwrap();
+
+    let (stdout, stderr, success) = list_annotations_in(dir.path(), &["docs"]);
+    assert!(!success, "a listing with errors must not exit 0");
+    // The good neighbours on both sides of the broken ones are listed.
+    let listed: Vec<_> = stdout
+        .lines()
+        .filter(|line| line.starts_with("# Annotations: "))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            "# Annotations: docs/a-good.md",
+            "# Annotations: docs/f-good.md"
+        ]
+    );
+    // One line per broken document, naming it and what is wrong with it.
+    let errors: Vec<_> = stderr.lines().collect();
+    assert_eq!(errors.len(), 4, "{stderr}");
+    for (line, document, problem) in [
+        (
+            errors[0],
+            "docs/b-not-utf8.md",
+            "annotation store is not UTF-8",
+        ),
+        (
+            errors[1],
+            "docs/c-symlink.md",
+            ".markview/annotations/docs/c-symlink.md",
+        ),
+        (
+            errors[2],
+            "docs/d-directory.md",
+            ".markview/annotations/docs/d-directory.md",
+        ),
+        (errors[3], "docs/e-bad-source.md", "UTF-8"),
+    ] {
+        assert!(line.starts_with(&format!("error: {document}: ")), "{line}");
+        assert!(line.contains(problem), "{line}");
+    }
+
+    // Explicit files behave the same way.
+    let (stdout, stderr, success) =
+        list_annotations_in(dir.path(), &["docs/c-symlink.md", "docs/f-good.md"]);
+    assert!(!success);
+    assert!(stdout.contains("# Annotations: docs/f-good.md"));
+    assert!(stderr.starts_with("error: docs/c-symlink.md: "), "{stderr}");
+}
+
+#[test]
+fn annotations_cli_warns_about_headers_that_almost_parse() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join(".markview/annotations");
+    std::fs::create_dir_all(&store).unwrap();
+    for name in ["near.md", "none.md", "twice.md", "fine.md"] {
+        std::fs::write(dir.path().join(name), "# Doc\n").unwrap();
+    }
+    std::fs::write(
+        store.join("near.md"),
+        concat!(
+            "## a1 [OPEN] document\n\nUpper case status\n\n",
+            "## a2 [open] document \n\nTrailing space\n\n",
+            "## a3  [open] document\n\nTwo spaces\n\n",
+            "## a4 [Resolved] document\n\nCapitalised status\n\n",
+            "## a5 [open] document\n\nThe only real one\n\n",
+            "\\## a6 [OPEN] document\n\n## a11y notes are just a heading\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        store.join("none.md"),
+        "### a1 [open] document\n\nWrong level\n",
+    )
+    .unwrap();
+    std::fs::write(
+        store.join("twice.md"),
+        "## a1 [open] document\n\nOne\n\n## a1 [open] document\n\nTwo\n",
+    )
+    .unwrap();
+    std::fs::write(store.join("fine.md"), "## a1 [open] document\n\nFine\n").unwrap();
+
+    let (stdout, stderr, success) = list_annotations_in(dir.path(), &["near.md"]);
+    assert!(success, "{stderr}");
+    assert!(stdout.contains("## a5 · document"));
+    assert!(!stdout.contains("## a1 · "));
+    let warnings: Vec<_> = stderr.lines().collect();
+    assert_eq!(warnings.len(), 4, "{stderr}");
+    for (warning, line, header) in [
+        (warnings[0], 1, "## a1 [OPEN] document"),
+        (warnings[1], 5, "## a2 [open] document "),
+        (warnings[2], 9, "## a3  [open] document"),
+        (warnings[3], 13, "## a4 [Resolved] document"),
+    ] {
+        assert!(
+            warning.starts_with(&format!(
+                "warning: .markview/annotations/near.md:{line}: \"{header}\" is not an annotation header"
+            )),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("## a<N> [open|resolved] <anchor>"),
+            "{warning}"
+        );
+    }
+
+    let (stdout, stderr, success) = list_annotations_in(dir.path(), &["none.md"]);
+    assert!(success);
+    assert!(stdout.contains("No open annotations for none.md."));
+    assert_eq!(
+        stderr,
+        "warning: .markview/annotations/none.md: the store has content but no annotation sections; a section starts with a line like \"## a1 [open] document\"\n"
+    );
+
+    // Two sections with one ID cannot be told apart, so neither is printed.
+    let (stdout, stderr, success) = list_annotations_in(dir.path(), &["twice.md", "fine.md"]);
+    assert!(!success);
+    assert!(!stdout.contains("# Annotations: twice.md"));
+    assert!(stdout.contains("# Annotations: fine.md"));
+    assert_eq!(
+        stderr,
+        "error: twice.md: .markview/annotations/twice.md: annotation a1 appears more than once; give each section a unique ID\n"
+    );
+}
+
+#[test]
+fn annotations_cli_refuses_a_store_file_as_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join(".markview/annotations/docs");
+    std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(dir.path().join("docs/spec.md"), "# Doc\n").unwrap();
+    std::fs::write(store.join("spec.md"), "## a1 [open] document\n\nNote\n").unwrap();
+
+    let input = ".markview/annotations/docs/spec.md";
+    let (stdout, stderr, success) = list_annotations_in(dir.path(), &[input, "docs/spec.md"]);
+    assert!(!success);
+    assert_eq!(
+        stderr,
+        format!("error: {input}: this is an annotation store, not a document; pass the Markdown file it annotates\n")
+    );
+    // The real document is still listed, and nothing was resolved under the store.
+    assert_eq!(stdout.matches("# Annotations: ").count(), 1);
+    assert!(stdout.contains("# Annotations: docs/spec.md"));
+}
+
+#[test]
+fn annotations_cli_reports_flag_conflicts_before_missing_inputs() {
+    for (args, flag) in [
+        (&["--annotations", "--serve"][..], "--serve"),
+        (&["--annotations", "--daemon"], "--daemon"),
+        (&["--annotations", "--recurse", "docs"], "--recurse"),
+        (&["--annotations", "--open", "one.md"], "--open"),
+        (&["--annotations", "--port", "0", "one.md"], "--port"),
+        (&["--annotations", "--annotate", "one.md"], "--annotate"),
+        (&["--annotations", "--html", "one.md"], "--html"),
+        (&["--annotations", "--width", "60", "one.md"], "--width"),
+        (&["--annotations", "-w", "60", "one.md"], "--width"),
+        (&["--daemon", "--annotations", "--serve"], "--serve"),
+    ] {
+        let output = std::process::Command::new(cargo_bin("markview"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("markview: --annotations cannot be combined with {flag}\n"),
+            "{args:?}"
+        );
+    }
+    let help = std::process::Command::new(cargo_bin("markview"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    let help = String::from_utf8(help.stdout).unwrap();
+    // Every description starts in the same column, 25 characters in.
+    assert!(help.contains(concat!(
+        "      --annotations      List open comments for Markdown files or directories\n",
+        "      --include-resolved\n",
+        "                         Include resolved comments after open comments\n",
+    )));
+}
+
 #[test]
 fn annotations_cli_validates_arguments() {
     for (args, error) in [

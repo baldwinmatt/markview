@@ -127,6 +127,8 @@ impl Review {
         projection: &TextProjection,
     ) -> Result<Self, Error> {
         let store = parse_snapshot(location, bytes)?;
+        // Two sections with one ID cannot be told apart in a list either.
+        store.check_ids()?;
         let ranges = store
             .annotations
             .iter()
@@ -169,10 +171,18 @@ impl Review {
                 range,
             })
             .collect();
+        // Open before resolved. Within each: text comments in document
+        // order, then whole-document comments, then detached ones, each of
+        // the last two in the order the store lists them.
         annotations.sort_by_key(|record| {
+            let placement = match (&record.range, record.attached) {
+                (Some(_), _) => 0,
+                (None, true) => 1,
+                (None, false) => 2,
+            };
             (
                 record.status == Status::Resolved,
-                !record.attached,
+                placement,
                 record.range.as_ref().map_or(0, |range| range.start),
             )
         });
@@ -379,6 +389,41 @@ impl ReviewCache {
 pub fn read(location: &Location, projection: &TextProjection) -> Result<Review, Error> {
     let bytes = snapshot(location)?;
     Review::from_snapshot(location, bytes.as_deref(), projection)
+}
+
+/// A problem in a store file that does not stop it from loading but probably
+/// hides annotations: a header that almost parses is silently read as comment
+/// text, so the annotation it was meant to start disappears.
+#[derive(Debug, PartialEq, Eq)]
+pub struct StoreWarning {
+    /// The 1-based line in the store file, when the problem is one line.
+    pub line: Option<usize>,
+    pub message: String,
+}
+
+pub fn store_warnings(location: &Location, bytes: &[u8]) -> Vec<StoreWarning> {
+    let Ok(source) = std::str::from_utf8(bytes) else {
+        return Vec::new();
+    };
+    let mut warnings: Vec<_> = Store::near_headers(source)
+        .map(|(line, text)| StoreWarning {
+            line: Some(line),
+            message: format!(
+                "{text:?} is not an annotation header; write it exactly as \"## a<N> [open|resolved] <anchor>\""
+            ),
+        })
+        .collect();
+    if warnings.is_empty()
+        && Store::parse(source).annotations.is_empty()
+        && !source.trim().is_empty()
+        && source != Store::generated_preamble(&location.relative)
+    {
+        warnings.push(StoreWarning {
+            line: None,
+            message: "the store has content but no annotation sections; a section starts with a line like \"## a1 [open] document\"".to_owned(),
+        });
+    }
+    warnings
 }
 
 pub fn snapshot(location: &Location) -> io::Result<Option<Vec<u8>>> {

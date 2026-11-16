@@ -192,6 +192,27 @@ impl Store {
         }
     }
 
+    /// Lines that look like a section header but do not parse as one, with
+    /// their 1-based line numbers: `## a<N>` followed by a space or `[`.
+    /// A typo such as `[OPEN]` or a trailing space lands here.
+    pub(super) fn near_headers(source: &str) -> impl Iterator<Item = (usize, &str)> {
+        source
+            .strip_prefix(BYTE_ORDER_MARK)
+            .unwrap_or(source)
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let Some(rest) = line.strip_prefix("## a") else {
+                    return false;
+                };
+                let rest = rest.trim_start_matches(|ch: char| ch.is_ascii_digit());
+                rest.len() < line.len() - 4
+                    && rest.starts_with([' ', '['])
+                    && header(line).is_none()
+            })
+            .map(|(index, line)| (index + 1, line))
+    }
+
     pub fn parse(source: &str) -> Self {
         // Windows editors may prepend a byte order mark. It is kept in the
         // preamble but must not hide a header on the first line.

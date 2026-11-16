@@ -537,8 +537,11 @@ function createMarkviewReview(root, mount, submit, {
     return Array.from(cards.children).find(card => card.dataset.annotation === id);
   }
   function scrollToAnnotation(card, entry) {
+    // A range counts scalars of the revision its list was resolved against.
+    // While a newer page waits for its own list, go to the card instead.
+    const current = review?.source_revision === revision;
     const range = ranges.find(item => item.id === entry.id)?.range ||
-      (entry.range && markviewReviewRange(markviewReviewText(root), entry.range));
+      (current && entry.range && markviewReviewRange(textPoints(), entry.range));
     if (range) range.startContainer.parentElement.scrollIntoView({block: 'center'});
     else card.scrollIntoView({block: 'nearest'});
   }

@@ -916,6 +916,51 @@ test('J and K move keyboard focus through the visible cards, wrap, and scroll to
   focused(page, page.card('a4'));
 });
 
+test('J does not apply a comment\'s range to a document that has changed since', () => {
+  const page = shortcutPage();
+  const paragraph = page.main.querySelector('p');
+  // A live edit: the page shows the new revision, and the old comments stay
+  // on screen until the list for it arrives. Their ranges count scalars of
+  // the old text, so they point at whatever sits there now.
+  paragraph.textContent = 'An inserted sentence. first second';
+  page.mutated(page.main);
+  page.review.show('doc', 'source-2', true, true);
+  assert.equal(page.highlights.has('markview-annotations'), false, 'stale ranges are not painted either');
+  assert.ok(press(page, 'j'));
+  focused(page, page.card('a1'));
+  assert.equal(paragraph.scrolledIntoView, 0, 'scrolled to text the comment is not about');
+  assert.equal(page.card('a1').scrolledIntoView, 1);
+
+  // Once the list for the new revision is here, its range is used again.
+  page.review.update({source_revision: 'source-2', store_revision: 'store-2',
+    annotations: [comment('a1', {range: [19, 24], quote: 'first', lines: [1, 1]})]});
+  page.blur();
+  assert.ok(press(page, 'j'));
+  assert.equal(paragraph.scrolledIntoView, 1);
+});
+
+test('navigating over resolved comments walks the document once, not once per key', () => {
+  const page = directPage();
+  page.main.append(page.h('p', {}, 'first second third'));
+  page.review.show('doc', 'source-1', true, true);
+  // Resolved comments are not highlighted, so going to one needs its range
+  // turned into a DOM range from the text points.
+  page.review.update(review('store-1', [
+    comment('a1', {status: 'resolved', range: [0, 5], quote: 'first', lines: [1, 1]}),
+    comment('a2', {status: 'resolved', range: [5, 11], quote: 'second', lines: [1, 1]}),
+  ]));
+  const resolved = page.panel.querySelectorAll('input')[0];
+  resolved.checked = true;
+  resolved.dispatchEvent({type: 'change'});
+  let walks = 0;
+  const walk = page.context.markviewReviewText;
+  page.context.markviewReviewText = root => { walks += 1; return walk(root); };
+  const paragraph = page.main.querySelector('p');
+  for (let step = 0; step < 20; step++) assert.ok(press(page, 'k'));
+  assert.equal(paragraph.scrolledIntoView, 20);
+  assert.ok(walks <= 1, walks + ' walks of the document for 20 keys');
+});
+
 test('single-key shortcuts stand aside for text fields, modifiers, composition, repeats and dialogs', () => {
   const saved = [];
   const page = shortcutPage(true, true, {saveShortcuts: enabled => saved.push(enabled)});

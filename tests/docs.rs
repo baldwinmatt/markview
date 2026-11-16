@@ -249,3 +249,78 @@ fn architecture_skill_help_and_roadmap_cover_the_agent_api() {
     let roadmap = normalized("ROADMAP.md");
     assert!(roadmap.contains("### FEAT-006: Agent HTTP API"));
 }
+
+fn agent_api_section() -> String {
+    let readme = fs::read_to_string("README.md").expect("read README");
+    readme
+        .split("### Agent HTTP API\n")
+        .nth(1)
+        .expect("Agent HTTP API section")
+        .split("\n### ")
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn readme_api_examples_show_error_bodies() {
+    let section = agent_api_section();
+    let mut blocks = 0;
+    for block in section.split("```sh\n").skip(1) {
+        let block = block.split("```").next().unwrap();
+        if !block.contains("curl") {
+            continue;
+        }
+        blocks += 1;
+        for word in block.split_whitespace() {
+            let short_f = word.starts_with('-')
+                && !word.starts_with("--")
+                && word.chars().skip(1).all(|ch| ch.is_ascii_alphabetic())
+                && word.contains('f');
+            assert!(!short_f, "`{word}` hides the error body: {block}");
+            assert!(word != "--fail", "`--fail` hides the error body: {block}");
+        }
+        assert!(block.contains("--fail-with-body"), "{block}");
+    }
+    assert!(blocks >= 2, "the section lost its curl examples");
+}
+
+#[test]
+fn readme_states_the_api_contract_precisely() {
+    let section = agent_api_section();
+    let text = section.split_whitespace().collect::<Vec<_>>().join(" ");
+    for claim in [
+        r#"{"error":"<message>"}"#,
+        "`400`",
+        "`403`",
+        "`404`",
+        "`405`",
+        "`409`",
+        "`413`",
+        "`500`",
+        "10,000 characters",
+        r#"`id` is a string such as `"a1"`"#,
+        "`null` for a whole-document comment",
+        r#"`{"finished":true}`"#,
+        "`finished`",
+        "`client_id`",
+        "`ETag`",
+        "`If-None-Match`",
+        "`304`",
+        "`can_annotate`",
+        "`can_finish`",
+        "a credential was configured",
+        "Unicode `White_Space`",
+        "`char::is_whitespace`",
+        "not Python's `str.isspace` and not JavaScript's `\\s`",
+        "Unicode scalar values of `projected_text`",
+        "`markdown` and `projected_text` can differ",
+        "quote from `projected_text`",
+        "may still be applied",
+        "`alpha\\u001fbeta gamma`",
+        "`[10, 15)`",
+        "`api_version`",
+    ] {
+        assert!(text.contains(claim), "README Agent HTTP API: {claim}");
+    }
+}

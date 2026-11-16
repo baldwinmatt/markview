@@ -107,11 +107,11 @@ API uses the server's document allowlist and requires a `Host` of
 
 | Method and path relative to the API base | Response or operation |
 | --- | --- |
-| `GET /documents` | `documents` in served order, each with its `route`. Also returns `default_document` (a route) and the `can_annotate` and `can_finish` configuration flags. |
-| `GET /document?doc=…` | `route`, current `title`, raw `markdown`, `source_revision`, and `projected_text` for anchoring comments. |
-| `GET /annotations?doc=…` | `source_revision`, `store_revision`, and `annotations` including open and resolved comments. Each annotation includes `id`, `status`, `body`, `quote`, `lines`, `section`, `attached`, and `range`. |
-| `POST /annotations` | Add or update a saved comment. Returns the updated annotation response. |
-| `GET /review` | In `--review`, returns `review_revision`, the number of open `comments`, and the number of `documents` with open comments. |
+| `GET /documents` | `api_version` (`1`), `documents` in served order, each with its `route`, `default_document` (a route), and the `can_annotate` and `can_finish` flags. |
+| `GET /document?doc=…` | `route`, current `title`, raw `markdown`, `source_revision`, and `projected_text` for anchoring comments. Sends an `ETag`. |
+| `GET /annotations?doc=…` | `source_revision`, `store_revision`, and `annotations`, open and resolved. Each has `id`, `status`, `body`, `quote`, `lines`, `section`, `attached`, `range` and `client_id`. |
+| `POST /annotations` | Add, edit, resolve or delete a saved comment. Returns the updated annotation response. |
+| `GET /review` | In `--review`, returns `review_revision`, the number of open `comments`, the number of `documents` with open comments, and `finished` (`false`). |
 | `POST /review` | In `--review`, submit a collection verdict. Returns `{"finished":true}` and completes the waiting CLI command. |
 
 Use the route as returned by the catalog, then encode it as a query or form
@@ -120,16 +120,29 @@ value. For example, the route `/Release%20notes.md` becomes
 
 ```sh
 API=http://localhost:7878/_markview/api/v1
-curl -fsS "$API/documents"
-curl -fsSG --data-urlencode 'doc=/Release%20notes.md' "$API/document"
+curl -sS --fail-with-body "$API/documents"
+curl -sS --fail-with-body -G --data-urlencode 'doc=/Release%20notes.md' "$API/document"
 ```
+
+Plain `curl -f` throws away the body of an error, which is where the reason
+is. Use `--fail-with-body` (curl 7.76 or later), or print the status with
+`-w '%{http_code}'`, so a refused request still shows its `{"error":"<message>"}`.
+
+#### Writing
 
 To enable API writes, start the server with `MARKVIEW_API_TOKEN` set to a
 random 64-character lowercase hex string (for example, generate it with
 `openssl rand -hex 32`). Use `--serve --annotate` for comments or
 `--review` for comments and a verdict. Give the agent the server URL and
 token. All POST requests use `Authorization: Bearer <token>` and
-`application/x-www-form-urlencoded` bodies.
+`application/x-www-form-urlencoded` bodies. An empty variable counts as unset;
+any other malformed value stops the server at startup.
+
+`can_annotate` and `can_finish` report what this server accepts from the
+caller: `can_annotate` is `true` when a credential was configured and the
+server runs with `--annotate` or `--review`, and `can_finish` additionally
+needs `--review`. A server in `--review` mode without a token reports both as
+`false`, because it has no way to accept an API write.
 
 | Operation | Form fields |
 | --- | --- |
@@ -140,14 +153,13 @@ token. All POST requests use `Authorization: Bearer <token>` and
 | Delete a comment | `op=delete`, `doc`, `id`, `store_revision` |
 | Submit a verdict | `op=finish`, `doc`, `source_revision` from that document, `review_revision` from the collection summary, and `verdict=approved` or `verdict=changes` |
 
-For an anchored comment, select a substring in `projected_text` and use it
-as the quote. Count Unicode code points excluding whitespace to get the
-zero-based, half-open range `[start, end)`. Returned `range` uses the
-same offsets. Returned `lines` contains the first and last source lines,
-both 1-based and inclusive.
+An `id` is a string such as `"a1"`; send it back as `id=a1`. `quote`, `lines`,
+`section` and `range` are `null` for a whole-document comment. A
+`body` is at most 10,000 characters and a `quote` at most 1,000; a whole form
+is at most 160 KiB.
 
 ```sh
-curl -fsS "$API/annotations" \
+curl -sS --fail-with-body "$API/annotations" \
   -H "Authorization: Bearer $MARKVIEW_API_TOKEN" \
   --data-urlencode 'op=add' \
   --data-urlencode 'doc=/Release%20notes.md' \
@@ -155,12 +167,36 @@ curl -fsS "$API/annotations" \
   --data-urlencode "source_revision=$SOURCE_REVISION"
 ```
 
-A verdict covers the entire collection. For `verdict=changes`, save at least
-one open comment first. For either verdict, fetch the collection summary
-after saving comments, then verify that each document still has the
-`source_revision` you reviewed before submitting. An HTTP `409` means
-the revision is stale, a store conflict needs attention, or the verdict
-has already been accepted. Re-fetch the relevant state before resubmitting.
+#### Anchoring a comment
+
+Select a substring of `projected_text` and send it as `quote`. To get its
+offsets, count Unicode scalar values of `projected_text` and skip every
+scalar that is Unicode `White_Space`, which is exactly what Rust's
+`char::is_whitespace` skips: not Python's `str.isspace` and not JavaScript's
+`\s`, which disagree about some characters. The range `[start, end)` is
+zero-based and half-open over the scalars that are left. Returned `range` uses
+the same offsets, and `lines` holds the first and last source line, 1-based
+and inclusive.
+
+For example, the document `alpha\u001fbeta gamma` (U+001F is not
+`White_Space`, so it is counted) has `projected_text` `alpha\u001fbeta gamma`,
+and `gamma` is `[10, 15)`. A count that treats U+001F as whitespace gets
+`[9, 14)` and is refused with `400`.
+
+`markdown` and `projected_text` can differ: the text is the rendered
+document, without markup, and source repairs (such as mojibake or a byte-order
+mark) apply to it. Always quote from `projected_text`, never from `markdown`.
+
+#### Revisions, conditional requests and retries
+
+`GET /document` sends `ETag: "<source_revision>"`, and a request with a
+matching `If-None-Match` is answered `304` with no body. The response is
+`Cache-Control: no-cache`, so a cache may keep it but revalidates.
+
+Every add names the `source_revision` it was written against, and every
+edit, status change and delete names the `store_revision` it read. A stale
+revision is `409`: fetch the document or annotations again and decide again.
+
 An add can lose its response, and the first attempt may still be applied.
 To retry safely, send `client_id` (1-64 letters, digits or `. _ : -`) with the
 add. The server saves it with the comment and returns it as `client_id` in the
@@ -169,6 +205,28 @@ current annotations, even if the document or store changed since the first
 attempt, so the same finding is only added once. An add may also send
 `store_revision` to be refused with `409` when the store changed since that
 revision.
+
+#### Errors
+
+A refused request has a JSON body `{"error":"<message>"}`, with `"finished":true`
+added when the review already has a verdict.
+
+| Status | Meaning |
+| --- | --- |
+| `400` | The request is malformed: bad form fields, a missing or empty revision, a quote that does not match its range, an oversized body or field, or a bad `client_id`. |
+| `403` | The `Host` is not loopback, API writes are disabled on this server, or the bearer token is missing or wrong. |
+| `404` | The route does not exist or this server does not offer it (for example `/review` outside `--review`), whatever the method; or the document is not served or can no longer be found. |
+| `405` | The route exists but not for that method. |
+| `409` | A revision is stale, the store or collection changed, or the review is already finished. |
+| `413` | `GET /document` was asked for a file over 16 MiB. |
+| `500` | A served document or store cannot be read (the message names the document and the cause, never a path). |
+
+A verdict covers the entire collection. For `verdict=changes`, save at least
+one open comment first. For either verdict, fetch the collection summary
+after saving comments, then verify that each document still has the
+`source_revision` you reviewed before submitting. After a verdict, `GET /review`
+returns exactly `{"finished":true}` and every write is `409` with
+`"finished":true`.
 
 ### Review comments
 

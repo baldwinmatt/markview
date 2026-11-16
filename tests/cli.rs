@@ -4713,3 +4713,35 @@ fn api_v1_responses_have_exactly_these_keys() {
         )
     );
 }
+
+#[test]
+fn the_documented_anchor_offsets_count_every_scalar_that_is_not_unicode_whitespace() {
+    // `alpha\u{1f}beta gamma`: U+001F is not White_Space (Python's isspace
+    // says it is), so it counts and `gamma` is [10, 15), not [9, 14).
+    let dir = tempfile::tempdir().unwrap();
+    let source = "alpha\u{1f}beta gamma\n";
+    std::fs::write(dir.path().join("README.md"), source).unwrap();
+    let token = "a9".repeat(32);
+    let server = start_api_server(dir.path(), &token, false);
+    let port = server.port;
+    let api = "/_markview/api/v1";
+    let document = http_get_local(port, &format!("{api}/document?doc=%2FREADME.md"));
+    assert!(
+        document.contains(r#""projected_text":"alpha\u001fbeta gamma""#),
+        "{document}"
+    );
+    let revision = markview::annotations::source_revision(source);
+    let add = |start: u32, end: u32| {
+        post_form(
+            port,
+            &format!("{api}/annotations"),
+            &format!("Authorization: Bearer {token}"),
+            &format!("op=add&doc=%2FREADME.md&body=Note&quote=gamma&start={start}&end={end}&source_revision={revision}"),
+        )
+    };
+    let wrong = add(9, 14);
+    assert!(wrong.starts_with("HTTP/1.1 400"), "{wrong}");
+    let right = add(10, 15);
+    assert!(right.starts_with("HTTP/1.1 200"), "{right}");
+    assert!(right.contains(r#""range":[10,15]"#), "{right}");
+}

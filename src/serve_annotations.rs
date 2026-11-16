@@ -15,6 +15,7 @@ use super::{
 
 const ENDPOINT: &str = "/_markview/annotations";
 const HEAD_CAP: usize = 32 * 1024;
+const HOST_SCAN_CAP: usize = 256 * 1024;
 
 pub fn reserved(target: &str) -> bool {
     let path = target.split(['?', '#']).next().unwrap_or(target);
@@ -62,6 +63,69 @@ pub fn blocked_destination(kind: DestinationKind, destination: &str) -> bool {
     ["javascript", "vbscript"]
         .iter()
         .any(|blocked| scheme.eq_ignore_ascii_case(blocked))
+}
+
+/// Whether a `Host` header value names this server on loopback. DNS resolves
+/// names case-insensitively and accepts one trailing dot, so browsers send
+/// `LOCALHOST:7878` or `localhost.:7878` for the same origin. Any other name
+/// or port may be a DNS-rebinding page and is refused.
+pub fn loopback_host(host: &str, port: u16) -> bool {
+    let Some((name, host_port)) = host.rsplit_once(':') else {
+        return false;
+    };
+    host_port == port.to_string()
+        && (name == "127.0.0.1"
+            || name
+                .strip_suffix('.')
+                .unwrap_or(name)
+                .eq_ignore_ascii_case("localhost"))
+}
+
+/// Finds the `Host` header of an ordinary request without the strict
+/// parser's rules: any line ending, any bytes. `None` means the request has
+/// no single well-formed Host within the cap and deadline, so the caller
+/// treats the client as untrusted and still serves the page.
+pub fn lenient_host(reader: &mut BufReader<TcpStream>, deadline: Instant) -> Option<String> {
+    let mut budget = HOST_SCAN_CAP;
+    let mut host = None;
+    loop {
+        let line = bounded_bytes(reader, deadline, budget, true).ok()?;
+        budget -= line.len();
+        let line = line.strip_suffix(b"\n")?;
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            return host;
+        }
+        if line.len() >= 5 && line[..5].eq_ignore_ascii_case(b"host:") {
+            let value = String::from_utf8_lossy(&line[5..]);
+            if host
+                .replace(value.trim_matches([' ', '\t']).to_owned())
+                .is_some()
+            {
+                return None;
+            }
+        }
+    }
+}
+
+/// Compares a presented token with the real one without stopping at the
+/// first difference: every byte of the real token is always examined, so the
+/// time taken says nothing about how much of a guess was right. Returns the
+/// accumulated difference (zero only for an exact match) and the number of
+/// bytes compared.
+fn token_difference(presented: &[u8], expected: &[u8]) -> (usize, usize) {
+    let mut difference = presented.len() ^ expected.len();
+    let mut compared = 0;
+    for (index, byte) in expected.iter().enumerate() {
+        difference |= usize::from(byte ^ presented.get(index).copied().unwrap_or(0));
+        compared += 1;
+    }
+    (difference, compared)
+}
+
+fn token_matches(presented: Option<&str>, expected: &str) -> bool {
+    presented
+        .is_some_and(|presented| token_difference(presented.as_bytes(), expected.as_bytes()).0 == 0)
 }
 
 pub struct HttpRequest {
@@ -241,9 +305,10 @@ pub fn handle(
             head,
         )
     };
-    if !request.header("host").is_some_and(|host| {
-        host == format!("localhost:{}", config.port) || host == format!("127.0.0.1:{}", config.port)
-    }) {
+    if !request
+        .header("host")
+        .is_some_and(|host| loopback_host(host, config.port))
+    {
         return fail(stream, "403 Forbidden", "invalid Host");
     }
     let (path, query) = request
@@ -278,7 +343,8 @@ pub fn handle(
                 .and_then(|source| annotations::read(&location, &TextProjection::new(&source)))
         }
         "POST" if config.review_token.is_some() => {
-            if request.header("x-markview-token") != config.review_token.as_deref() {
+            let expected = config.review_token.as_deref().expect("checked token");
+            if !token_matches(request.header("x-markview-token"), expected) {
                 return fail(stream, "403 Forbidden", "invalid annotation token");
             }
             let length = request
@@ -343,42 +409,16 @@ pub fn handle(
     }
 }
 
-pub fn script(route: &str, token: Option<&str>) -> String {
+pub fn script(route: &str, token: Option<&str>, port: u16) -> String {
     format!(
         "{}\n(() => {{
           const route = {};
           const token = {};
-          const review = createMarkviewReview(document.querySelector('main'), document.body, async (form) => {{
-            form.set('doc', route);
-            const response = await fetch('{}', {{ method: 'POST',
-              headers: {{'X-Markview-Token': token}}, body: form }});
-            const data = await response.json();
-            if (!response.ok) {{
-              if (response.status === 409) window.markviewReviewRefresh();
-              throw new Error(data.error);
-            }}
-            window.markviewReviewRefresh();
-            return data;
-          }});
-          let requested = 0;
-          window.markviewReviewRefresh = async () => {{
-            const sequence = ++requested;
-            const revision = document.querySelector('main').dataset.sourceRevision;
-            review.show(route, revision, Boolean(token), Boolean(token));
-            try {{
-              const response = await fetch('{}?doc=' + encodeURIComponent(route), {{cache: 'no-store'}});
-              const data = await response.json();
-              if (sequence === requested && response.ok && revision === data.source_revision) review.update(data);
-            }} catch {{ /* Live reload will retry on the next change. */ }}
-          }};
-          window.markviewReviewRoute = route;
-          window.markviewReviewRefresh();
+          markviewServeReview(route, token, {port});
         }})();",
         annotations::REVIEW_SCRIPT,
         annotations::json_string(route),
         token.map_or("null".to_owned(), annotations::json_string),
-        ENDPOINT,
-        ENDPOINT,
     )
 }
 
@@ -439,6 +479,34 @@ mod tests {
     );
 
     #[test]
+    fn token_comparison_examines_every_byte() {
+        let token = "0123456789abcdef".repeat(3);
+        let expected = token.as_bytes();
+        let mut first = expected.to_vec();
+        first[0] ^= 1;
+        let mut last = expected.to_vec();
+        *last.last_mut().unwrap() ^= 1;
+        let longer = [expected, b"0"].concat();
+        // Wherever the guess goes wrong, or however long it is, the whole
+        // real token is compared: there is no early exit to time.
+        for (guess, matches) in [
+            (expected, true),
+            (first.as_slice(), false),
+            (last.as_slice(), false),
+            (&expected[..1], false),
+            (longer.as_slice(), false),
+            (b"".as_slice(), false),
+        ] {
+            let (difference, compared) = token_difference(guess, expected);
+            assert_eq!(difference == 0, matches, "{guess:?}");
+            assert_eq!(compared, expected.len(), "{guess:?}");
+        }
+        assert!(token_matches(Some(&token), &token));
+        assert!(!token_matches(None, &token));
+        assert!(!token_matches(Some("guessed"), &token));
+    }
+
+    #[test]
     fn server_renders_normalized_safe_destinations_and_nonce_scripts() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("review.md");
@@ -448,9 +516,13 @@ mod tests {
         let mut config = ServeConfig::from_inputs(vec![path, target], 7878, false).unwrap();
         config.review_token = Some("test-only".to_owned());
         let nonce = annotations::random_hex().unwrap();
-        let html =
-            super::super::render_file(&config, config.default_document().unwrap(), Some(&nonce))
-                .unwrap();
+        let html = super::super::render_file(
+            &config,
+            config.default_document().unwrap(),
+            Some(&nonce),
+            config.review_token.as_deref(),
+        )
+        .unwrap();
         assert_eq!(
             html.matches(&format!("<script nonce=\"{nonce}\">")).count(),
             2

@@ -1734,7 +1734,7 @@ fn serve_annotations_enforces_http_boundaries_and_keeps_stores_in_sync() {
         ServeProcess::try_start_with_env(&[&docs], 0, false, true, false, None, true).unwrap();
     let port = server.port;
     let host = format!("localhost:{port}");
-    let page = http_get(port, "/");
+    let page = http_get_local(port, "/");
     let token = review_token(&page);
     let token = token.as_str();
     let nonce = page
@@ -1887,6 +1887,15 @@ fn serve_mode_blocks_executable_destinations_but_keeps_data_images() {
     );
 }
 
+/// Fetches a page the way a browser on this machine does. The write token is
+/// only embedded for a loopback `Host` that names the server's own port.
+fn http_get_local(port: u16, route: &str) -> String {
+    raw_http(
+        port,
+        &format!("GET {route} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"),
+    )
+}
+
 /// The review token a `--annotate` page embeds for its own POSTs.
 fn review_token(page: &str) -> String {
     page.split("const token = \"")
@@ -1915,7 +1924,7 @@ fn serve_annotations_accepts_writes_next_to_a_hand_edited_section() {
     std::fs::write(&store, hand_edited).unwrap();
     let server =
         ServeProcess::try_start_with_env(&[&doc], 0, false, false, false, None, true).unwrap();
-    let token = review_token(&http_get(server.port, "/"));
+    let token = review_token(&http_get_local(server.port, "/"));
 
     let added = post_annotation(
         server.port,
@@ -1949,7 +1958,7 @@ fn serve_annotations_rejects_a_body_that_exceeds_the_read_deadline() {
     std::fs::write(&doc, "# Test").unwrap();
     let server =
         ServeProcess::try_start_with_env(&[&doc], 0, false, false, false, None, true).unwrap();
-    let page = http_get(server.port, "/");
+    let page = http_get_local(server.port, "/");
     let token = review_token(&page);
     let token = token.as_str();
     let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
@@ -2087,7 +2096,7 @@ fn serve_annotations_delivers_the_error_when_rejecting_a_large_post() {
     let server =
         ServeProcess::try_start_with_env(&[&doc], 0, false, false, false, None, true).unwrap();
     let port = server.port;
-    let token = review_token(&http_get(port, "/"));
+    let token = review_token(&http_get_local(port, "/"));
     let body = format!("op=add&doc=%2Fdoc.md&body={}", "x".repeat(150_000));
     let request = |host: &str, token: &str, content_type: &str| {
         format!(
@@ -2135,6 +2144,107 @@ fn serve_annotations_delivers_the_error_when_rejecting_a_large_post() {
         assert_eq!(delivered, 20, "{name}: complete responses out of 20");
     }
     assert!(!dir.path().join(".markview").exists());
+}
+
+#[test]
+fn serve_annotations_accepts_only_loopback_host_spellings() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = dir.path().join("doc.md");
+    std::fs::write(&doc, "# Doc\n").unwrap();
+    let server =
+        ServeProcess::try_start_with_env(&[&doc], 0, false, false, false, None, true).unwrap();
+    let port = server.port;
+    let status = |host: &str| {
+        let response = raw_http(
+            port,
+            &format!("GET /_markview/annotations?doc=%2Fdoc.md HTTP/1.1\r\nHost: {host}\r\n\r\n"),
+        );
+        response[..response.len().min(12)].to_owned()
+    };
+    for host in [
+        format!("localhost:{port}"),
+        format!("LOCALHOST:{port}"),
+        format!("localhost.:{port}"),
+        format!("LocalHost.:{port}"),
+        format!("127.0.0.1:{port}"),
+    ] {
+        assert_eq!(status(&host), "HTTP/1.1 200", "{host}");
+    }
+    for host in [
+        format!("localhost:{}", port.wrapping_add(1).max(1)),
+        "localhost".to_owned(),
+        format!("evil.test:{port}"),
+        format!("localhost.evil.test:{port}"),
+        format!("localhost..:{port}"),
+        format!("127.0.0.1.:{port}"),
+        format!("127.0.0.2:{port}"),
+        format!("localhost:{port}:{port}"),
+        format!("localhost:0{port}"),
+    ] {
+        assert_eq!(status(&host), "HTTP/1.1 403", "{host}");
+    }
+
+    // A page reached through any other name is rendered read-only, so a
+    // DNS-rebinding page cannot read the write token out of it.
+    let page = |host: &str| raw_http(port, &format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n"));
+    for host in [format!("localhost:{port}"), format!("LOCALHOST.:{port}")] {
+        assert_eq!(review_token(&page(&host)).len(), 48, "{host}");
+    }
+    for request in [
+        format!("GET / HTTP/1.1\r\nHost: evil.test:{port}\r\n\r\n"),
+        format!("GET / HTTP/1.1\r\nHost: localhost:{port}\r\nHost: evil.test:{port}\r\n\r\n"),
+        "GET / HTTP/1.0\r\n\r\n".to_owned(),
+    ] {
+        let page = raw_http(port, &request);
+        assert!(page.starts_with("HTTP/1.1 200"), "{request:?}");
+        assert!(page.contains("const token = null"), "{request:?}");
+        assert!(!page.contains("const token = \""), "{request:?}");
+    }
+}
+
+#[test]
+fn serve_annotate_sandboxes_assets_and_warns_about_a_reserved_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("site");
+    let reserved = root.join("_markview");
+    std::fs::create_dir_all(&reserved).unwrap();
+    std::fs::write(root.join("doc.md"), "# Doc\n\n[data](data.xml)\n").unwrap();
+    std::fs::write(
+        root.join("data.xml"),
+        "<svg xmlns=\"http://www.w3.org/2000/svg\"/>",
+    )
+    .unwrap();
+    std::fs::write(reserved.join("one.md"), "# One").unwrap();
+    std::fs::write(reserved.join("two.md"), "# Two").unwrap();
+
+    let annotate =
+        ServeProcess::try_start_with_env(&[&root], 0, false, true, false, None, true).unwrap();
+    let asset = http_get(annotate.port, "/data.xml");
+    assert!(asset.starts_with("HTTP/1.1 200"), "{asset}");
+    assert!(
+        asset.contains("\r\nContent-Security-Policy: sandbox\r\n"),
+        "{asset}"
+    );
+    assert!(
+        asset.contains("\r\nX-Content-Type-Options: nosniff\r\n"),
+        "{asset}"
+    );
+    // The skipped directory is named once, however many files it holds.
+    let warning = format!(
+        "markview: warning: not serving {}: the /_markview/ route prefix is reserved",
+        reserved.canonicalize().unwrap().display()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !annotate.stderr_so_far().contains(&warning) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(annotate.stderr_so_far().matches(&warning).count(), 1);
+    assert!(http_get(annotate.port, "/_markview/one.md").starts_with("HTTP/1.1 403"));
+
+    let plain = ServeProcess::start_recursive_dir(&root);
+    let asset = http_get(plain.port, "/data.xml");
+    assert!(asset.starts_with("HTTP/1.1 200"), "{asset}");
+    assert!(!asset.contains("Content-Security-Policy"), "{asset}");
 }
 
 fn raw_http(port: u16, request: &str) -> String {

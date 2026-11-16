@@ -283,7 +283,7 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
   function render() {
     const entries = review?.annotations || [];
     const openCount = entries.filter(entry => entry.status === 'open').length;
-    panel.hidden = !key || (!writable && !entries.length);
+    panel.hidden = !key || (!writable && !entries.length && !errors.get(key));
     whole.hidden = !writable || !canAdd;
     resolvedToggle.checked = Boolean(showResolved.get(key));
     resolvedLabel.hidden = !entries.some(entry => entry.status === 'resolved');
@@ -378,6 +378,42 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
       render();
     }
   };
+}
+
+// Transport for `markview --serve`: reads the annotations of one served route
+// and posts changes with the page's write token (null on a read-only page).
+function markviewServeReview(route, token, port) {
+  const endpoint = '/_markview/annotations';
+  const root = document.querySelector('main');
+  const review = createMarkviewReview(root, document.body, async (form) => {
+    form.set('doc', route);
+    const response = await fetch(endpoint, {method: 'POST', headers: {'X-Markview-Token': token}, body: form});
+    const data = await response.json();
+    if (!response.ok) {
+      if (response.status === 409) window.markviewReviewRefresh();
+      throw new Error(data.error);
+    }
+    window.markviewReviewRefresh();
+    return data;
+  });
+  let requested = 0;
+  window.markviewReviewRefresh = async () => {
+    const sequence = ++requested;
+    const revision = root.dataset.sourceRevision;
+    review.show(route, revision, Boolean(token), Boolean(token));
+    try {
+      const response = await fetch(endpoint + '?doc=' + encodeURIComponent(route), {cache: 'no-store'});
+      if (response.status === 403 && sequence === requested) {
+        // The server answers `/_markview/` only for its loopback Host.
+        review.unavailable('Open this page at localhost:' + port + ' to review.');
+        return;
+      }
+      const data = await response.json();
+      if (sequence === requested && response.ok && revision === data.source_revision) review.update(data);
+    } catch { /* Live reload will retry on the next change. */ }
+  };
+  window.markviewReviewRoute = route;
+  return window.markviewReviewRefresh();
 }
 
 if (typeof module === 'object') {

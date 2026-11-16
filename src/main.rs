@@ -175,6 +175,9 @@ struct ServeConfig {
     default_document: PathBuf,
     port: u16,
     review_token: Option<String>,
+    /// Directories under the root that are not served because their route
+    /// would fall under the reserved `/_markview/` prefix.
+    reserved: Vec<PathBuf>,
     mode: ServeMode,
     sidebar_nav: Option<NavDir>,
     /// Memoized `scan_assets()` result, invalidated by comparing each served
@@ -210,6 +213,7 @@ struct ServeBuild {
     documents: Vec<ServedDocument>,
     default_document: PathBuf,
     mode: ServeMode,
+    reserved: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,6 +298,13 @@ fn serve_markdown(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = ServeConfig::from_inputs(inputs.clone(), port, recurse)?;
     config.review_token = annotate.then(annotations::random_hex).transpose()?;
+    // Said once, at startup: a rescan builds a fresh config but stays quiet.
+    for directory in &config.reserved {
+        eprintln!(
+            "markview: warning: not serving {}: the /_markview/ route prefix is reserved",
+            directory.display()
+        );
+    }
     #[cfg(unix)]
     let listener = if std::env::var_os("MARKVIEW_INHERITED_LISTENER").is_some() {
         let listener = TcpListener::from(io::stdin().as_fd().try_clone_to_owned()?);
@@ -551,6 +562,7 @@ impl ServeConfig {
             default_document: build.default_document,
             port,
             review_token: None,
+            reserved: build.reserved,
             mode: build.mode,
             sidebar_nav,
             asset_cache: Mutex::new(None),
@@ -598,6 +610,7 @@ impl ServeConfig {
             documents,
             default_document,
             mode,
+            reserved: Vec::new(),
         })
     }
 
@@ -613,6 +626,7 @@ impl ServeConfig {
 
         let mut collision_keys: Vec<String> = Vec::new();
         let mut documents = Vec::new();
+        let mut reserved = Vec::new();
         for candidate in candidates {
             let canonical = candidate.canonicalize()?;
             if !canonical.starts_with(&root) {
@@ -626,6 +640,10 @@ impl ServeConfig {
             let relative = canonical.strip_prefix(&root).unwrap_or(&canonical);
             let route_path = relative_to_route(relative);
             if serve_annotations::reserved(&route_path) {
+                let directory = root.join(relative.iter().next().unwrap_or_default());
+                if !reserved.contains(&directory) {
+                    reserved.push(directory);
+                }
                 continue;
             }
             if documents
@@ -674,6 +692,7 @@ impl ServeConfig {
             documents,
             default_document,
             mode: ServeMode::Directory,
+            reserved,
         })
     }
 
@@ -1372,6 +1391,15 @@ fn handle_connection(
             Err(error) => Err(error),
         };
     }
+    // The write token goes only into pages requested by a loopback name.
+    // Reached through any other Host the page is read-only, so a page that
+    // rebinds its own name to this server finds no token to harvest.
+    let token = |reader: &mut BufReader<TcpStream>| {
+        config.review_token.as_deref().filter(|_| {
+            serve_annotations::lenient_host(reader, deadline)
+                .is_some_and(|host| serve_annotations::loopback_host(&host, config.port))
+        })
+    };
     let result = if !matches!(method, "GET" | "HEAD") {
         write_response(
             &mut stream,
@@ -1383,7 +1411,10 @@ fn handle_connection(
     } else {
         match route {
             "/" => match config.default_document() {
-                Some(document) => serve_document(&mut stream, config, document, head_only),
+                Some(document) => {
+                    let token = token(&mut reader);
+                    serve_document(&mut stream, config, document, head_only, token)
+                }
                 None => write_404(&mut stream, head_only),
             },
             "/events" => {
@@ -1392,7 +1423,8 @@ fn handle_connection(
             "/favicon.ico" => serve_favicon(&mut stream, config, head_only),
             _ => {
                 if let Some(document) = config.document_by_route(route) {
-                    serve_document(&mut stream, config, document, head_only)
+                    let token = token(&mut reader);
+                    serve_document(&mut stream, config, document, head_only, token)
                 } else if let Some(asset) = config.asset_by_route(route) {
                     serve_asset(&mut stream, config, &asset, head_only)
                 } else {
@@ -1450,12 +1482,13 @@ fn serve_favicon(stream: &mut TcpStream, config: &ServeConfig, head_only: bool) 
     let candidate = config.root.join("favicon.ico");
     if let Some(canonical) = validated_served_path(&config.root, &candidate) {
         if let Ok(bytes) = fs::read(&canonical) {
-            return write_bytes_response(
+            return write_response_headers(
                 stream,
                 "200 OK",
                 safe_content_type("favicon.ico"),
                 &bytes,
                 head_only,
+                asset_policy(config),
             );
         }
     }
@@ -1467,13 +1500,14 @@ fn serve_document(
     config: &ServeConfig,
     document: &ServedDocument,
     head_only: bool,
+    token: Option<&str>,
 ) -> io::Result<()> {
     let nonce = config
         .review_token
         .as_ref()
         .map(|_| annotations::random_hex())
         .transpose()?;
-    match render_file(config, document, nonce.as_deref()) {
+    match render_file(config, document, nonce.as_deref(), token) {
         Ok(html) => {
             let policy = nonce.map(|nonce| format!("Content-Security-Policy: default-src 'self'; script-src 'nonce-{nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' https: http: data:; object-src 'none'; base-uri 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'none'\r\n"));
             write_response_headers(
@@ -1496,6 +1530,17 @@ fn serve_document(
     }
 }
 
+/// With `--annotate` the origin holds a write token, so a served file opened
+/// as a document must not be able to act as that origin. `sandbox` gives it
+/// an opaque origin and no script; images and downloads are unaffected.
+fn asset_policy(config: &ServeConfig) -> &'static str {
+    if config.review_token.is_some() {
+        "Content-Security-Policy: sandbox\r\n"
+    } else {
+        ""
+    }
+}
+
 fn serve_asset(
     stream: &mut TcpStream,
     config: &ServeConfig,
@@ -1509,7 +1554,14 @@ fn serve_asset(
         return write_404(stream, head_only);
     }
     match fs::read(&asset.source_path) {
-        Ok(bytes) => write_bytes_response(stream, "200 OK", asset.content_type, &bytes, head_only),
+        Ok(bytes) => write_response_headers(
+            stream,
+            "200 OK",
+            asset.content_type,
+            &bytes,
+            head_only,
+            asset_policy(config),
+        ),
         Err(_) => write_404(stream, head_only),
     }
 }
@@ -1563,6 +1615,7 @@ fn render_file(
     config: &ServeConfig,
     served: &ServedDocument,
     nonce: Option<&str>,
+    token: Option<&str>,
 ) -> io::Result<String> {
     if validated_served_path(&config.root, &served.source_path).is_none() {
         return Err(io::Error::new(
@@ -1592,6 +1645,7 @@ fn render_file(
         }),
         &revision,
         nonce,
+        token,
     ))
 }
 
@@ -1812,6 +1866,7 @@ fn inject_serve_shell(
     html: &str,
     revision: &str,
     nonce: Option<&str>,
+    token: Option<&str>,
 ) -> String {
     let nav = render_nav(config, active_route);
     let modified_attr = modified_at
@@ -2101,7 +2156,7 @@ fn inject_serve_shell(
         &format!(r#"<main data-source-revision="{revision}">"#),
         1,
     );
-    let review = serve_annotations::script(active_route, config.review_token.as_deref());
+    let review = serve_annotations::script(active_route, token, config.port);
     let nonce_attr = nonce.map_or(String::new(), |nonce| format!(r#" nonce="{nonce}""#));
     let script = script.replacen("<script>", &format!("<script{nonce_attr}>"), 1);
     html.replace(

@@ -101,6 +101,13 @@ Paths mirror the source tree below that root. For example, repository file
 `.gitignore` for local review. Exclude the generated `*.markview-lock` files
 if you commit comments.
 
+`/_markview/` is a reserved route prefix, like `/events`. A directory named
+`_markview` at the top of a served directory is not served; Markview prints a
+warning naming it at startup. The annotation endpoint under that prefix
+answers only when the page is opened as `localhost:<port>` or
+`127.0.0.1:<port>`. Opened through any other host name, the page is read-only
+and says where to open it instead.
+
 Agents can run `markview --annotations <FILE or DIR>...` to see open comments
 and current lines. After addressing a comment, change its header from
 `[open]` to `[resolved]` in the store. Markview locks its own writes and

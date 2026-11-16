@@ -2713,6 +2713,61 @@ mod serve_nav_tests {
     }
 
     #[test]
+    fn store_changes_inside_the_served_tree_do_not_reload_documents() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let readme = dir.path().join("README.md");
+        fs::write(&readme, "# Home").unwrap();
+        let config = ServeConfig::from_inputs(vec![dir.path().to_path_buf()], 0, true).unwrap();
+        let shared: SharedConfig = Arc::new(RwLock::new(Arc::new(config)));
+        let (tx, rx) = mpsc::channel();
+        let clients = Arc::new(Mutex::new(vec![(0, tx)]));
+        let store = dir.path().join(".markview/annotations");
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("README.md"), "## a1 [open] document\n\nNote\n").unwrap();
+        let handle = |kind: EventKind, path: PathBuf| {
+            handle_fs_events(
+                vec![notify::Event::new(kind).add_path(path)],
+                &shared,
+                &clients,
+                &test_stores(),
+                &[dir.path().to_path_buf()],
+                0,
+                true,
+            );
+        };
+        // Everything a store write does: directories, the store file, its
+        // lock and its temporary file. The store watcher reports these as
+        // `annotations` events; the document must not be re-rendered too.
+        let created = EventKind::Create(notify::event::CreateKind::Any);
+        let modified = EventKind::Modify(ModifyKind::Any);
+        for (kind, path) in [
+            (created, dir.path().join(".markview")),
+            (created, store.clone()),
+            (created, store.join("README.md")),
+            (modified, store.join("README.md")),
+            (created, store.join("README.md.markview-lock")),
+            (created, store.join(".markview-0123.tmp")),
+            (
+                EventKind::Remove(notify::event::RemoveKind::Any),
+                store.join("README.md"),
+            ),
+        ] {
+            handle(kind, path.clone());
+            assert!(
+                rx.recv_timeout(Duration::from_millis(100)).is_err(),
+                "{} reloaded the document",
+                path.display()
+            );
+        }
+        // The same handler does reload for the document itself.
+        handle(modified, readme);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)),
+            Ok(ReloadKind::Content)
+        );
+    }
+
+    #[test]
     fn structural_event_bursts_share_one_rescan() {
         let dir = tempfile::tempdir().expect("temp dir");
         std::fs::write(dir.path().join("README.md"), "# Home\n").expect("write readme");

@@ -2847,11 +2847,13 @@ fn serve_reports_store_replacement_and_deletion_above_the_serve_root() {
     std::fs::write(&temporary, "## a1 [resolved] document\n\nExpand this.\n").unwrap();
     std::fs::rename(&temporary, &store).unwrap();
     let event = read_until(&mut events, "data: /guide.md", Duration::from_secs(8));
+    // (No claim here about `data: reload`: the file watcher can still be
+    // delivering the document's own creation. That a store change does not
+    // reload the document is tested at the event handler in `src/main.rs`.)
     assert!(
         event.contains("event: annotations\ndata: /guide.md"),
         "{event}"
     );
-    assert!(!event.contains("data: reload"), "{event}");
     assert!(http_get_local(server.port, endpoint).contains("\"status\":\"resolved\""));
 
     std::fs::remove_file(&store).unwrap();

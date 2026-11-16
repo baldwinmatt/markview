@@ -28,7 +28,7 @@ pub(super) fn normalized(text: &str) -> Vec<char> {
 
 impl TextProjection {
     pub fn new(source: &str) -> Self {
-        let prepared = crate::repair_utf8_mojibake(source);
+        let prepared = crate::prepare_source(source);
         Self::from_prepared(source, &prepared)
     }
 

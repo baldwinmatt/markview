@@ -544,5 +544,7 @@ fn utc_now() -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
+#[cfg(test)]
+mod parity;
 #[cfg(all(test, unix))]
 mod tests;

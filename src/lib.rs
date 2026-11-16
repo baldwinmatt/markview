@@ -1206,7 +1206,7 @@ fn render_document_with_destinations(
     document: &MarkdownDocument,
     mut rewrite: impl FnMut(&str) -> Option<String>,
 ) -> RenderedDocument {
-    let source = repair_utf8_mojibake(document.source());
+    let source = prepare_source(document.source());
     let title = repair_utf8_mojibake(document.title());
     let events = Parser::new_ext(&source, markdown_options())
         .map(sanitize_html_event)
@@ -1229,6 +1229,15 @@ fn render_document_with_destinations(
         html,
         headings,
     }
+}
+
+/// The source text every HTML-facing consumer parses: the renderer and the
+/// annotation `TextProjection` must see identical input.
+///
+/// A browser drops U+0000 from body text, which would shift every annotation
+/// offset after it. CommonMark replaces it with U+FFFD, so do that up front.
+pub(crate) fn prepare_source(source: &str) -> String {
+    repair_utf8_mojibake(source).replace('\0', "\u{fffd}")
 }
 
 pub fn repair_utf8_mojibake(value: &str) -> String {
@@ -1755,12 +1764,7 @@ fn escape_html(value: &str) -> String {
             '>' => escaped.push_str("&gt;"),
             '"' => escaped.push_str("&quot;"),
             '\'' => escaped.push_str("&#39;"),
-            _ if !ch.is_ascii() => {
-                escaped.push_str("&#");
-                escaped.push_str(&(ch as u32).to_string());
-                escaped.push(';');
-            }
-            _ => escaped.push(ch),
+            _ => push_html_char(&mut escaped, ch),
         }
     }
     escaped
@@ -1769,17 +1773,24 @@ fn escape_html(value: &str) -> String {
 fn escape_non_ascii_html(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
-        // HTML numeric references remap C1 control codes through Windows-1252.
-        // Keep their UTF-8 spelling so the DOM and text projection agree.
-        if ch.is_ascii() || ('\u{80}'..='\u{9f}').contains(&ch) {
-            escaped.push(ch);
-        } else {
-            escaped.push_str("&#");
-            escaped.push_str(&(ch as u32).to_string());
-            escaped.push(';');
-        }
+        push_html_char(&mut escaped, ch);
     }
     escaped
+}
+
+/// Appends `ch` so a browser decodes exactly `ch`: ASCII as is and other
+/// characters as numeric references, except C1 control codes. HTML remaps
+/// numeric references in that range through Windows-1252 (`&#133;` becomes an
+/// ellipsis), so they keep their UTF-8 spelling and the DOM agrees with the
+/// annotation text projection.
+fn push_html_char(escaped: &mut String, ch: char) {
+    if ch.is_ascii() || ('\u{80}'..='\u{9f}').contains(&ch) {
+        escaped.push(ch);
+    } else {
+        escaped.push_str("&#");
+        escaped.push_str(&(ch as u32).to_string());
+        escaped.push(';');
+    }
 }
 
 struct Renderer {
@@ -2403,6 +2414,22 @@ mod tests {
         assert!(html.contains(r#"<h1 id="hello">Hello</h1>"#));
         assert!(html.contains("<strong>rendered</strong>"));
         assert!(html.contains("<main>"));
+    }
+
+    #[test]
+    fn html_renderer_keeps_c1_controls_raw_in_highlighted_code() {
+        // A numeric reference such as `&#133;` is remapped through
+        // Windows-1252 by the browser, so NEL would become an ellipsis.
+        let plain = render_html("```\n+a\u{85}b\u{80}c\n```\n");
+        assert!(plain.contains("+a\u{85}b\u{80}c"), "{plain}");
+        for language in ["diff", "rust"] {
+            let html = render_html(&format!("```{language}\n+a\u{85}b\u{80}c\n```\n"));
+            assert!(
+                !html.contains("&#133;") && !html.contains("&#128;"),
+                "{html}"
+            );
+            assert!(html.contains("+a\u{85}b\u{80}c"), "{language}: {html}");
+        }
     }
 
     #[test]

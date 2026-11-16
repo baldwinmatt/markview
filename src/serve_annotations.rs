@@ -257,13 +257,24 @@ impl HttpRequest {
     }
 }
 
-fn document(config: &ServeConfig, route: &str) -> Option<annotations::Location> {
-    // Routes are generated from the served allowlist, never joined to a path.
-    let document = if route == "/" {
-        config.default_document()?
+/// The served document a route names. Routes are generated from the served
+/// allowlist, never joined to a path.
+fn served<'a>(config: &'a ServeConfig, route: &str) -> Option<&'a super::ServedDocument> {
+    if route == "/" {
+        config.default_document()
     } else {
-        config.document_by_route(route)?
-    };
+        config.document_by_route(route)
+    }
+}
+
+fn document(config: &ServeConfig, route: &str) -> Option<annotations::Location> {
+    location(config, served(config, route)?)
+}
+
+fn location(
+    config: &ServeConfig,
+    document: &super::ServedDocument,
+) -> Option<annotations::Location> {
     let canonical = validated_served_path(&config.root, &document.source_path)?;
     if canonical != document.source_path {
         return None;
@@ -273,12 +284,56 @@ fn document(config: &ServeConfig, route: &str) -> Option<annotations::Location> 
         .filter(|location| location.document == canonical)
 }
 
-fn read_review(
+/// The review a page asks for when it loads. A failure names the document
+/// and what is wrong with it, as `markview --annotations` does, so a reader
+/// facing a page without comments knows which file to look at.
+fn page_review(
     config: &ServeConfig,
-    location: &annotations::Location,
+    document: &super::ServedDocument,
 ) -> Result<annotations::Review, Error> {
-    let source = annotations::read_source(location)?;
-    config.review_cache.read(location, &source)
+    use serve_review::DocumentProblem;
+    let Some(location) = location(config, document) else {
+        return Err(DocumentProblem::wrap(
+            config,
+            document,
+            "document",
+            &document.source_path,
+            io::Error::from(io::ErrorKind::NotFound).into(),
+            "404 Not Found",
+        ));
+    };
+    let source = annotations::read_source(&location).map_err(|error| {
+        DocumentProblem::wrap(
+            config,
+            document,
+            "document",
+            &location.document,
+            error.into(),
+            "500 Internal Server Error",
+        )
+    })?;
+    config
+        .review_cache
+        .read(&location, &source)
+        .map_err(|error| {
+            let status = status(&error);
+            DocumentProblem::wrap(
+                config,
+                document,
+                "annotation store",
+                &location.path,
+                error,
+                status,
+            )
+        })
+}
+
+fn status(error: &Error) -> &'static str {
+    match error {
+        Error::Invalid(_) => "400 Bad Request",
+        Error::Conflict(_) | Error::Section(..) => "409 Conflict",
+        Error::Io(_) => "500 Internal Server Error",
+    }
 }
 
 fn mutate_review(
@@ -430,14 +485,14 @@ pub fn handle(
             else {
                 return fail(stream, "400 Bad Request", "expected a document route");
             };
-            let Some(location) = document(&initial, &route) else {
+            let Some(document) = served(&initial, &route) else {
                 return fail(
                     stream,
                     "404 Not Found",
                     "document route or store is unavailable",
                 );
             };
-            read_review(&initial, &location).map(Some)
+            page_review(&initial, document).map(Some)
         }
         "POST" if body.is_some() => {
             // Review mutations use the current allowlist and hold it stable
@@ -485,6 +540,10 @@ fn respond_error(
     unavailable: &str,
     fail: impl FnOnce(&mut TcpStream, &str, &str) -> io::Result<()>,
 ) -> io::Result<()> {
+    if let Some(problem) = serve_review::DocumentProblem::of(&error) {
+        eprintln!("markview: {problem}");
+        return fail(stream, problem.status, &problem.public);
+    }
     let message = error.to_string();
     match error {
         Error::Invalid(_) => fail(stream, "400 Bad Request", &message),
@@ -829,7 +888,8 @@ mod tests {
         let added = mutate_review(&config, &location, form.operation).unwrap();
         // Every page load and every `annotations` event asks again.
         for _ in 0..5 {
-            assert_eq!(read_review(&config, &location).unwrap(), added);
+            let page = page_review(&config, config.default_document().unwrap());
+            assert_eq!(page.unwrap(), added);
         }
         // One projection, and one resolution: the write's own.
         assert_eq!(config.review_cache.work(), (1, 1));

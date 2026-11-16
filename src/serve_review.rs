@@ -24,6 +24,76 @@ pub fn is_finished(error: &Error) -> bool {
     matches!(error, Error::Conflict(message) if *message == FINISHED_MESSAGE)
 }
 
+/// Why one served document cannot be reviewed.
+///
+/// The page gets `public`: the document as its route names it, and the cause
+/// in Markview's own words. That text never holds an absolute path or an
+/// operating-system message. `Display` is for stderr, where whoever ran the
+/// command can use the full path and the error as it was reported.
+#[derive(Debug)]
+pub struct DocumentProblem {
+    pub public: String,
+    pub status: &'static str,
+    detail: String,
+}
+
+impl std::fmt::Display for DocumentProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for DocumentProblem {}
+
+impl DocumentProblem {
+    /// `error` as a problem with `doc`. `what` is the file that failed, "document"
+    /// or "annotation store", and `path` is where it is.
+    pub fn wrap(
+        config: &ServeConfig,
+        doc: &ServedDocument,
+        what: &str,
+        path: &Path,
+        error: Error,
+        status: &'static str,
+    ) -> Error {
+        let cause = match &error {
+            Error::Io(error) => match error.kind() {
+                io::ErrorKind::InvalidData => format!("the {what} is not valid UTF-8"),
+                io::ErrorKind::NotFound => format!("the {what} is missing"),
+                io::ErrorKind::PermissionDenied => {
+                    format!("the {what} cannot be read: permission denied")
+                }
+                _ => format!("the {what} cannot be read"),
+            },
+            // A fixed message of Markview's, or one that adds an annotation ID.
+            error => error.to_string(),
+        };
+        // The path under the served root, which is also what the route shows.
+        let name = doc
+            .source_path
+            .strip_prefix(&config.root)
+            .ok()
+            .or_else(|| doc.source_path.file_name().map(Path::new))
+            .unwrap_or(Path::new("document"));
+        Error::Io(io::Error::other(Self {
+            public: format!("{}: {cause}", name.display()),
+            status,
+            detail: format!("{}: {error}", path.display()),
+        }))
+    }
+
+    /// The problem `error` carries, if it is one.
+    pub fn of(error: &Error) -> Option<&Self> {
+        match error {
+            Error::Io(error) => error.get_ref()?.downcast_ref(),
+            _ => None,
+        }
+    }
+}
+
+/// A collection that cannot be read is the server's failure to answer.
+const UNREADABLE: &str = "500 Internal Server Error";
+
 /// What identifies one version of a file without reading it. A rename into
 /// place (how Markview and most editors save) changes the inode; an in-place
 /// write changes the size or a timestamp.
@@ -68,11 +138,11 @@ impl DocumentCount {
         // again instead of trusting a count it may not match.
         let source = FileKey::of(&location.document);
         let store = FileKey::of(&location.path);
-        let (text, bytes) = read_located(config, &location)?;
+        let (text, bytes) = read_located(config, doc, &location)?;
         // Whether a comment is open does not depend on where it sits, so
         // counting builds no projection and locates nothing.
         let open = annotations::open_count(&location, bytes.as_deref())
-            .map_err(|error| io::Error::other(format!("{}: {error}", location.path.display())))?;
+            .map_err(|error| store_problem(config, doc, &location, error))?;
         Ok(Self {
             source,
             store,
@@ -360,9 +430,7 @@ impl Snapshot {
             .map(|doc| {
                 let (location, source, bytes) = read_document(config, doc)?;
                 let review = Review::from_snapshot(&location, bytes.as_deref(), &project(&source))
-                    .map_err(|error| {
-                        io::Error::other(format!("{}: {error}", location.path.display()))
-                    })?;
+                    .map_err(|error| store_problem(config, doc, &location, error))?;
                 Ok(DocumentSnapshot {
                     path: location.document,
                     store: location.path,
@@ -435,40 +503,74 @@ impl Snapshot {
     }
 }
 
+fn store_problem(
+    config: &ServeConfig,
+    doc: &ServedDocument,
+    location: &Location,
+    error: Error,
+) -> Error {
+    DocumentProblem::wrap(
+        config,
+        doc,
+        "annotation store",
+        &location.path,
+        error,
+        UNREADABLE,
+    )
+}
+
 /// Where a served document and its store are, if the document is still the
 /// file that was allowlisted.
-fn locate(config: &ServeConfig, doc: &ServedDocument) -> io::Result<Location> {
+fn locate(config: &ServeConfig, doc: &ServedDocument) -> Result<Location, Error> {
+    let unavailable = |error: io::Error| {
+        DocumentProblem::wrap(
+            config,
+            doc,
+            "document",
+            &doc.source_path,
+            error.into(),
+            UNREADABLE,
+        )
+    };
     let path = validated_served_path(&config.root, &doc.source_path)
         .filter(|path| path == &doc.source_path)
-        .ok_or_else(|| {
-            io::Error::other(format!(
-                "served document is unavailable: {}",
-                doc.source_path.display()
-            ))
-        })?;
-    let location = annotations::resolve(&path)?;
+        .ok_or_else(|| unavailable(io::Error::other("served document is unavailable")))?;
+    let location = annotations::resolve(&path).map_err(unavailable)?;
     if location.document != path {
-        return Err(io::Error::other("served document changed location"));
+        return Err(unavailable(io::Error::other(
+            "served document changed location",
+        )));
     }
     Ok(location)
 }
 
 fn read_located(
     config: &ServeConfig,
+    doc: &ServedDocument,
     location: &Location,
-) -> io::Result<(String, Option<Vec<u8>>)> {
+) -> Result<(String, Option<Vec<u8>>), Error> {
     config.review_summary.note_read();
-    let source = annotations::read_source(location)?;
-    let store = annotations::snapshot(location)?;
+    let source = annotations::read_source(location).map_err(|error| {
+        DocumentProblem::wrap(
+            config,
+            doc,
+            "document",
+            &location.document,
+            error.into(),
+            UNREADABLE,
+        )
+    })?;
+    let store = annotations::snapshot(location)
+        .map_err(|error| store_problem(config, doc, location, error.into()))?;
     Ok((source, store))
 }
 
 fn read_document(
     config: &ServeConfig,
     doc: &ServedDocument,
-) -> io::Result<(Location, String, Option<Vec<u8>>)> {
+) -> Result<(Location, String, Option<Vec<u8>>), Error> {
     let location = locate(config, doc)?;
-    let (source, store) = read_located(config, &location)?;
+    let (source, store) = read_located(config, doc, &location)?;
     Ok((location, source, store))
 }
 

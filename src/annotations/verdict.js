@@ -53,11 +53,12 @@ function createMarkviewVerdict(page, review, token) {
     render('Review finished. You can close this tab.');
     review.show(page.dataset.markviewRoute, page.dataset.sourceRevision, false, false);
   }
-  function unavailable() {
+  // `cause` is the server's: the document that cannot be read, and why.
+  function unavailable(cause) {
     if (completed) return;
     sequence++;
     summary = null;
-    render('Could not refresh the review summary.', true);
+    render(cause ? 'The review cannot be read. ' + cause : 'Could not refresh the review summary.', true);
   }
   // At most one summary request is in flight and one more is pending. A
   // burst of events while a request is out is answered by a single request
@@ -85,7 +86,7 @@ function createMarkviewVerdict(page, review, token) {
       const response = await fetch(endpoint, {cache: 'no-store'});
       const data = await response.json();
       if (completed || request !== sequence) return;
-      if (!response.ok) throw new Error(data.error);
+      if (!response.ok) return unavailable(data.error);
       if (data.finished) return done();
       summary = data;
       render(counts() + (reconfirm ? '. The review changed. Confirm the verdict again.' : '.'));

@@ -988,6 +988,27 @@ test('a refused verdict leaves the buttons as the counts allow', async () => {
   assert.equal(page.verdictButton('Request changes').disabled, true, 'nothing to request changes for');
 });
 
+test('the bar says which document made the summary unavailable, and offers a retry', async () => {
+  const page = await reviewPage();
+  const failure = response(500, {error: 'b.md: annotation a1 appears more than once; give each section a unique ID'});
+  page.fetch = async url => (url === '/_markview/review' ? failure : response(200, review('store-1')));
+  page.events.dispatchEvent({type: 'open'});
+  await page.settle();
+  assert.equal(page.status(),
+    'The review cannot be read. b.md: annotation a1 appears more than once; give each section a unique ID');
+  const retry = page.verdictButton('Retry review summary');
+  assert.equal(retry.hidden, false);
+  assert.equal(page.verdictButton('Approve').disabled, true);
+  assert.equal(page.verdictButton('Request changes').disabled, true);
+
+  // Without a cause from the server, for example when it cannot be reached.
+  page.fetch = async () => { throw new Error('Failed to fetch'); };
+  retry.click();
+  await page.settle();
+  assert.equal(page.status(), 'Could not refresh the review summary.');
+  assert.equal(retry.hidden, false);
+});
+
 // A served page without review hooks, and the page its next live reload
 // fetches: `attributes` are those of the new page's <main>.
 async function liveReload(page, events, attributes) {

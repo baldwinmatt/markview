@@ -3391,32 +3391,54 @@ fn review_serves_a_verdict_and_saved_comments_with_optional_gate() {
 }
 
 fn start_review(cwd: &std::path::Path, options: &[&str]) -> ServeProcess {
+    start_review_of(cwd, "sample.md", options)
+}
+
+fn start_review_of(cwd: &std::path::Path, input: &str, options: &[&str]) -> ServeProcess {
     let child = std::process::Command::new(cargo_bin("markview"))
         .current_dir(cwd)
-        .args(["--review", "--no-open", "sample.md"])
+        .args(["--review", "--no-open", input])
         .args(options)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut server = ServeProcess {
-        child,
-        port: 0,
-        stderr: Default::default(),
-    };
+    waiting_review(child).unwrap_or_else(|notice| panic!("review did not start: {notice:?}"))
+}
+
+/// Reads the "Waiting for review" notice of a review that was just spawned,
+/// then keeps collecting its stderr: the server reports problems there for
+/// as long as it runs, and a closed pipe would make those reports fail.
+/// `Err` is the first line of stderr when it is not the notice.
+fn waiting_review(mut child: Child) -> Result<ServeProcess, String> {
+    let mut stderr_pipe = BufReader::new(child.stderr.take().unwrap());
     let mut notice = String::new();
-    BufReader::new(server.child.stderr.take().unwrap())
-        .read_line(&mut notice)
-        .unwrap();
-    server.port = notice
+    stderr_pipe.read_line(&mut notice).unwrap();
+    let Some(port) = notice
         .trim()
         .strip_prefix("Waiting for review at http://localhost:")
         .and_then(|url| url.strip_suffix('/'))
-        .unwrap_or_else(|| panic!("review did not start: {notice:?}"))
-        .parse()
-        .unwrap();
-    assert_ne!(server.port, 0);
-    server
+        .and_then(|port| port.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+    else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(notice);
+    };
+    let stderr = Arc::new(Mutex::new(String::new()));
+    let stderr_writer = stderr.clone();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        while stderr_pipe.read_line(&mut line).unwrap_or(0) > 0 {
+            stderr_writer.lock().unwrap().push_str(&line);
+            line.clear();
+        }
+    });
+    Ok(ServeProcess {
+        child,
+        port,
+        stderr,
+    })
 }
 
 /// Starts `--review` with at most `limit` open file descriptors, keeping its
@@ -3430,7 +3452,7 @@ fn start_review_with_fd_limit(
     spare: bool,
 ) -> Option<ServeProcess> {
     let spare = if spare { "exec 9</dev/null; " } else { "" };
-    let mut child = std::process::Command::new("sh")
+    let child = std::process::Command::new("sh")
         .current_dir(cwd)
         .arg("-c")
         .arg(format!(
@@ -3441,33 +3463,17 @@ fn start_review_with_fd_limit(
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut stderr_pipe = BufReader::new(child.stderr.take().unwrap());
-    let mut notice = String::new();
-    stderr_pipe.read_line(&mut notice).unwrap();
-    let Some(port) = notice
-        .trim()
-        .strip_prefix("Waiting for review at http://localhost:")
-        .and_then(|url| url.strip_suffix('/'))
-    else {
-        let status = child.wait().unwrap();
-        assert_eq!(status.code(), Some(97), "review did not start: {notice:?}");
-        eprintln!("skipped: this shell cannot lower RLIMIT_NOFILE to {limit}: {notice:?}");
-        return None;
-    };
-    let stderr = Arc::new(Mutex::new(String::new()));
-    let stderr_writer = stderr.clone();
-    std::thread::spawn(move || {
-        let mut line = String::new();
-        while stderr_pipe.read_line(&mut line).unwrap_or(0) > 0 {
-            stderr_writer.lock().unwrap().push_str(&line);
-            line.clear();
+    match waiting_review(child) {
+        Ok(server) => Some(server),
+        Err(notice) => {
+            assert!(
+                notice.contains("ulimit") || notice.is_empty(),
+                "review did not start: {notice:?}"
+            );
+            eprintln!("skipped: this shell cannot lower RLIMIT_NOFILE to {limit}: {notice:?}");
+            None
         }
-    });
-    Some(ServeProcess {
-        child,
-        port: port.parse().unwrap(),
-        stderr,
-    })
+    }
 }
 
 /// Runs a review out of descriptors, then finishes it. Returns whether
@@ -3587,6 +3593,66 @@ fn review_survives_running_out_of_file_descriptors() {
     };
     let spare = finish_review_after_fd_exhaustion(true).expect("the limit was lowered before");
     assert!(plain || spare, "neither run made `accept` fail");
+}
+
+#[test]
+fn review_errors_name_the_document_and_the_cause_but_no_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::write(root.join("a.md"), "# A\n").unwrap();
+    std::fs::write(root.join("b.md"), "# B\n").unwrap();
+    let store = root.join(".markview/annotations");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        store.join("b.md"),
+        "## a1 [open] document\n\nOne\n\n## a1 [open] document\n\nTwo\n",
+    )
+    .unwrap();
+    let server = start_review_of(&root, ".", &[]);
+    let port = server.port;
+    let get = |target: &str| {
+        let response = raw_http(
+            port,
+            &format!("GET {target} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"),
+        );
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        // Nothing the page can show says where the collection lives.
+        assert!(!response.contains(root.to_str().unwrap()), "{response}");
+        assert!(!response.contains(".markview"), "{response}");
+        (head.lines().next().unwrap().to_owned(), body.to_owned())
+    };
+    let duplicate =
+        r#"{"error":"b.md: annotation a1 appears more than once; give each section a unique ID"}"#;
+    // The bar cannot offer a verdict, and says which document is why.
+    assert_eq!(
+        get("/_markview/review"),
+        (
+            "HTTP/1.1 500 Internal Server Error".to_owned(),
+            duplicate.to_owned()
+        )
+    );
+    // That document's own page says the same.
+    assert_eq!(
+        get("/_markview/annotations?doc=/b.md"),
+        ("HTTP/1.1 409 Conflict".to_owned(), duplicate.to_owned())
+    );
+    // Where exactly, for whoever runs the command.
+    let store_path = store.join("b.md").display().to_string();
+    let until = Instant::now() + Duration::from_secs(5);
+    while !server.stderr_so_far().contains(&store_path) {
+        assert!(Instant::now() < until, "{}", server.stderr_so_far());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    std::fs::remove_file(store.join("b.md")).unwrap();
+    std::fs::write(root.join("a.md"), [0xff, 0xfe]).unwrap();
+    assert_eq!(
+        get("/_markview/review"),
+        (
+            "HTTP/1.1 500 Internal Server Error".to_owned(),
+            r#"{"error":"a.md: the document is not valid UTF-8"}"#.to_owned()
+        )
+    );
 }
 
 #[test]

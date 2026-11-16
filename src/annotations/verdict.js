@@ -23,11 +23,16 @@ function createMarkviewVerdict(page, review, token) {
   let sequence = 0;
   let submitting = false;
   let completed = false;
+  // Set by a conflict and shown with the next counts only: a later refresh
+  // or anything the reviewer does on the bar is not a conflict.
   let reconfirm = false;
 
+  // The one place that decides which buttons can be used. Without a
+  // message it re-applies those rules and leaves the status line alone.
   function render(message, retryable = false) {
     approve.disabled = completed || submitting || !summary;
     changes.disabled = approve.disabled || !summary?.comments;
+    if (message === undefined) return;
     retry.hidden = !retryable;
     status.textContent = message;
   }
@@ -84,12 +89,15 @@ function createMarkviewVerdict(page, review, token) {
       if (data.finished) return done();
       summary = data;
       render(counts() + (reconfirm ? '. The review changed. Confirm the verdict again.' : '.'));
+      reconfirm = false;
     } catch {
       if (!completed && request === sequence) unavailable();
     }
   }
   async function finish(verdict) {
     if (!summary || completed || submitting || (verdict === 'changes' && !summary.comments)) return;
+    // The reviewer has read the warning and is acting on it.
+    render(counts() + '.');
     const label = verdict === 'approved' ? 'Approve' : 'Request changes for';
     const draft = review.hasDraft() ? '\n\nThis page has an unsaved comment draft. Only saved comments count.' : '';
     if (!window.confirm(label + ' the entire served collection?\n' + counts() + '.' + draft)) return;
@@ -100,7 +108,8 @@ function createMarkviewVerdict(page, review, token) {
     try {
       const response = await fetch(endpoint, {method: 'POST', headers: {'X-Markview-Token': token}, body});
       const data = await response.json();
-      if (completed || response.ok || data.error === 'Review finished. You can close this tab.') return done();
+      // A session that another tab finished answers 409 with `finished`.
+      if (completed || response.ok || data.finished) return done();
       if (response.status === 409) {
         reconfirm = true;
         // Reload through the same path as a live edit. Drafts survive in sessionStorage.
@@ -113,10 +122,7 @@ function createMarkviewVerdict(page, review, token) {
       await refresh();
     } finally {
       submitting = false;
-      if (!completed && summary) {
-        approve.disabled = false;
-        changes.disabled = !summary.comments;
-      }
+      render();
     }
   }
 

@@ -484,6 +484,15 @@ fn respond_error(
     let message = error.to_string();
     match error {
         Error::Invalid(_) => fail(stream, "400 Bad Request", &message),
+        Error::Conflict(_) if serve_review::is_finished(&error) => annotation_response(
+            stream,
+            "409 Conflict",
+            &format!(
+                "{{\"finished\":true,\"error\":{}}}",
+                annotations::json_string(&message)
+            ),
+            false,
+        ),
         Error::Conflict(_) | Error::Section(..) => fail(stream, "409 Conflict", &message),
         Error::Io(_) => {
             eprintln!("markview: {message}");
@@ -794,44 +803,68 @@ mod tests {
         assert_eq!(config.review_cache.work(), (1, 1));
     }
 
-    #[test]
-    fn a_summary_in_progress_blocks_neither_a_rescan_nor_a_save() {
-        use std::io::{Read, Write};
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("doc.md");
-        std::fs::write(&path, "# Doc\n\nSome text.\n").unwrap();
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let mut config = ServeConfig::from_inputs(vec![path], port, false).unwrap();
-        config.review_token = Some("token".to_owned());
-        config.blocking_review = true;
-        let (entered, held) = mpsc::channel();
-        let (release, proceed) = mpsc::channel::<()>();
-        config.review_summary.hold_next(move || {
-            entered.send(()).unwrap();
-            let _ = proceed.recv();
-        });
-        let shared: SharedConfig = Arc::new(std::sync::RwLock::new(Arc::new(config)));
-        let clients: Clients = Arc::new(Mutex::new(Vec::new()));
-        let stores = watch_stores(shared.clone(), clients.clone()).unwrap();
-        let (session, _verdict) = serve_review::Session::new();
-        let server = shared.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming().take(2) {
-                let (shared, clients) = (server.clone(), clients.clone());
-                let (stores, session) = (stores.clone(), session.clone());
-                std::thread::spawn(move || {
-                    super::super::handle_connection(
-                        stream.unwrap(),
-                        &shared,
-                        clients,
-                        &stores,
-                        Some(session),
-                    )
-                });
+    /// A `--review` server for one document, run by `handle_connection` in
+    /// this process, so a test can reach its config, session and hooks.
+    struct LocalReview {
+        _dir: tempfile::TempDir,
+        port: u16,
+        shared: SharedConfig,
+    }
+
+    impl LocalReview {
+        /// Serves `connections` requests, then stops accepting.
+        fn start(connections: usize, prepare: impl FnOnce(&ServeConfig)) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("doc.md");
+            std::fs::write(&path, "# Doc\n\nSome text.\n").unwrap();
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let mut config = ServeConfig::from_inputs(vec![path], port, false).unwrap();
+            config.review_token = Some("token".to_owned());
+            config.blocking_review = true;
+            prepare(&config);
+            let shared: SharedConfig = Arc::new(std::sync::RwLock::new(Arc::new(config)));
+            let clients: Clients = Arc::new(Mutex::new(Vec::new()));
+            let stores = watch_stores(shared.clone(), clients.clone()).unwrap();
+            let (session, verdict) = serve_review::Session::new();
+            let server = shared.clone();
+            std::thread::spawn(move || {
+                // Kept so that publishing a verdict has somewhere to go.
+                let _verdict = verdict;
+                for stream in listener.incoming().take(connections) {
+                    let (shared, clients) = (server.clone(), clients.clone());
+                    let (stores, session) = (stores.clone(), session.clone());
+                    std::thread::spawn(move || {
+                        super::super::handle_connection(
+                            stream.unwrap(),
+                            &shared,
+                            clients,
+                            &stores,
+                            Some(session),
+                        )
+                    });
+                }
+            });
+            Self {
+                _dir: dir,
+                port,
+                shared,
             }
-        });
-        let request = |request: String| {
+        }
+
+        /// Sends one request. The response arrives on the returned channel.
+        fn request(&self, request_line: &str, form: Option<&str>) -> mpsc::Receiver<String> {
+            use std::io::{Read, Write};
+            let port = self.port;
+            let mut request = format!("{request_line} HTTP/1.1\r\nHost: localhost:{port}\r\n");
+            if let Some(form) = form {
+                request.push_str(&format!(
+                    "Content-Type: application/x-www-form-urlencoded\r\nX-Markview-Token: token\r\nContent-Length: {}\r\n\r\n{form}",
+                    form.len()
+                ));
+            } else {
+                request.push_str("\r\n");
+            }
             let (done, response) = mpsc::channel();
             std::thread::spawn(move || {
                 let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -841,19 +874,42 @@ mod tests {
                 let _ = done.send(response);
             });
             response
-        };
-        let host = format!("Host: localhost:{port}\r\n");
-        let summary = request(format!("GET /_markview/review HTTP/1.1\r\n{host}\r\n"));
+        }
+
+        /// The status line and body of a response, waited for.
+        fn response(&self, request_line: &str, form: Option<&str>) -> (String, String) {
+            let response = self
+                .request(request_line, form)
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a response");
+            let (head, body) = response
+                .split_once("\r\n\r\n")
+                .expect("a complete response");
+            (head.lines().next().unwrap().to_owned(), body.to_owned())
+        }
+    }
+
+    #[test]
+    fn a_summary_in_progress_blocks_neither_a_rescan_nor_a_save() {
+        let (entered, held) = mpsc::channel();
+        let (release, proceed) = mpsc::channel::<()>();
+        let server = LocalReview::start(2, |config| {
+            config.review_summary.hold_next(move || {
+                entered.send(()).unwrap();
+                let _ = proceed.recv();
+            })
+        });
+        let summary = server.request("GET /_markview/review", None);
         held.recv_timeout(Duration::from_secs(5)).unwrap();
         // The summary is now mid-computation. A rescan can still publish...
-        let rescan_can_publish = shared.try_write().is_ok();
+        let rescan_can_publish = server.shared.try_write().is_ok();
         // ...and a save is answered instead of queueing behind the summary.
-        let body = "op=add&doc=%2F&body=Saved";
-        let saved = request(format!(
-            "POST /_markview/annotations HTTP/1.1\r\n{host}Content-Type: application/x-www-form-urlencoded\r\nX-Markview-Token: token\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        ))
-        .recv_timeout(Duration::from_secs(5));
+        let saved = server
+            .request(
+                "POST /_markview/annotations",
+                Some("op=add&doc=%2F&body=Saved"),
+            )
+            .recv_timeout(Duration::from_secs(5));
         release.send(()).unwrap();
         let summary = summary.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(rescan_can_publish, "the summary held the config lock");
@@ -861,6 +917,52 @@ mod tests {
         assert!(saved.starts_with("HTTP/1.1 200"), "{saved}");
         assert!(summary.starts_with("HTTP/1.1 200"), "{summary}");
         assert!(summary.contains("\"review_revision\":"), "{summary}");
+    }
+
+    #[test]
+    fn requests_after_the_verdict_say_the_review_is_finished() {
+        let server = LocalReview::start(5, |_| {});
+        let (_, summary) = server.response("GET /_markview/review", None);
+        let revision = summary
+            .split("\"review_revision\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("review revision");
+        let finish = format!(
+            "op=finish&verdict=approved&review_revision={revision}&doc=/&source_revision={}",
+            annotations::source_revision("# Doc\n\nSome text.\n")
+        );
+        assert_eq!(
+            server.response("POST /_markview/review", Some(&finish)),
+            (
+                "HTTP/1.1 200 OK".to_owned(),
+                r#"{"finished":true}"#.to_owned()
+            )
+        );
+        // The page tells "already finished" from any other conflict by the
+        // `finished` field, not by the wording of the message.
+        let finished = (
+            "HTTP/1.1 409 Conflict".to_owned(),
+            r#"{"finished":true,"error":"Review finished. You can close this tab."}"#.to_owned(),
+        );
+        assert_eq!(
+            server.response("POST /_markview/review", Some(&finish)),
+            finished
+        );
+        assert_eq!(
+            server.response(
+                "POST /_markview/annotations",
+                Some("op=add&doc=%2F&body=Late")
+            ),
+            finished
+        );
+        assert_eq!(
+            server.response("GET /_markview/review", None),
+            (
+                "HTTP/1.1 200 OK".to_owned(),
+                r#"{"finished":true}"#.to_owned()
+            )
+        );
     }
 
     #[test]

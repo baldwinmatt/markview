@@ -14,7 +14,15 @@ use super::{format_annotations, validated_served_path, ServeConfig, ServedDocume
 pub const ENDPOINT: &str = "/_markview/review";
 const CHANGED: Error =
     Error::Conflict("The collection changed. Review the latest page and confirm again.");
-const FINISHED: Error = Error::Conflict("Review finished. You can close this tab.");
+const FINISHED_MESSAGE: &str = "Review finished. You can close this tab.";
+const FINISHED: Error = Error::Conflict(FINISHED_MESSAGE);
+
+/// Whether `error` is the refusal every write gets once a verdict has been
+/// accepted. Its response says so in a field of its own, so the page does
+/// not have to recognise the message.
+pub fn is_finished(error: &Error) -> bool {
+    matches!(error, Error::Conflict(message) if *message == FINISHED_MESSAGE)
+}
 
 /// What identifies one version of a file without reading it. A rename into
 /// place (how Markview and most editors save) changes the inode; an in-place

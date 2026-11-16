@@ -870,17 +870,29 @@ async function reviewPage(summary = {review_revision: 'r1', comments: 0, documen
   const page = createPage();
   page.summary = summary;
   page.summaries = [];
+  // What `POST /_markview/review` answers, and the forms it was sent.
+  page.finish = () => response(200, {finished: true});
+  page.finishes = [];
+  page.next = {root: page.h('html', {}, page.h('main', {'data-source-revision': 'source-1', 'data-markview-route': '/doc.md'}))};
   page.fetch = (url, init = {}) => {
     if (url === '/_markview/review' && !init.method) {
       return new Promise(resolve => page.summaries.push(() => resolve(response(200, page.summary))));
     }
+    if (url === '/_markview/review') {
+      page.finishes.push(Object.fromEntries(init.body));
+      return Promise.resolve(page.finish());
+    }
+    // The page itself, fetched again by a live reload.
+    if (url === '/doc.md') return Promise.resolve({ok: true, status: 200, text: async () => ''});
     return Promise.resolve(response(200, review('store-1')));
   };
+  page.main.dataset.markviewRoute = '/doc.md';
   page.loadVerdict();
   await page.context.markviewServeReview('/doc.md', 'token', 7878, true);
   page.events = page.loadShell();
   page.bar = page.document.querySelector('.markview-verdict');
   page.status = () => page.bar.querySelector('p').textContent;
+  page.verdictButton = label => page.bar.querySelectorAll('button').find(button => button.textContent === label);
   // Answers every summary request in flight, and any that follows from it.
   page.answerSummaries = async () => {
     for (let index = 0; index < page.summaries.length; index++) {
@@ -909,6 +921,71 @@ test('a review page asks for the collection summary once, and an event burst at 
   await page.answerSummaries();
   assert.equal(page.summaries.length, 3, 'one pending request, not four');
   assert.equal(page.status(), '5 open comments in 2 documents.');
+});
+
+// A review page whose first summary has arrived.
+async function openedReviewPage(summary) {
+  const page = await reviewPage(summary);
+  page.events.dispatchEvent({type: 'open'});
+  await page.settle();
+  await page.answerSummaries();
+  return page;
+}
+
+test('the reconfirm warning after a conflict is shown once, not on every later refresh', async () => {
+  const page = await openedReviewPage({review_revision: 'r1', comments: 2, documents: 1});
+  const approve = page.verdictButton('Approve');
+  page.finish = () => response(409, {error: 'The collection changed. Review the latest page and confirm again.'});
+  approve.click();
+  await page.settle();
+  await page.answerSummaries();
+  assert.equal(page.finishes.length, 1);
+  assert.equal(page.status(), '2 open comments in 1 document. The review changed. Confirm the verdict again.');
+  assert.equal(approve.disabled, false);
+
+  // A comment saved on another page refreshes the counts. That refresh is
+  // not a conflict, so the line is the plain one again.
+  page.summary = {review_revision: 'r2', comments: 3, documents: 2};
+  page.events.dispatchEvent({type: 'annotations', data: '/other.md'});
+  await page.settle();
+  await page.answerSummaries();
+  assert.equal(page.status(), '3 open comments in 2 documents.');
+
+  // Acting on the bar also dismisses it: here, a verdict the reviewer
+  // starts and then cancels in the confirmation dialog.
+  approve.click();
+  await page.settle();
+  await page.answerSummaries();
+  assert.match(page.status(), /Confirm the verdict again\.$/);
+  page.loadVerdictAnswer(false);
+  approve.click();
+  await page.settle();
+  assert.equal(page.finishes.length, 2, 'a cancelled confirmation posts nothing');
+  assert.equal(page.status(), '3 open comments in 2 documents.');
+});
+
+test('a finish refused because the review is already finished ends the page, whatever the message says', async () => {
+  const page = await openedReviewPage({review_revision: 'r1', comments: 1, documents: 1});
+  // Another tab finished first. The refusal is recognised by its
+  // `finished` field: the wording belongs to the server.
+  page.finish = () => response(409, {finished: true, error: 'Reworded by a later server.'});
+  page.verdictButton('Request changes').click();
+  await page.settle();
+  assert.equal(page.status(), 'Review finished. You can close this tab.');
+  assert.equal(page.verdictButton('Approve').disabled, true);
+  assert.equal(page.verdictButton('Request changes').disabled, true);
+  assert.equal(page.summaries.length, 1, 'no refresh after the review is over');
+});
+
+test('a refused verdict leaves the buttons as the counts allow', async () => {
+  const page = await openedReviewPage({review_revision: 'r1', comments: 0, documents: 0});
+  page.finish = () => response(400, {error: 'missing or invalid review fields'});
+  page.verdictButton('Approve').click();
+  await page.settle();
+  await page.answerSummaries();
+  assert.equal(page.status(), '0 open comments in 0 documents · missing or invalid review fields');
+  assert.equal(page.verdictButton('Approve').disabled, false);
+  assert.equal(page.verdictButton('Request changes').disabled, true, 'nothing to request changes for');
 });
 
 // A served page without review hooks, and the page its next live reload

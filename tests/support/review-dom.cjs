@@ -293,9 +293,10 @@ function createPage({revision = 'source-1'} = {}) {
   run('annotations/review.js');
   // The verdict bar of a blocking review. It confirms with a native dialog,
   // which a browser has; `page.confirmations` records what it asked.
+  page.loadVerdictAnswer = answer => { window.confirm = text => { page.confirmations.push(text); return answer; }; };
   page.loadVerdict = (answer = true) => {
     page.confirmations = [];
-    window.confirm = text => { page.confirmations.push(text); return answer; };
+    page.loadVerdictAnswer(answer);
     run('annotations/verdict.js');
   };
   // The live-reload shell every served page ends with. Returns its

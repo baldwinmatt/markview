@@ -14,8 +14,9 @@ use std::os::fd::{AsRawFd, RawFd};
 
 use markview::annotations;
 use markview::{
-    app_view_with_preferences, AnnotationView, AppModel, AppView, FrontendRenderer, GuiPreferences,
-    HtmlRenderer, DIFF_DARK_VARIABLES, DIFF_LIGHT_VARIABLES, DIFF_PRINT_RULES, DIFF_RULES,
+    app_view_with_preferences, percent_decode, AnnotationView, AppModel, AppView, FrontendRenderer,
+    GuiPreferences, HtmlRenderer, ALERT_DARK_VARIABLES, ALERT_LIGHT_VARIABLES, ALERT_RULES,
+    DIFF_DARK_VARIABLES, DIFF_LIGHT_VARIABLES, DIFF_PRINT_RULES, DIFF_RULES,
 };
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tao::event::{Event, WindowEvent};
@@ -202,6 +203,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 preferences.auto_refresh = !preferences.auto_refresh;
                 persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
                 sync_view(&webview, &model, &preferences);
+            }
+            Event::UserEvent(UserEvent::SingleKeyShortcuts(enabled)) => {
+                preferences.single_key_shortcuts = enabled;
+                persist_open_state(&preferences_path, &mut preferences, &model, Some(&window));
             }
             Event::UserEvent(UserEvent::CycleTheme) => {
                 preferences.theme = preferences.theme.cycle();
@@ -476,6 +481,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Event::UserEvent(UserEvent::AddComment) => {
                 let _ = webview.evaluate_script("window.markview.addComment()");
             }
+            Event::UserEvent(UserEvent::CopyCode(id, request)) => {
+                let copied = request
+                    .and_then(|request| request.preview_text(&model).map(copy_text_to_clipboard))
+                    .is_ok_and(|result| result.is_ok());
+                let _ = webview.evaluate_script(&format!("receiveCodeCopy({}, {copied});", js_string(&id)));
+            }
             Event::UserEvent(UserEvent::AnnotationRequest(id, form)) => {
                 let tab = model.tab(id).cloned();
                 let cache = model.review_cache().clone();
@@ -637,15 +648,17 @@ fn tab_copy_path(model: &AppModel, id: u64) -> Option<PathBuf> {
     model.tab(id)?.path().map(Path::to_path_buf)
 }
 
-#[cfg(target_os = "macos")]
 fn copy_path_to_clipboard(path: &Path) -> io::Result<()> {
+    copy_text_to_clipboard(&path.to_string_lossy())
+}
+
+#[cfg(target_os = "macos")]
+fn copy_text_to_clipboard(text: &str) -> io::Result<()> {
     use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
     use objc2_foundation::NSString;
     let pasteboard = NSPasteboard::generalPasteboard();
     pasteboard.clearContents();
-    if pasteboard.setString_forType(&NSString::from_str(&path.to_string_lossy()), unsafe {
-        NSPasteboardTypeString
-    }) {
+    if pasteboard.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString }) {
         Ok(())
     } else {
         Err(io::Error::other("failed to write clipboard"))
@@ -653,8 +666,53 @@ fn copy_path_to_clipboard(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn copy_path_to_clipboard(_path: &Path) -> io::Result<()> {
-    Err(io::Error::other("Copy Path requires macOS"))
+fn copy_text_to_clipboard(_text: &str) -> io::Result<()> {
+    Err(io::Error::other("The native clipboard requires macOS"))
+}
+
+const COPY_TEXT_CAP: usize = 1024 * 1024;
+const COPY_FRAME_CAP: usize = 3 * COPY_TEXT_CAP + 128;
+
+#[derive(Debug, Clone)]
+struct CopyCodeRequest {
+    tab: u64,
+    revision: String,
+    text: String,
+}
+
+impl CopyCodeRequest {
+    fn parse(frame: &str) -> Result<Self, &'static str> {
+        if frame.len() > COPY_FRAME_CAP {
+            return Err("copy request frame too large");
+        }
+        let invalid = "invalid copy request";
+        let (tab, rest) = frame.split_once(':').ok_or(invalid)?;
+        let (revision, encoded) = rest.split_once(':').ok_or(invalid)?;
+        let tab = tab.parse().map_err(|_| invalid)?;
+        if revision.len() != 16 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(invalid);
+        }
+        let text = percent_decode(encoded).ok_or(invalid)?;
+        if text.len() > COPY_TEXT_CAP {
+            return Err("copied code exceeds 1 MiB");
+        }
+        Ok(Self {
+            tab,
+            revision: revision.to_owned(),
+            text,
+        })
+    }
+
+    fn preview_text<'a>(&'a self, model: &AppModel) -> Result<&'a str, &'static str> {
+        let tab = model
+            .active_tab()
+            .filter(|tab| tab.id() == self.tab && !tab.is_editing())
+            .ok_or("preview tab changed")?;
+        if annotations::source_revision(tab.document().source()) != self.revision {
+            return Err("preview revision changed");
+        }
+        Ok(&self.text)
+    }
 }
 
 fn ipc_event(body: &str) -> Option<UserEvent> {
@@ -668,6 +726,8 @@ fn ipc_event(body: &str) -> Option<UserEvent> {
         "toggle-sidebar" => UserEvent::ToggleSidebar,
         "show-sidebar" => UserEvent::ShowSidebar,
         "add-comment" => UserEvent::AddComment,
+        "shortcuts:on" => UserEvent::SingleKeyShortcuts(true),
+        "shortcuts:off" => UserEvent::SingleKeyShortcuts(false),
         "toggle-auto-refresh" => UserEvent::ToggleAutoRefresh,
         "cycle-theme" => UserEvent::CycleTheme,
         "toggle-edit" => UserEvent::ToggleActiveEdit,
@@ -676,6 +736,13 @@ fn ipc_event(body: &str) -> Option<UserEvent> {
             let (kind, rest) = body.split_once(':')?;
             match kind {
                 "recent" => UserEvent::OpenRecent(PathBuf::from(rest)),
+                "copy-code" => {
+                    let (id, frame) = rest.split_once(':')?;
+                    if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                        return None;
+                    }
+                    UserEvent::CopyCode(id.to_owned(), CopyCodeRequest::parse(frame))
+                }
                 "spell" | "edit" | "link" | "annotation" => {
                     let (id, text) = rest.split_once(':')?;
                     let id = id.parse().ok()?;
@@ -1135,6 +1202,8 @@ enum UserEvent {
     StoreEvent(notify::Event),
     AddComment,
     AnnotationRequest(u64, String),
+    CopyCode(String, Result<CopyCodeRequest, &'static str>),
+    SingleKeyShortcuts(bool),
     AnnotationResult(u64, Option<String>),
     ToggleActiveEdit,
     EditTab(u64),
@@ -1599,6 +1668,7 @@ fn app_shell_html(view: &AppView) -> String {
   --code-bg: #ebe6de;
   --quote-bg: #f1ede7;
 {DIFF_LIGHT_VARIABLES}
+{ALERT_LIGHT_VARIABLES}
 }}
 @media (prefers-color-scheme: dark) {{
   :root {{
@@ -1612,6 +1682,7 @@ fn app_shell_html(view: &AppView) -> String {
     --code-bg: #25221f;
     --quote-bg: #211f1c;
 {DIFF_DARK_VARIABLES}
+{ALERT_DARK_VARIABLES}
   }}
 }}
 :root[data-theme="light"] {{
@@ -1626,6 +1697,7 @@ fn app_shell_html(view: &AppView) -> String {
   --code-bg: #ebe6de;
   --quote-bg: #f1ede7;
 {DIFF_LIGHT_VARIABLES}
+{ALERT_LIGHT_VARIABLES}
 }}
 :root[data-theme="dark"] {{
   color-scheme: dark;
@@ -1639,6 +1711,7 @@ fn app_shell_html(view: &AppView) -> String {
   --code-bg: #25221f;
   --quote-bg: #211f1c;
 {DIFF_DARK_VARIABLES}
+{ALERT_DARK_VARIABLES}
 }}
 * {{ box-sizing: border-box; }}
 html {{
@@ -2021,6 +2094,7 @@ pre {{
 }}
 pre code {{ background: transparent; padding: 0; }}
 {DIFF_RULES}
+{ALERT_RULES}
 .syntax-keyword {{ color: var(--accent); font-weight: 700; }}
 .syntax-comment {{ color: var(--muted); font-style: italic; }}
 table {{
@@ -2160,7 +2234,8 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
   }}
 }}
 </style>
-<style>{review_style}</style>
+<style>{review_style}
+{copy_style}</style>
 </head>
 <body>
 <header class="toolbar">
@@ -2252,20 +2327,52 @@ hr {{ border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }}
 <script>
 {editor_script}
 {review_script}
+{copy_script}
+const attachCodeCopy = createMarkviewCodeCopy(document.getElementById('document'));
+const copyRequests = new Map();
+function requestCodeCopy(tab, revision, text) {{
+  if (new TextEncoder().encode(text).length > {COPY_TEXT_CAP}) return Promise.reject();
+  const id = Array.from(crypto.getRandomValues(new Uint32Array(4)),
+    n => n.toString(16).padStart(8, '0')).join('');
+  return new Promise((resolve, reject) => {{
+    const frame = `copy-code:${{id}}:${{tab}}:${{revision}}:${{encodeURIComponent(text)}}`;
+    copyRequests.set(id, {{resolve, reject}});
+    try {{
+      window.ipc.postMessage(frame);
+    }} catch (error) {{
+      copyRequests.delete(id);
+      reject(error);
+    }}
+  }});
+}}
+function receiveCodeCopy(id, copied) {{
+  const pending = copyRequests.get(id);
+  if (!pending) return;
+  copyRequests.delete(id);
+  if (copied) pending.resolve();
+  else pending.reject();
+}}
 const annotationRequests = new Map();
 const review = createMarkviewReview(document.getElementById('document'), document.getElementById('review-mount'), form => new Promise((resolve, reject) => {{
   const id = window.markview.state.activeTabId;
   annotationRequests.set(id, {{resolve, reject}});
   window.ipc.postMessage(`annotation:${{id}}:${{form}}`);
-}}), () => {{
-  // The panel shares the sidebar. Show it now, and record that in state so
-  // the next state push (an auto-refresh, say) does not hide it again.
-  document.getElementById('toc').classList.remove('hidden');
-  document.querySelector('.content-shell').classList.remove('sidebar-hidden');
-  if (!window.markview.state.preferences.sidebarVisible && !window.markview.sidebarRevealed) {{
-    window.markview.sidebarRevealed = true;
-    window.ipc.postMessage('show-sidebar');
-  }}
+}}), {{
+  reveal: () => {{
+    // The panel shares the sidebar. Show it now, and record that in state so
+    // the next state push (an auto-refresh, say) does not hide it again.
+    document.getElementById('toc').classList.remove('hidden');
+    document.querySelector('.content-shell').classList.remove('sidebar-hidden');
+    if (!window.markview.state.preferences.sidebarVisible && !window.markview.sidebarRevealed) {{
+      window.markview.sidebarRevealed = true;
+      window.ipc.postMessage('show-sidebar');
+    }}
+  }},
+  saveShortcuts: enabled => {{
+    window.markview.state.preferences.singleKeyShortcuts = enabled;
+    window.ipc.postMessage(enabled ? 'shortcuts:on' : 'shortcuts:off');
+  }},
+  shortcutsBlocked: () => !document.getElementById('tab-context-menu').classList.contains('hidden')
 }});
 function receiveAnnotation(id, error) {{
   const request = annotationRequests.get(id);
@@ -2322,6 +2429,7 @@ window.markview = {{
   }},
   showAnnotations() {{
     const annotation = this.state.annotation;
+    review.setShortcuts(this.state.preferences.singleKeyShortcuts);
     review.show(annotation?.key || null, annotation?.revision || null, Boolean(annotation), Boolean(annotation?.canAdd));
     if (annotation?.data) review.update(annotation.data);
     else if (annotation?.error) review.unavailable(annotation.error);
@@ -2449,6 +2557,7 @@ window.markview = {{
       }}
     }} else {{
       pane.innerHTML = next.activeHtml;
+      attachCodeCopy(text => requestCodeCopy(next.activeTabId, next.previewRevision, text));
       for (const action of pane.querySelectorAll('[data-action="open"]')) {{
         action.addEventListener('click', () => window.ipc.postMessage('open'));
       }}
@@ -2608,7 +2717,7 @@ function highlightText(root, query) {{
         return NodeFilter.FILTER_REJECT;
       }}
       const parent = node.parentElement;
-      if (!parent || parent.closest('script,style,mark,textarea,.editor-highlight,.editor-reference,.editor-tools')) {{
+      if (!parent || parent.closest('script,style,mark,textarea,.editor-highlight,.editor-reference,.editor-tools,[data-markview-review-exclude]')) {{
         return NodeFilter.FILTER_REJECT;
       }}
       return NodeFilter.FILTER_ACCEPT;
@@ -2687,6 +2796,7 @@ document.addEventListener('contextmenu', event => {{
 window.addEventListener('resize', () => window.markview.hideTabContextMenu());
 window.addEventListener('blur', () => window.markview.hideTabContextMenu());
 window.addEventListener('keydown', event => {{
+  if (event.defaultPrevented) return;
   if (event.key === 'Escape') {{
     window.markview.hideTabContextMenu();
   }} else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f') {{
@@ -2729,6 +2839,8 @@ window.markview.setState({state});
         editor_script = include_str!("markview_gui_support/editor.js"),
         review_style = annotations::REVIEW_STYLE,
         review_script = annotations::REVIEW_SCRIPT,
+        copy_style = annotations::COPY_STYLE,
+        copy_script = annotations::COPY_SCRIPT,
     )
 }
 
@@ -2779,12 +2891,14 @@ fn view_js(view: &AppView) -> String {
 
     let annotation = annotation_js(view.annotation.as_ref());
     format!(
-        "{{tabs:[{tabs}],annotation:{annotation},activeTabId:{active_tab_id},activeHtml:{},activeSource:{},headings:[{headings}],preferences:{{theme:{},sidebarVisible:{},autoRefresh:{},recentFiles:[{recent_files}]}}}}",
+        "{{tabs:[{tabs}],annotation:{annotation},activeTabId:{active_tab_id},previewRevision:{},activeHtml:{},activeSource:{},headings:[{headings}],preferences:{{theme:{},sidebarVisible:{},autoRefresh:{},singleKeyShortcuts:{},recentFiles:[{recent_files}]}}}}",
+        js_string(&annotations::source_revision(&view.active_source)),
         js_string(&view.active_html),
         js_string(&view.active_source),
         js_string(view.preferences.theme.as_str()),
         view.preferences.sidebar_visible,
-        view.preferences.auto_refresh
+        view.preferences.auto_refresh,
+        view.preferences.single_key_shortcuts
     )
 }
 
@@ -3247,6 +3361,46 @@ mod tests {
     }
 
     #[test]
+    fn code_copy_frames_are_correlated_bounded_and_scoped_to_the_preview() {
+        let mut model = AppModel::new();
+        let source = "    code\n";
+        let tab = model.open_untitled("Draft", source.into());
+        let revision = annotations::source_revision(source);
+        let id = "0123456789abcdef0123456789abcdef";
+        let payload = "%20%09%26%2B%F0%9F%98%80%0A";
+        let frame = format!("copy-code:{id}:{tab}:{revision}:{payload}");
+        let Some(UserEvent::CopyCode(received, Ok(request))) = ipc_event(&frame) else {
+            panic!("valid copy frame rejected");
+        };
+        assert_eq!(received, id);
+        assert_eq!(request.preview_text(&model), Ok(" \t&+😀\n"));
+        model.update_source(tab, "# Updated".into());
+        assert_eq!(
+            request.preview_text(&model),
+            Err("preview revision changed")
+        );
+        model.update_source(tab, source.into());
+        model.edit(tab);
+        assert_eq!(request.preview_text(&model), Err("preview tab changed"));
+        model.open_untitled("Other", source.into());
+        assert_eq!(request.preview_text(&model), Err("preview tab changed"));
+
+        let capped = "%C3%A9".repeat(COPY_TEXT_CAP / 2);
+        assert!(CopyCodeRequest::parse(&format!("{tab}:{revision}:{capped}")).is_ok());
+        for (payload, error) in [
+            (format!("{capped}x"), "copied code exceeds 1 MiB"),
+            ("x".repeat(COPY_FRAME_CAP), "copy request frame too large"),
+            ("%ZZ".to_owned(), "invalid copy request"),
+            ("%FF".to_owned(), "invalid copy request"),
+        ] {
+            assert!(
+                matches!(ipc_event(&format!("copy-code:{id}:{tab}:{revision}:{payload}")),
+                Some(UserEvent::CopyCode(received, Err(message))) if received == id && message == error)
+            );
+        }
+    }
+
+    #[test]
     fn copy_path_targets_context_tab_and_ignores_untitled_or_missing_tabs() {
         let mut model = AppModel::new();
         let path = std::env::current_dir().unwrap().join("file with spaces.md");
@@ -3372,7 +3526,7 @@ mod tests {
         ));
 
         let print_css = html
-            .split("@media print {")
+            .split("@page {")
             .nth(1)
             .unwrap()
             .split("</style>")
@@ -3380,6 +3534,8 @@ mod tests {
             .unwrap();
         assert!(print_css.contains(".diff-addition, .diff-deletion, .diff-hunk, .diff-header { background: none; color: #000; }"));
         assert!(html.contains("@page"));
+        assert!(html.contains("border-left: 4px solid #000"));
+        assert!(html.contains(".markview-copy-code, .markview-copy-status { display: none; }"));
         assert!(html.contains("a[href^=\"http\"]::after"));
         assert!(html.contains("break-after: avoid"));
         assert!(html.contains(".syntax-keyword, .syntax-comment"));
@@ -3394,9 +3550,9 @@ mod tests {
         ));
         // Test the key handler, not toolbar commands that intentionally use IPC.
         let html = html
-            .split("window.addEventListener('keydown', event => {")
-            .nth(1)
+            .rsplit_once("window.addEventListener('keydown', event => {")
             .expect("keyboard handler")
+            .1
             .split("function fileName")
             .next()
             .unwrap();

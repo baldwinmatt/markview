@@ -1,7 +1,7 @@
 // Text offsets count non-White_Space Unicode scalars, while DOM offsets
 // count UTF-16 code units. Structural breaks are only used in displayed quotes.
 const markviewReviewWhitespace = /\p{White_Space}/u;
-const markviewReviewExcluded = 'img,input,.footnote-reference,.footnote-definition-label';
+const markviewReviewExcluded = 'img,input,.footnote-reference,.footnote-definition-label,[data-markview-review-exclude]';
 const markviewReviewBlocks = 'p,h1,h2,h3,h4,h5,h6,blockquote,pre,li,td,th,.footnote-definition,br,hr';
 
 function markviewReviewText(root) {
@@ -69,7 +69,9 @@ function markviewReviewSelection(root, selection, points) {
   return {quote, start, end};
 }
 
-function createMarkviewReview(root, mount, submit, reveal = () => {}) {
+function createMarkviewReview(root, mount, submit, {
+  reveal = () => {}, shortcuts = true, saveShortcuts = () => {}, shortcutsBlocked = () => false
+} = {}) {
   function element(tag, className, text) {
     const node = document.createElement(tag);
     if (className) node.className = className;
@@ -101,6 +103,7 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
   }
   const panel = element('section', 'markview-review');
   panel.setAttribute('aria-label', 'Annotations');
+  panel.tabIndex = -1;
   const toolbar = element('header', 'markview-review-toolbar');
   const count = element('strong');
   const whole = button('Comment on document', () => startDraft({op: 'add'}, {control: whole}));
@@ -108,8 +111,23 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
   const resolvedToggle = element('input');
   resolvedToggle.type = 'checkbox';
   resolvedLabel.append(resolvedToggle, ' Show resolved');
+  const shortcutsLabel = element('label');
+  const shortcutsToggle = element('input');
+  shortcutsToggle.type = 'checkbox';
+  shortcutsToggle.checked = shortcuts;
+  shortcutsLabel.title = 'J/K navigate, C comments, E edits, R resolves or reopens';
+  shortcutsLabel.append(shortcutsToggle, ' Single-key shortcuts');
+  shortcutsToggle.addEventListener('change', () => saveShortcuts(shortcutsToggle.checked));
+  whole.title = 'Comment on document (C)';
   const composer = element('form', 'markview-review-composer');
   const quote = element('blockquote');
+  const labels = element('div', 'markview-review-actions');
+  labels.setAttribute('role', 'group');
+  labels.setAttribute('aria-label', 'Quick labels');
+  const quickLabels = ['Question', 'Needs a test', 'Out of scope', 'Nit'];
+  for (const label of quickLabels) {
+    labels.append(button(label, () => applyLabel(label)));
+  }
   const body = element('textarea');
   body.setAttribute('aria-label', 'Comment');
   body.placeholder = 'Write a comment';
@@ -130,7 +148,7 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
   const cards = element('div', 'markview-review-cards');
   const selectionButton = button('Comment', () => addSelection());
   selectionButton.className = 'markview-review-selection';
-  selectionButton.setAttribute('title', 'Comment on the selection (Ctrl/Cmd+Shift+K)');
+  selectionButton.setAttribute('title', 'Comment on the selection (C or Ctrl/Cmd+Shift+K)');
   selectionButton.setAttribute('aria-keyshortcuts', 'Control+Shift+K Meta+Shift+K');
   selectionButton.addEventListener('pointerdown', event => event.preventDefault());
   // Shown in place of the Comment button when the selection cannot be used,
@@ -138,8 +156,8 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
   const selectionNote = element('div', 'markview-review-selection-note', 'Select at most 1,000 characters to comment.');
   selectionNote.setAttribute('role', 'status');
   actions.append(save, cancel, retry);
-  composer.append(quote, body, actions);
-  toolbar.append(count, whole, resolvedLabel);
+  composer.append(quote, labels, body, actions);
+  toolbar.append(count, whole, resolvedLabel, shortcutsLabel);
   panel.append(toolbar, composer, message, cards);
   mount.append(panel);
   document.body.append(selectionButton, selectionNote);
@@ -178,6 +196,7 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
     return points ??= markviewReviewText(root);
   }
   const drafts = new Map();
+  const cardActionsByElement = new WeakMap();
   const pending = new Set();
   const errors = new Map();
   const showResolved = new Map();
@@ -215,14 +234,14 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
     message.hidden = !text;
   }
   function startDraft(fields, from = null, discard = false) {
-    if (!writable || (fields.op === 'add' && !canAdd) || pending.has(key)) return;
+    if (!writable || (fields.op === 'add' && !canAdd) || pending.has(key)) return false;
     const previous = getDraft();
     const reuseBody = previous?.op === 'add' && fields.op === 'add';
     if (previous && !reuseBody && !discard) {
       discarding = {next: fields, opener: from};
       renderComposer();
       reveal();
-      return;
+      return true;
     }
     discarding = null;
     opener = from;
@@ -232,6 +251,7 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
     reveal();
     if (panel.getClientRects().length) composer.scrollIntoView({block: 'nearest'});
     body.focus();
+    return true;
   }
   // Whether the current draft holds text that cancelling would lose.
   function draftHasText() {
@@ -271,16 +291,15 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
       node.style.top = Math.max(4, rect.top - 34) + 'px';
     }
   }
-  function addSelection() {
-    const selection = markviewReviewSelection(root, window.getSelection(), textPoints()) || selected;
-    if (!key || !canAdd || !selection) return;
+  function addSelection(selection = markviewReviewSelection(root, window.getSelection(), textPoints()) || selected) {
+    if (!key || !canAdd || !selection || pending.has(key)) return false;
     if (tooLong(selection)) {
       showSelection(selection);
-      return;
+      return true;
     }
     showSelection(null);
     selected = null;
-    startDraft({op: 'add', ...selection, source_revision: revision});
+    return startDraft({op: 'add', ...selection, source_revision: revision});
   }
   function renderComposer() {
     const draft = getDraft();
@@ -307,6 +326,8 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
       confirm.focus();
     }
     if (!draft || !writable) return;
+    labels.hidden = draft.op !== 'add';
+    labels.querySelectorAll('button').forEach(label => { label.disabled = pending.has(key); });
     const changedSource = draft.source_revision && draft.source_revision !== revision;
     const changedStore = draft.op === 'edit' && review && draft.store_revision !== review.store_revision;
     const busy = pending.has(key);
@@ -329,7 +350,9 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
     renderComposer();
     try {
       const result = await submit(new URLSearchParams(fields));
-      if (draft && drafts.get(documentKey) === draft) keepDraft(null, documentKey);
+      if (draft && drafts.get(documentKey) === draft) {
+        keepDraft(null, documentKey);
+      }
       if (key === documentKey && revision === source && result?.source_revision === revision) update(result);
       if (draft && key === documentKey) {
         renderComposer();
@@ -339,7 +362,9 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
       setMessage(error.message || 'Could not save the comment.', documentKey);
     } finally {
       pending.delete(documentKey);
-      if (key === documentKey) renderComposer();
+      if (key === documentKey) {
+        renderComposer();
+      }
     }
   }
   body.addEventListener('input', () => {
@@ -347,8 +372,28 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
     if (draft) draft.body = body.value;
     keepDraft(draft);
   });
-  composer.addEventListener('submit', event => {
-    event.preventDefault();
+  function hasLabel(text, label) {
+    while (text) {
+      if (text === label) return true;
+      const prefix = quickLabels.map(item => item + ': ').find(item => text.startsWith(item));
+      if (!prefix) return false;
+      if (prefix === label + ': ') return true;
+      text = text.slice(prefix.length);
+    }
+    return false;
+  }
+  function applyLabel(label) {
+    const draft = getDraft();
+    if (!writable || !canAdd || pending.has(key) || draft?.op !== 'add') return;
+    const blank = !draft.body.trim();
+    if (blank) draft.body = label;
+    else if (!hasLabel(draft.body, label)) draft.body = label + ': ' + draft.body;
+    keepDraft(draft);
+    renderComposer();
+    body.focus();
+    if (blank) submitDraft();
+  }
+  function submitDraft() {
     const draft = getDraft();
     if (save.disabled || !draft) return;
     if ([...draft.body].length > 10000) {
@@ -356,13 +401,17 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
       return;
     }
     send(draft, draft);
+  }
+  composer.addEventListener('submit', event => {
+    event.preventDefault();
+    submitDraft();
   });
   composer.addEventListener('keydown', event => {
-    if (event.key === 'Escape') {
+    if (!event.defaultPrevented && event.key === 'Escape') {
       // An input method uses Escape to close its candidate window.
       if (event.isComposing || event.keyCode === 229) return;
-      event.preventDefault();
       if (cancel.disabled) return;
+      event.preventDefault();
       if (draftHasText()) {
         discarding = {next: null};
         renderComposer();
@@ -417,7 +466,7 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
     const focusedLabel = active?.tagName === 'BUTTON' ? active.textContent : null;
     if (!writable || !entries.some(entry => entry.id === deleting)) deleting = null;
     cards.replaceChildren();
-    for (const entry of entries) {
+    for (const entry of [...entries].sort((a, b) => Number(b.attached) - Number(a.attached))) {
       if (entry.status === 'resolved' && !resolvedToggle.checked) continue;
       const card = element('article', 'markview-review-card');
       card.tabIndex = 0;
@@ -436,12 +485,9 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
       card.append(element('div', 'markview-review-label', label.join(' · ')));
       if (entry.quote) card.append(element('blockquote', '', entry.quote));
       card.append(element('p', 'markview-review-body', entry.body));
-      const navigate = () => {
-        const hit = ranges.find(item => item.id === entry.id);
-        if (hit) hit.range.startContainer.parentElement.scrollIntoView({block: 'center'});
-      };
+      const navigate = () => scrollToAnnotation(card, entry);
       card.addEventListener('click', event => { if (!event.target.closest('button')) navigate(); });
-      card.addEventListener('keydown', event => { if (event.target === card && event.key === 'Enter') navigate(); });
+      card.addEventListener('keydown', event => { if (!event.defaultPrevented && event.target === card && event.key === 'Enter') { navigate(); event.preventDefault(); } });
       const controls = {};
       if (writable && deleting === entry.id) {
         const fields = {id: entry.id, store_revision: review.store_revision};
@@ -463,8 +509,13 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
         const fields = {id: entry.id, store_revision: review.store_revision};
         const nextStatus = entry.status === 'open' ? 'resolved' : 'open';
         const statusLabel = entry.status === 'open' ? 'Resolve' : 'Reopen';
-        controls.Edit = cardButton('Edit', about, () => startDraft({op: 'edit', ...fields, body: entry.body}, {id: entry.id, label: 'Edit'}));
-        controls[statusLabel] = cardButton(statusLabel, about, () => send({op: 'status', ...fields, status: nextStatus}));
+        const editDraft = () => startDraft({op: 'edit', ...fields, body: entry.body}, {id: entry.id, label: 'Edit'});
+        const changeStatus = () => send({op: 'status', ...fields, status: nextStatus});
+        cardActionsByElement.set(card, {editDraft, changeStatus});
+        controls.Edit = cardButton('Edit', about, editDraft);
+        controls.Edit.title = 'Edit (E)';
+        controls[statusLabel] = cardButton(statusLabel, about, changeStatus);
+        controls[statusLabel].title = statusLabel + ' (R)';
         controls.Delete = cardButton('Delete', about, () => {
           deleting = entry.id;
           focusNext = {id: entry.id, label: 'Confirm'};
@@ -481,6 +532,51 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
     renderComposer();
     repaint();
   }
+  function cardById(id) {
+    return Array.from(cards.children).find(card => card.dataset.annotation === id);
+  }
+  function scrollToAnnotation(card, entry) {
+    const range = ranges.find(item => item.id === entry.id)?.range ||
+      (entry.range && markviewReviewRange(markviewReviewText(root), entry.range));
+    if (range) range.startContainer.parentElement.scrollIntoView({block: 'center'});
+    else card.scrollIntoView({block: 'nearest'});
+  }
+  window.addEventListener('keydown', event => {
+    if (!key || panel.hidden || deleting || discarding || event.defaultPrevented || event.isComposing || event.keyCode === 229 || event.repeat ||
+        event.altKey || event.ctrlKey || event.metaKey || event.shiftKey ||
+        event.target?.closest?.('input, textarea, select, [role="textbox"]') || event.target?.isContentEditable ||
+        document.querySelector('dialog[open], [aria-modal="true"]') || shortcutsBlocked()) return;
+    const active = document.activeElement;
+    const card = active?.closest('.markview-review-card');
+    const focused = cards.contains(card) ? card : null;
+    if (event.key === 'Escape' && focused) {
+      panel.focus({preventScroll: true});
+    } else if (!shortcutsToggle.checked) {
+      return;
+    } else if (event.key === 'j' || event.key === 'k') {
+      const visible = Array.from(cards.children);
+      if (!visible.length) return;
+      const index = visible.indexOf(focused);
+      const next = visible[event.key === 'j' ? (index + 1) % visible.length :
+        index <= 0 ? visible.length - 1 : index - 1];
+      const entry = review.annotations.find(item => item.id === next.dataset.annotation);
+      reveal();
+      next.focus({preventScroll: true});
+      scrollToAnnotation(next, entry);
+    } else if (event.key === 'c' && writable && canAdd && !pending.has(key)) {
+      const selection = window.getSelection();
+      if (selection && !selection.isCollapsed) {
+        if (!addSelection(markviewReviewSelection(root, selection, textPoints()))) return;
+      } else if (!startDraft({op: 'add'}, active === document.body ? {control: whole} : {control: active})) return;
+    } else if ((event.key === 'e' || event.key === 'r') && focused && writable && !pending.has(key)) {
+      const actions = cardActionsByElement.get(focused);
+      if (!actions) return;
+      if (event.key === 'e') {
+        if (!actions.editDraft()) return;
+      } else actions.changeStatus();
+    } else return;
+    event.preventDefault();
+  });
   resolvedToggle.addEventListener('change', () => {
     showResolved.set(key, resolvedToggle.checked);
     render();
@@ -492,7 +588,7 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
     const hit = hits[(hits.findIndex(hit => hit.id === lastHit) + 1) % hits.length];
     lastHit = hit?.id;
     if (hit) {
-      const card = Array.from(cards.children).find(card => card.dataset.annotation === hit.id);
+      const card = cardById(hit.id);
       if (card) { reveal(); card.focus({preventScroll: true}); card.scrollIntoView({block: 'nearest'}); }
     }
   });
@@ -538,6 +634,8 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
       repaint();
     },
     addSelection,
+    hasDraft: () => Boolean(getDraft()),
+    setShortcuts: enabled => { shortcutsToggle.checked = enabled; },
     // The annotations cannot be read at all: show why instead of a list.
     unavailable(message) {
       review = null;
@@ -554,11 +652,11 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
 
 // Transport for `markview --serve`: reads the annotations of one served route
 // and posts changes with the page's write token (null on a read-only page).
-function markviewServeReview(route, token, port) {
+function markviewServeReview(route, token, port, blockingReview) {
   const endpoint = '/_markview/annotations';
   const root = document.querySelector('main');
   const review = createMarkviewReview(root, document.body, async (form) => {
-    form.set('doc', route);
+    form.set('doc', root.dataset.markviewRoute || route);
     const response = await fetch(endpoint, {method: 'POST', headers: {'X-Markview-Token': token}, body: form});
     const data = await response.json();
     if (!response.ok) {
@@ -567,14 +665,27 @@ function markviewServeReview(route, token, port) {
     }
     // The response is the updated list, so there is nothing to fetch again.
     return data;
+  }, {
+    shortcuts: (() => {
+      try { return localStorage.getItem('markview-single-key-shortcuts') !== 'off'; }
+      catch { return true; }
+    })(),
+    saveShortcuts: enabled => {
+      try { localStorage.setItem('markview-single-key-shortcuts', enabled ? 'on' : 'off'); }
+      catch { /* Preference storage is optional. */ }
+    }
   });
+  const verdict = blockingReview ? createMarkviewVerdict(root, review, token) : null;
+  window.markviewVerdict = verdict;
   let requested = 0;
   window.markviewReviewRefresh = async () => {
     const sequence = ++requested;
     const revision = root.dataset.sourceRevision;
-    review.show(route, revision, Boolean(token), Boolean(token));
+    const currentRoute = root.dataset.markviewRoute || route;
+    const writable = Boolean(token) && !verdict?.finished();
+    review.show(currentRoute, revision, writable, writable);
     try {
-      const response = await fetch(endpoint + '?doc=' + encodeURIComponent(route), {cache: 'no-store'});
+      const response = await fetch(endpoint + '?doc=' + encodeURIComponent(currentRoute), {cache: 'no-store'});
       if (sequence !== requested) return;
       if (response.status === 403) {
         // The server answers `/_markview/` only for its loopback Host.

@@ -82,3 +82,16 @@ body > .markview-review {
   .markview-review, .markview-review-selection, .markview-review-selection-note, .markview-review-overlay { display: none !important; }
   ::highlight(markview-annotations) { background: transparent; text-decoration: none; }
 }
+
+.markview-verdict {
+  width: min(860px, calc(100vw - 48px));
+  box-sizing: border-box;
+  margin: 1rem auto;
+  padding: 0.85rem 1rem;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--quote-bg);
+}
+.markview-verdict p { margin: 0.25rem 0 0.5rem; }
+.markview-verdict button { margin: 0.15rem 0.5rem 0.15rem 0; }
+@media print { .markview-verdict { display: none; } }

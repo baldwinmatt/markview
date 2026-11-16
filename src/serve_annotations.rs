@@ -3,14 +3,14 @@ use std::io::{self, BufRead, BufReader};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use markview::annotations::{self, Error, Request, FORM_CAP};
 use markview::DestinationKind;
 
 use super::{
-    broadcast_reload, decode_repeated, validated_served_path, write_response_headers, Clients,
-    ReloadKind, ServeConfig, SharedConfig, WATCH_DEBOUNCE,
+    broadcast_reload, decode_repeated, serve_review, validated_served_path, write_response_headers,
+    Clients, ReloadKind, ServeConfig, SharedConfig, WATCH_DEBOUNCE,
 };
 
 const ENDPOINT: &str = "/_markview/annotations";
@@ -305,15 +305,44 @@ fn annotation_response(
     )
 }
 
+fn post_body(
+    reader: &mut BufReader<TcpStream>,
+    request: &HttpRequest,
+    query: &str,
+    deadline: Instant,
+) -> Result<Vec<u8>, &'static str> {
+    let length = request
+        .header("content-length")
+        .filter(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|value| value.parse::<usize>().ok());
+    let Some(length @ 1..=FORM_CAP) = length else {
+        return Err("invalid annotation request framing");
+    };
+    if !query.is_empty()
+        || request.header("transfer-encoding").is_some()
+        || !request.header("content-type").is_some_and(|value| {
+            value.split(';').next().is_some_and(|mime| {
+                mime.trim()
+                    .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+            })
+        })
+    {
+        return Err("invalid annotation request framing");
+    }
+    bounded_bytes(reader, deadline, length, false).map_err(|_| "incomplete annotation request")
+}
+
 pub fn handle(
     stream: &mut TcpStream,
     reader: &mut BufReader<TcpStream>,
-    config: &ServeConfig,
+    shared: &SharedConfig,
     request: &HttpRequest,
     deadline: Instant,
+    session: Option<&serve_review::Session>,
+    clients: &Clients,
 ) -> io::Result<()> {
     let head = request.method == "HEAD";
-    let fail = |stream: &mut TcpStream, status, message| {
+    let fail = |stream: &mut TcpStream, status: &str, message: &str| {
         annotation_response(
             stream,
             status,
@@ -321,9 +350,10 @@ pub fn handle(
             head,
         )
     };
+    let initial = shared.read().expect("config lock").clone();
     if !request
         .header("host")
-        .is_some_and(|host| loopback_host(host, config.port))
+        .is_some_and(|host| loopback_host(host, initial.port))
     {
         return fail(stream, "403 Forbidden", "invalid Host");
     }
@@ -331,11 +361,52 @@ pub fn handle(
         .target
         .split_once('?')
         .unwrap_or((&request.target, ""));
-    if path != ENDPOINT {
+    let review_endpoint = session.filter(|_| path == serve_review::ENDPOINT);
+    if path != ENDPOINT && review_endpoint.is_none() {
         return if matches!(request.method.as_str(), "GET" | "HEAD") {
             fail(stream, "404 Not Found", "unknown endpoint")
         } else {
             fail(stream, "405 Method Not Allowed", "method not allowed")
+        };
+    }
+    let body = if request.method == "POST" && initial.review_token.is_some() {
+        if !token_matches(
+            request.header("x-markview-token"),
+            initial.review_token.as_deref().expect("checked token"),
+        ) {
+            return fail(stream, "403 Forbidden", "invalid annotation token");
+        }
+        match post_body(reader, request, query, deadline) {
+            Ok(body) => Some(body),
+            Err(message) => return fail(stream, "400 Bad Request", message),
+        }
+    } else {
+        None
+    };
+    if let Some(session) = review_endpoint {
+        if !query.is_empty() {
+            return fail(stream, "400 Bad Request", "unexpected review query");
+        }
+        let config = shared.read().expect("config lock");
+        let result = match request.method.as_str() {
+            "GET" | "HEAD" => session.summary(&config).map(|json| (json, None)),
+            "POST" if body.is_some() => session
+                .finish(&config, body.as_deref().expect("validated POST"))
+                .map(|result| ("{\"finished\":true}".to_owned(), Some(result))),
+            _ => return fail(stream, "405 Method Not Allowed", "method not allowed"),
+        };
+        drop(config);
+        return match result {
+            Ok((json, Some(result))) => {
+                broadcast_reload(clients, ReloadKind::ReviewFinished);
+                let response = stream
+                    .set_write_timeout(Some(Duration::from_millis(250)))
+                    .and_then(|()| annotation_response(stream, "200 OK", &json, false));
+                session.publish(result);
+                response
+            }
+            Ok((json, None)) => annotation_response(stream, "200 OK", &json, head),
+            Err(error) => respond_error(stream, error, "review summary is unavailable", fail),
         };
     }
     let result = match request.method.as_str() {
@@ -347,78 +418,68 @@ pub fn handle(
             else {
                 return fail(stream, "400 Bad Request", "expected a document route");
             };
-            let Some(location) = document(config, &route) else {
+            let Some(location) = document(&initial, &route) else {
                 return fail(
                     stream,
                     "404 Not Found",
                     "document route or store is unavailable",
                 );
             };
-            read_review(config, &location)
+            read_review(&initial, &location).map(Some)
         }
-        "POST" if config.review_token.is_some() => {
-            let expected = config.review_token.as_deref().expect("checked token");
-            if !token_matches(request.header("x-markview-token"), expected) {
-                return fail(stream, "403 Forbidden", "invalid annotation token");
-            }
-            let length = request
-                .header("content-length")
-                .filter(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
-                .and_then(|value| value.parse::<usize>().ok());
-            if !query.is_empty()
-                || !matches!(length, Some(1..=FORM_CAP))
-                || request.header("transfer-encoding").is_some()
-                || !request.header("content-type").is_some_and(|value| {
-                    value.split(';').next().is_some_and(|mime| {
-                        mime.trim()
-                            .eq_ignore_ascii_case("application/x-www-form-urlencoded")
-                    })
-                })
-            {
-                return fail(
-                    stream,
-                    "400 Bad Request",
-                    "invalid annotation request framing",
-                );
-            }
-            let Ok(bytes) = bounded_bytes(reader, deadline, length.expect("checked size"), false)
-            else {
-                return fail(stream, "400 Bad Request", "incomplete annotation request");
-            };
-            match Request::parse(&bytes) {
-                Ok(form) => {
-                    let Some(route) = form.doc else {
-                        return fail(stream, "400 Bad Request", "expected a document route");
-                    };
-                    let Some(location) = document(config, &route) else {
-                        return fail(
-                            stream,
-                            "404 Not Found",
-                            "document route or store is unavailable",
-                        );
-                    };
-                    mutate_review(config, &location, form.operation)
+        "POST" if body.is_some() => {
+            // Review mutations use the current allowlist and hold it stable
+            // through validation and writing. Ordinary serve uses its
+            // immutable request snapshot.
+            let published = session.map(|_| shared.read().expect("config lock"));
+            let config = published.as_deref().unwrap_or(&initial);
+            let mutation = || {
+                let form = Request::parse(body.as_deref().expect("validated POST"))?;
+                let route = form
+                    .doc
+                    .ok_or(Error::Invalid("expected a document route"))?;
+                let Some(location) = document(config, &route) else {
+                    return Ok(None);
+                };
+                let result = mutate_review(config, &location, form.operation)?;
+                if session.is_some() {
+                    if let Some(route) = config.document_route_for_path(&location.document) {
+                        broadcast_reload(clients, ReloadKind::Annotations(route.to_owned()));
+                    }
                 }
-                Err(error) => Err(error),
+                Ok(Some(result))
+            };
+            match session {
+                Some(session) => session.mutate(mutation),
+                None => mutation(),
             }
         }
         _ => return fail(stream, "405 Method Not Allowed", "method not allowed"),
     };
     match result {
-        Ok(review) => annotation_response(stream, "200 OK", &review.json(), head),
-        Err(error) => {
-            let status = match error {
-                Error::Invalid(_) => "400 Bad Request",
-                Error::Conflict(_) | Error::Section(..) => "409 Conflict",
-                Error::Io(_) => "500 Internal Server Error",
-            };
-            let message = error.to_string();
-            if status == "500 Internal Server Error" {
-                eprintln!("markview: {message}");
-                fail(stream, status, "annotation store is unavailable")
-            } else {
-                fail(stream, status, &message)
-            }
+        Ok(Some(review)) => annotation_response(stream, "200 OK", &review.json(), head),
+        Ok(None) => fail(
+            stream,
+            "404 Not Found",
+            "document route or store is unavailable",
+        ),
+        Err(error) => respond_error(stream, error, "annotation store is unavailable", fail),
+    }
+}
+
+fn respond_error(
+    stream: &mut TcpStream,
+    error: Error,
+    unavailable: &str,
+    fail: impl FnOnce(&mut TcpStream, &str, &str) -> io::Result<()>,
+) -> io::Result<()> {
+    let message = error.to_string();
+    match error {
+        Error::Invalid(_) => fail(stream, "400 Bad Request", &message),
+        Error::Conflict(_) | Error::Section(..) => fail(stream, "409 Conflict", &message),
+        Error::Io(_) => {
+            eprintln!("markview: {message}");
+            fail(stream, "500 Internal Server Error", unavailable)
         }
     }
 }
@@ -433,9 +494,16 @@ pub fn static_asset(target: &str) -> Option<(&'static str, &'static str)> {
         Some("/_markview/review.css") => {
             Some(("text/css; charset=utf-8", annotations::REVIEW_STYLE))
         }
+        Some("/_markview/copy.js") => {
+            Some(("text/javascript; charset=utf-8", annotations::COPY_SCRIPT))
+        }
+        Some("/_markview/copy.css") => Some(("text/css; charset=utf-8", annotations::COPY_STYLE)),
+        Some("/_markview/verdict.js") => Some(("text/javascript; charset=utf-8", VERDICT_SCRIPT)),
         _ => None,
     }
 }
+
+const VERDICT_SCRIPT: &str = include_str!("annotations/verdict.js");
 
 /// The URLs carry a digest of the content, so a response can be cached for
 /// good and a new markview build is still picked up at once.
@@ -445,7 +513,14 @@ fn static_version() -> &'static str {
     static VERSION: OnceLock<String> = OnceLock::new();
     VERSION.get_or_init(|| {
         annotations::source_revision(
-            &[annotations::REVIEW_SCRIPT, annotations::REVIEW_STYLE].concat(),
+            &[
+                annotations::REVIEW_SCRIPT,
+                annotations::REVIEW_STYLE,
+                annotations::COPY_SCRIPT,
+                annotations::COPY_STYLE,
+                VERDICT_SCRIPT,
+            ]
+            .concat(),
         )
     })
 }
@@ -453,18 +528,38 @@ fn static_version() -> &'static str {
 /// What a page needs to show annotations: the cached stylesheet and script,
 /// and the call that connects them to this route. `nonce_attr` is the
 /// ` nonce="..."` attribute a token-bearing page's policy requires.
-pub fn hooks(route: &str, token: Option<&str>, port: u16, nonce_attr: &str) -> String {
+pub fn hooks(
+    route: &str,
+    token: Option<&str>,
+    port: u16,
+    nonce_attr: &str,
+    blocking: bool,
+) -> String {
     let version = static_version();
+    let verdict = if blocking {
+        format!(r#"<script{nonce_attr} src="/_markview/verdict.js?v={version}"></script>"#)
+    } else {
+        String::new()
+    };
     format!(
         "<link rel=\"stylesheet\" href=\"/_markview/review.css?v={version}\">
 <script{nonce_attr} src=\"/_markview/review.js?v={version}\"></script>
+{verdict}
 <script{nonce_attr}>(() => {{
   const route = {};
   const token = {};
-  markviewServeReview(route, token, {port});
+  markviewServeReview(route, token, {port}, {blocking});
 }})();</script>",
         annotations::json_string(route),
         token.map_or("null".to_owned(), annotations::json_string),
+    )
+}
+
+pub fn copy_hooks(nonce_attr: &str) -> String {
+    let version = static_version();
+    format!(
+        r#"<link rel="stylesheet" href="/_markview/copy.css?v={version}">
+<script{nonce_attr} src="/_markview/copy.js?v={version}"></script>"#
     )
 }
 
@@ -509,6 +604,16 @@ impl Stores {
         if !hooks {
             if let Ok(mut plain) = self.plain.lock() {
                 plain.insert(document.to_owned());
+            }
+        }
+    }
+
+    /// A blocking review shows counts for the whole collection, even when
+    /// the reviewer has only opened one document.
+    pub fn watch_collection(&self, config: &ServeConfig) {
+        if let Ok(mut watcher) = self.watcher.lock() {
+            for document in &config.documents {
+                watcher.watch(&document.source_path);
             }
         }
     }
@@ -590,8 +695,11 @@ mod tests {
         "Before **two** &amp; [a link](target.md) 😀![alt](image.png).[^n]\n\n",
         "[unsafe](java&#x09;script:alert%281%29) [fragment](#review-fixture)\n\n",
         "```diff\n-old\n+new\n```\n\n",
+        "> ```rust\r\n> \tlet ready = true;\r\n> ```\r\n\r\n",
+        "    indented & text\n\n",
         "<div>\nliteral &amp;\n</div>\n\n",
         "- [x] task\n\n",
+        "> [!NOTE]\n> Alert **prose**.\n\n",
         "| first | second |\n| - | - |\n| a | b |\n\n",
         "[^n]: Footnote *prose*.\n\n",
         "â€™ `two\nlines` with NEL\u{85}space\n",
@@ -713,6 +821,7 @@ mod tests {
             Some(super::super::ReviewHooks {
                 nonce: Some(&nonce),
                 token: config.review_token.as_deref(),
+                blocking_review: true,
             }),
         )
         .unwrap();
@@ -738,5 +847,43 @@ mod tests {
             r#"<script nonce="{nonce}" src="/_markview/review.js?v={}"></script>"#,
             static_version()
         )));
+        if let Some(path) = std::env::var_os("MARKVIEW_REVIEW_BROWSER_FIXTURE") {
+            let policy = content_security_policy(&nonce);
+            let projection = markview::annotations::TextProjection::new(SOURCE);
+            let expected = annotations::json_string(&projection.text());
+            let setup = format!(
+                r#"<meta http-equiv="Content-Security-Policy" content="{policy}">
+<script nonce="{nonce}">const expectedText = {expected};
+window.fixtureFetch = () => new Promise(() => {{}});
+window.fetch = (...args) => window.fixtureFetch(...args);
+window.EventSource = class extends EventTarget {{
+  constructor() {{ super(); window.fixtureEvents = this; }}
+  close() {{}}
+}};
+</script>
+<script>window.untrustedScriptRan = true;</script>"#
+            );
+            let mut html = html.replacen("<head>", &format!("<head>{setup}"), 1);
+            for (name, source) in [
+                ("copy.js", annotations::COPY_SCRIPT),
+                ("review.js", annotations::REVIEW_SCRIPT),
+                ("verdict.js", VERDICT_SCRIPT),
+            ] {
+                let link = format!(
+                    r#"<script nonce="{nonce}" src="/_markview/{name}?v={}"></script>"#,
+                    static_version()
+                );
+                html = html.replace(
+                    &link,
+                    &format!(r#"<script nonce="{nonce}">{source}</script>"#),
+                );
+            }
+            let harness = include_str!("../tests/review.browser.js");
+            let html = html.replace(
+                "</body>",
+                &format!(r#"<script nonce="{nonce}">{harness}</script></body>"#),
+            );
+            std::fs::write(path, html).unwrap();
+        }
     }
 }

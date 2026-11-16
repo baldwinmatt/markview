@@ -2442,7 +2442,7 @@ fn serve_annotations_delivers_the_error_when_rejecting_a_large_post() {
 }
 
 /// A copy of `tests/fixtures/serve-baseline`, whose rendered default page
-/// before annotations existed is `tests/fixtures/serve-baseline.expected.html`.
+/// with the copy controls and without annotation hooks is `tests/fixtures/serve-baseline.expected.html`.
 fn baseline_site() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let site = dir.path().join("site");
@@ -2466,11 +2466,11 @@ fn without_timestamp(body: &str) -> String {
     format!("{before}{marker}TIMESTAMP\"{after}")
 }
 
-const BASELINE_HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\nContent-Length: 11157\r\nConnection: close";
+const BASELINE_HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\nContent-Length: 13909\r\nConnection: close";
 const BASELINE_BODY: &str = include_str!("fixtures/serve-baseline.expected.html");
 
 #[test]
-fn serve_page_without_annotations_is_byte_identical_to_before_the_feature() {
+fn serve_page_without_annotations_matches_the_plain_page_fixture() {
     let (_dir, site) = baseline_site();
     let server = ServeProcess::start_dir(&site);
     let response = http_get(server.port, "/");
@@ -3162,4 +3162,280 @@ fn read_until<R: Read>(reader: &mut R, needle: &str, timeout: Duration) -> Strin
         }
     }
     output
+}
+
+#[test]
+fn review_rejects_incompatible_options() {
+    for flag in [
+        "--serve",
+        "--daemon",
+        "--annotations",
+        "--include-resolved",
+        "--html",
+        "--open",
+        "--annotate",
+    ] {
+        Command::cargo_bin("markview")
+            .unwrap()
+            .args(["--review", flag, "sample.md"])
+            .assert()
+            .failure()
+            .stdout("")
+            .stderr(format!(
+                "markview: --review cannot be combined with {flag}\n"
+            ));
+    }
+    for flag in ["--gate", "--no-open"] {
+        Command::cargo_bin("markview")
+            .unwrap()
+            .args(["--serve", flag, "sample.md"])
+            .assert()
+            .failure()
+            .stdout("")
+            .stderr(format!("markview: {flag} requires --review\n"));
+    }
+}
+
+#[test]
+fn review_serves_a_verdict_and_saved_comments_with_optional_gate() {
+    use markview::annotations::source_revision;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = "# Reviewed\n";
+    std::fs::write(dir.path().join("sample.md"), source).unwrap();
+    for (verdict, gate, expected) in [
+        ("approved", false, 0),
+        ("changes", false, 0),
+        ("changes", true, 2),
+    ] {
+        if verdict == "changes" {
+            let store = dir.path().join(".markview/annotations");
+            std::fs::create_dir_all(&store).unwrap();
+            std::fs::write(
+                store.join("sample.md"),
+                "## a1 [open] document\n\nPlease revise\n",
+            )
+            .unwrap();
+        }
+        let requested = gate.then(unused_port);
+        let port_text = requested.unwrap_or(0).to_string();
+        let options = if gate {
+            &["--gate", "--port", &port_text][..]
+        } else {
+            &[]
+        };
+        let mut server = start_review(dir.path(), options);
+        let port = server.port;
+        assert!(requested.is_none_or(|requested| requested == port));
+        let html = http_get(port, "/");
+        let token = html
+            .split("const token = \"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        let host = format!("localhost:{port}");
+        let summary = raw_http(
+            port,
+            &format!("GET /_markview/review HTTP/1.1\r\nHost: {host}\r\n\r\n"),
+        );
+        assert!(summary.contains("Cache-Control: no-store"));
+        let revision = summary
+            .split("\"review_revision\":\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        let form = format!("op=finish&verdict={verdict}&review_revision={revision}&doc=/sample.md&source_revision={}", source_revision(source));
+        let post = |host: &str, token: &str, body: &str| {
+            raw_http(port, &format!(
+            "POST /_markview/review HTTP/1.1\r\nHost: {host}\r\nX-Markview-Token: {token}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}", body.len()))
+        };
+        assert!(raw_http(
+            port,
+            "GET /_markview/review HTTP/1.1\r\nHost: example.com\r\n\r\n"
+        )
+        .starts_with("HTTP/1.1 403"));
+        assert!(raw_http(
+            port,
+            &format!("HEAD /_markview/review HTTP/1.1\r\nHost: {host}\r\n\r\n")
+        )
+        .ends_with("\r\n\r\n"));
+        assert!(post("example.com", token, &form).starts_with("HTTP/1.1 403"));
+        assert!(post(&host, "wrong", &form).starts_with("HTTP/1.1 403"));
+        assert!(post(&host, token, "op=finish&op=finish").starts_with("HTTP/1.1 400"));
+        let oversized = format!("POST /_markview/review HTTP/1.1\r\nHost: {host}\r\nX-Markview-Token: {token}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n", markview::annotations::FORM_CAP + 1);
+        assert!(raw_http(port, &oversized).starts_with("HTTP/1.1 400"));
+        drop(open_reload_stream(port));
+        assert!(
+            server.child.try_wait().unwrap().is_none(),
+            "Tab disconnect ended the review"
+        );
+        let mut events = open_reload_stream(port);
+        let _stalled = open_reload_stream(port);
+        assert!(post(&host, token, &form).starts_with("HTTP/1.1 200"));
+        let mut notification = String::new();
+        events.read_to_string(&mut notification).unwrap();
+        assert!(
+            notification.contains("event: review-finished"),
+            "{notification}"
+        );
+        let until = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = server.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < until, "review server did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let mut stdout = String::new();
+        server
+            .child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        assert_eq!(status.code(), Some(expected));
+        if verdict == "approved" {
+            assert_eq!(stdout, "Review: approved (0 open comments in 0 documents)\n\nNo open annotations in the reviewed collection.\n");
+        } else {
+            assert_eq!(stdout, concat!("Review: changes requested (1 open comment in 1 document)\n\n",
+                "# Annotations: sample.md\n",
+                "Store: .markview/annotations/sample.md (change `[open]` to `[resolved]` there once addressed)\n\n",
+                "## a1 · document\n\nPlease revise\n\n"));
+        }
+    }
+}
+
+fn start_review(cwd: &std::path::Path, options: &[&str]) -> ServeProcess {
+    let child = std::process::Command::new(cargo_bin("markview"))
+        .current_dir(cwd)
+        .args(["--review", "--no-open", "sample.md"])
+        .args(options)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut server = ServeProcess {
+        child,
+        port: 0,
+        stderr: Default::default(),
+    };
+    let mut notice = String::new();
+    BufReader::new(server.child.stderr.take().unwrap())
+        .read_line(&mut notice)
+        .unwrap();
+    server.port = notice
+        .trim()
+        .strip_prefix("Waiting for review at http://localhost:")
+        .and_then(|url| url.strip_suffix('/'))
+        .unwrap_or_else(|| panic!("review did not start: {notice:?}"))
+        .parse()
+        .unwrap();
+    assert_ne!(server.port, 0);
+    server
+}
+
+#[test]
+fn review_endpoint_is_disabled_in_ordinary_serve() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("sample.md");
+    std::fs::write(&file, "# Sample").unwrap();
+    let server = ServeProcess::start(&file);
+    for (method, status) in [("GET", 404), ("HEAD", 404), ("POST", 405)] {
+        let response = raw_http(
+            server.port,
+            &format!(
+                "{method} /_markview/review HTTP/1.1\r\nHost: localhost:{}\r\n\r\n",
+                server.port
+            ),
+        );
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status}")),
+            "{response}"
+        );
+        assert!(response.contains("Cache-Control: no-store"));
+    }
+}
+
+#[test]
+fn review_finish_rejects_missing_token_and_times_out_an_incomplete_form() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("sample.md"), "# Sample").unwrap();
+    let mut server = start_review(dir.path(), &[]);
+    let port = server.port;
+    let headers = format!("POST /_markview/review HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/x-www-form-urlencoded\r\n");
+    assert!(raw_http(
+        port,
+        &format!("{headers}Content-Length: 9\r\n\r\nop=finish")
+    )
+    .starts_with("HTTP/1.1 403"));
+
+    let page = http_get(port, "/");
+    let token = page
+        .split("const token = \"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(6)))
+        .unwrap();
+    write!(
+        stream,
+        "{headers}X-Markview-Token: {token}\r\nContent-Length: 20\r\n\r\nop=finish"
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    assert!(response.contains("incomplete annotation request"));
+    assert!(server.child.try_wait().unwrap().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn review_signals_cancel_without_losing_comments() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("sample.md"), "# Sample").unwrap();
+    let annotation_dir = dir.path().join(".markview/annotations");
+    std::fs::create_dir_all(&annotation_dir).unwrap();
+    let annotation_path = annotation_dir.join("sample.md");
+    let comment = "## a1 [open] document\n\nSaved comment\n";
+    std::fs::write(&annotation_path, comment).unwrap();
+
+    for (signal, number) in [("INT", 2), ("TERM", 15)] {
+        let mut server = start_review(dir.path(), &[]);
+        assert!(std::process::Command::new("kill")
+            .args(["-s", signal, &server.child.id().to_string()])
+            .status()
+            .unwrap()
+            .success());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = server.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "review ignored SIG{signal}");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(status.signal(), Some(number));
+        let mut stdout = String::new();
+        server
+            .child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        assert!(stdout.is_empty());
+        assert_eq!(std::fs::read_to_string(&annotation_path).unwrap(), comment);
+    }
 }

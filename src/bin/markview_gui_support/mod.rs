@@ -346,6 +346,7 @@ mod tests {
             theme: markview::ThemePreference::Light,
             sidebar_visible: false,
             auto_refresh: false,
+            single_key_shortcuts: false,
             window_width: 1110,
             window_height: 720,
             recent_files: vec![PathBuf::from("/tmp/readme.md")],

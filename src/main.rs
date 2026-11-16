@@ -1,4 +1,5 @@
 mod serve_annotations;
+mod serve_review;
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -16,8 +17,8 @@ use std::time::{Duration, SystemTime};
 
 use markview::annotations;
 use markview::{
-    help, render, repair_utf8_mojibake, Cli, FrontendRenderer, HtmlRenderer, MarkdownDocument,
-    OutputFormat,
+    help, percent_decode, render, repair_utf8_mojibake, Cli, FrontendRenderer, HtmlRenderer,
+    MarkdownDocument, OutputFormat,
 };
 use notify::{event::ModifyKind, Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use pulldown_cmark::{Event, Parser, Tag};
@@ -48,6 +49,25 @@ fn run() -> Result<(String, ExitCode), Box<dyn std::error::Error>> {
         return list_annotations(&cli.inputs, cli.include_resolved);
     }
 
+    if let Some(port) = cli.review {
+        let (session, result) = serve_review::Session::new();
+        let result = serve_markdown(
+            cli.inputs.iter().map(PathBuf::from).collect(),
+            port,
+            cli.recurse,
+            !cli.no_open,
+            true,
+            Some((session, result)),
+        )?
+        .expect("review session returns a verdict");
+        let status = if cli.gate && result.changes {
+            ExitCode::from(2)
+        } else {
+            ExitCode::SUCCESS
+        };
+        return Ok((result.output, status));
+    }
+
     if let Some(port) = cli.serve {
         if cli.inputs.is_empty() {
             return Err(markview::CliError::MissingServeInput.into());
@@ -56,7 +76,7 @@ fn run() -> Result<(String, ExitCode), Box<dyn std::error::Error>> {
         if cli.daemon {
             serve_markdown_daemon(inputs, port, cli.recurse, cli.open, cli.annotate)?;
         } else {
-            serve_markdown(inputs, port, cli.recurse, cli.open, cli.annotate)?;
+            serve_markdown(inputs, port, cli.recurse, cli.open, cli.annotate, None)?;
         }
         return Ok((String::new(), ExitCode::SUCCESS));
     }
@@ -199,10 +219,28 @@ fn document_annotations(
     }
 
     let mut output = String::new();
+    format_annotations(
+        &mut output,
+        file,
+        Path::new(&store),
+        &review,
+        include_resolved,
+    );
+    Ok(Some(output))
+}
+
+fn format_annotations(
+    output: &mut String,
+    file: &Path,
+    store: &Path,
+    review: &annotations::Review,
+    include_resolved: bool,
+) {
     let _ = writeln!(
         output,
-        "# Annotations: {}\nStore: {store} (change `[open]` to `[resolved]` there once addressed)\n",
-        file.display()
+        "# Annotations: {}\nStore: {} (change `[open]` to `[resolved]` there once addressed)\n",
+        file.display(),
+        store.display()
     );
     let resolved = review
         .annotations
@@ -212,7 +250,7 @@ fn document_annotations(
     if resolved == review.annotations.len() {
         let _ = writeln!(output, "No open annotations for {}.\n", file.display());
     }
-    for record in review.annotations {
+    for record in &review.annotations {
         if record.status == annotations::Status::Resolved && !include_resolved {
             continue;
         }
@@ -226,7 +264,7 @@ fn document_annotations(
             }
             None => output.push_str("document"),
         }
-        if let Some(section) = record.section {
+        if let Some(section) = &record.section {
             let _ = write!(output, " · {section}");
         }
         if !record.attached {
@@ -236,7 +274,7 @@ fn document_annotations(
             output.push_str(" · resolved");
         }
         output.push('\n');
-        if let Some(quote) = record.quote {
+        if let Some(quote) = &record.quote {
             let _ = writeln!(output, "> {quote}");
         }
         let _ = writeln!(output, "\n{}\n", record.body);
@@ -249,7 +287,6 @@ fn document_annotations(
         };
         let _ = writeln!(output, "{resolved} resolved {label} not shown.\n");
     }
-    Ok(Some(output))
 }
 
 #[derive(Debug)]
@@ -259,11 +296,13 @@ struct ServeConfig {
     default_document: PathBuf,
     port: u16,
     review_token: Option<String>,
+    blocking_review: bool,
     /// Projections and resolved reviews of recently requested documents.
     review_cache: annotations::ReviewCache,
     /// Directories under the root that are not served because their route
     /// would fall under the reserved `/_markview/` prefix.
     reserved: Vec<PathBuf>,
+    rescan_id: u64,
     mode: ServeMode,
     sidebar_nav: Option<NavDir>,
     /// Memoized `scan_assets()` result, invalidated by comparing each served
@@ -327,6 +366,7 @@ enum NavLayout {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReloadKind {
     Annotations(String),
+    ReviewFinished,
     Content,
     Structure,
 }
@@ -335,6 +375,7 @@ enum ReloadKind {
 /// wholesale after a rescan (e.g. a Markdown file was added or removed under
 /// the served root) without connection threads ever seeing a torn read.
 type SharedConfig = Arc<RwLock<Arc<ServeConfig>>>;
+static NEXT_RESCAN_ID: AtomicU64 = AtomicU64::new(1);
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(50);
 /// How often an idle `/events` connection wakes up to send an SSE comment
 /// keepalive. This is also the bound on how quickly a browser navigating away
@@ -381,8 +422,13 @@ fn serve_markdown(
     recurse: bool,
     open: bool,
     annotate: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+    review: Option<(
+        Arc<serve_review::Session>,
+        mpsc::Receiver<serve_review::AcceptedReview>,
+    )>,
+) -> Result<Option<serve_review::AcceptedReview>, Box<dyn std::error::Error>> {
     let mut config = ServeConfig::from_inputs(inputs.clone(), port, recurse)?;
+    config.blocking_review = review.is_some();
     config.review_token = annotate.then(annotations::random_hex).transpose()?;
     // Said once, at startup: a rescan builds a fresh config but stays quiet.
     for directory in &config.reserved {
@@ -392,7 +438,8 @@ fn serve_markdown(
         );
     }
     #[cfg(unix)]
-    let listener = if std::env::var_os("MARKVIEW_INHERITED_LISTENER").is_some() {
+    let listener = if review.is_none() && std::env::var_os("MARKVIEW_INHERITED_LISTENER").is_some()
+    {
         let listener = TcpListener::from(io::stdin().as_fd().try_clone_to_owned()?);
         if listener.local_addr()?.port() != port {
             return Err("inherited listener does not match --port".into());
@@ -409,6 +456,9 @@ fn serve_markdown(
     let clients = Arc::new(Mutex::new(Vec::new()));
     let shared: SharedConfig = Arc::new(RwLock::new(Arc::new(config)));
     let stores = serve_annotations::watch_stores(shared.clone(), clients.clone())?;
+    if review.is_some() {
+        stores.watch_collection(&shared.read().expect("config lock"));
+    }
     let _watcher = watch_root(
         shared.clone(),
         inputs,
@@ -418,37 +468,74 @@ fn serve_markdown(
         stores.clone(),
     )?;
 
-    println!(
-        "Serving on http://localhost:{} — press Ctrl+C to stop",
-        address.port()
-    );
-    io::stdout().flush()?;
+    if review.is_some() {
+        listener.set_nonblocking(true)?;
+        eprintln!("Waiting for review at {}", serve_open_url(bound_port));
+    } else {
+        println!("Serving on http://localhost:{bound_port} — press Ctrl+C to stop");
+        io::stdout().flush()?;
+    }
 
     if open {
         let url = serve_open_url(address.port());
-        if let Err(error) = open::that(&url) {
-            eprintln!("markview: failed to open browser: {error}");
+        if review.is_some() {
+            thread::spawn(move || open_browser(&url));
+        } else {
+            open_browser(&url);
         }
     }
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
+    let mut accepted = None;
+    loop {
+        if let Some((_, receiver)) = &review {
+            if accepted.is_none() {
+                if let Ok(result) = receiver.try_recv() {
+                    // Give SSE clients a bounded window to receive the event,
+                    // while still returning conflicts to concurrent writers.
+                    accepted = Some((
+                        std::time::Instant::now() + Duration::from_millis(150),
+                        result,
+                    ));
+                }
+            }
+            if accepted
+                .as_ref()
+                .is_some_and(|(until, _)| std::time::Instant::now() >= *until)
+            {
+                return Ok(accepted.map(|(_, result)| result));
+            }
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
                 let shared = shared.clone();
                 let clients = clients.clone();
+                let session = review.as_ref().map(|(session, _)| session.clone());
                 let stores = stores.clone();
                 thread::spawn(move || {
-                    let config = shared.read().expect("config lock").clone();
-                    if let Err(error) = handle_connection(stream, &config, clients, &stores) {
+                    if let Err(error) =
+                        handle_connection(stream, &shared, clients, &stores, session)
+                    {
                         eprintln!("markview: serve error: {error}");
                     }
                 });
             }
-            Err(error) => eprintln!("markview: connection failed: {error}"),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock && review.is_some() => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::ConnectionAborted => {
+                eprintln!("markview: connection failed: {error}");
+            }
+            Err(error) if review.is_none() => eprintln!("markview: connection failed: {error}"),
+            Err(error) => return Err(error.into()),
         }
     }
+}
 
-    Ok(())
+fn open_browser(url: &str) {
+    if let Err(error) = open::that(url) {
+        eprintln!("markview: failed to open browser: {error}");
+    }
 }
 
 /// The URL `--open` should launch once the server is bound. The root route
@@ -696,8 +783,10 @@ impl ServeConfig {
             default_document: build.default_document,
             port,
             review_token: None,
+            blocking_review: false,
             review_cache: annotations::ReviewCache::default(),
             reserved: build.reserved,
+            rescan_id: 0,
             mode: build.mode,
             sidebar_nav,
             asset_cache: Mutex::new(None),
@@ -1170,33 +1259,6 @@ fn decode_repeated(value: &str) -> Option<String> {
     Some(current)
 }
 
-fn percent_decode(value: &str) -> Option<String> {
-    let bytes = value.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            let hi = *bytes.get(index + 1)?;
-            let lo = *bytes.get(index + 2)?;
-            output.push((hex_value(hi)? << 4) | hex_value(lo)?);
-            index += 3;
-        } else {
-            output.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8(output).ok()
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
 fn markdown_references(source: &str) -> Vec<String> {
     Parser::new_ext(source, markview::scanner_options())
         .filter_map(|event| match event {
@@ -1422,13 +1484,17 @@ fn handle_fs_events(
     if needs_rescan {
         // A fresh `ServeConfig` carries its own empty `asset_cache`, so
         // there's nothing to invalidate here even if `asset_changed` too.
+        let rescan_id = NEXT_RESCAN_ID.fetch_add(1, Ordering::Relaxed);
         let shared = shared.clone();
         let clients = clients.clone();
         let stores = stores.clone();
         let inputs = inputs.to_vec();
-        thread::spawn(move || {
-            rescan_and_reload(shared, clients, &stores, inputs, port, recurse, current);
-        });
+        thread::spawn(
+            move || match ServeConfig::from_inputs(inputs, port, recurse) {
+                Ok(fresh) => publish_rescan(&shared, &clients, &stores, fresh, rescan_id),
+                Err(error) => eprintln!("markview: failed to rescan served directory: {error}"),
+            },
+        );
     } else {
         if asset_changed {
             if let Ok(mut cache) = current.asset_cache.lock() {
@@ -1439,35 +1505,32 @@ fn handle_fs_events(
     }
 }
 
-fn rescan_and_reload(
-    shared: SharedConfig,
-    clients: Clients,
+fn publish_rescan(
+    shared: &SharedConfig,
+    clients: &Clients,
     stores: &serve_annotations::Stores,
-    inputs: Vec<PathBuf>,
-    port: u16,
-    recurse: bool,
-    previous: Arc<ServeConfig>,
+    mut fresh: ServeConfig,
+    rescan_id: u64,
 ) {
-    let reload_kind = match ServeConfig::from_inputs(inputs, port, recurse) {
-        Ok(mut fresh) => {
-            fresh.review_token.clone_from(&previous.review_token);
-            let reload_kind = if nav_layout(&previous) == nav_layout(&fresh) {
-                ReloadKind::Content
-            } else {
-                ReloadKind::Structure
-            };
-            // The document set changed: stop watching stores of documents
-            // that are no longer served.
-            stores.retain(&fresh);
-            *shared.write().expect("config lock") = Arc::new(fresh);
-            reload_kind
-        }
-        Err(error) => {
-            eprintln!("markview: failed to rescan served directory: {error}");
-            return;
-        }
+    let mut published = shared.write().expect("config lock");
+    // An earlier scan may finish after a newer one on the background workers.
+    if rescan_id <= published.rescan_id {
+        return;
+    }
+    fresh.rescan_id = rescan_id;
+    fresh.review_token.clone_from(&published.review_token);
+    let reload = if nav_layout(&published) == nav_layout(&fresh) {
+        ReloadKind::Content
+    } else {
+        ReloadKind::Structure
     };
-    broadcast_reload(&clients, reload_kind);
+    fresh.blocking_review = published.blocking_review;
+    stores.retain(&fresh);
+    if fresh.blocking_review {
+        stores.watch_collection(&fresh);
+    }
+    *published = Arc::new(fresh);
+    broadcast_reload(clients, reload);
 }
 
 fn broadcast_reload(clients: &Clients, reload_kind: ReloadKind) {
@@ -1485,10 +1548,12 @@ fn is_reload_event(kind: &EventKind) -> bool {
 
 fn handle_connection(
     mut stream: TcpStream,
-    config: &ServeConfig,
+    shared: &SharedConfig,
     clients: Clients,
     stores: &serve_annotations::Stores,
+    session: Option<Arc<serve_review::Session>>,
 ) -> io::Result<()> {
+    stream.set_nonblocking(false)?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     // Pages, assets and `/events` need only the method and target, so the
@@ -1525,9 +1590,15 @@ fn handle_connection(
     if serve_annotations::reserved(request_path) {
         let result =
             match serve_annotations::HttpRequest::parse(&request_line, &mut reader, deadline) {
-                Ok(request) => {
-                    serve_annotations::handle(&mut stream, &mut reader, config, &request, deadline)
-                }
+                Ok(request) => serve_annotations::handle(
+                    &mut stream,
+                    &mut reader,
+                    shared,
+                    &request,
+                    deadline,
+                    session.as_deref(),
+                    &clients,
+                ),
                 Err(_) => write_response(
                     &mut stream,
                     "400 Bad Request",
@@ -1542,11 +1613,13 @@ fn handle_connection(
         drain_request(&stream, &mut reader);
         return result;
     }
+    let config = shared.read().expect("config lock").clone();
+    let config = &*config;
     let head_only = method == "HEAD";
     let route = config.route_for_request(request_path);
     let route = route.as_deref().unwrap_or("");
     if method == "GET" && route == "/events" {
-        return match serve_events(stream, clients) {
+        return match serve_events(stream, clients, session.as_deref()) {
             Ok(()) => Ok(()),
             Err(error) if is_client_disconnect(&error) => {
                 if std::env::var_os("MARKVIEW_LOG_EVENT_DISCONNECTS").is_some() {
@@ -1579,7 +1652,15 @@ fn handle_connection(
             "/" => match config.default_document() {
                 Some(document) => {
                     let token = token(&mut reader);
-                    serve_document(&mut stream, config, stores, document, head_only, token)
+                    serve_document(
+                        &mut stream,
+                        config,
+                        stores,
+                        document,
+                        head_only,
+                        token,
+                        session.is_some(),
+                    )
                 }
                 None => write_404(&mut stream, head_only),
             },
@@ -1590,7 +1671,15 @@ fn handle_connection(
             _ => {
                 if let Some(document) = config.document_by_route(route) {
                     let token = token(&mut reader);
-                    serve_document(&mut stream, config, stores, document, head_only, token)
+                    serve_document(
+                        &mut stream,
+                        config,
+                        stores,
+                        document,
+                        head_only,
+                        token,
+                        session.is_some(),
+                    )
                 } else if let Some(asset) = config.asset_by_route(route) {
                     serve_asset(&mut stream, config, &asset, head_only)
                 } else {
@@ -1668,6 +1757,7 @@ fn serve_document(
     document: &ServedDocument,
     head_only: bool,
     token: Option<&str>,
+    review: bool,
 ) -> io::Result<()> {
     let nonce = config
         .review_token
@@ -1682,6 +1772,7 @@ fn serve_document(
     .then_some(ReviewHooks {
         nonce: nonce.as_deref(),
         token,
+        blocking_review: review && token.is_some(),
     });
     stores.served(&document.source_path, review.is_some());
     match render_file(config, document, review) {
@@ -1748,7 +1839,11 @@ fn serve_asset(
     }
 }
 
-fn serve_events(mut stream: TcpStream, clients: Clients) -> io::Result<()> {
+fn serve_events(
+    mut stream: TcpStream,
+    clients: Clients,
+    session: Option<&serve_review::Session>,
+) -> io::Result<()> {
     let (tx, rx) = mpsc::channel();
     let id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     clients
@@ -1771,6 +1866,9 @@ fn serve_events(mut stream: TcpStream, clients: Clients) -> io::Result<()> {
         b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n",
     )?;
     stream.flush()?;
+    if session.is_some_and(serve_review::Session::finished) {
+        return stream.write_all(b"event: review-finished\ndata: finished\n\n");
+    }
 
     // Poll on a timeout rather than blocking on `rx.recv()` forever: this is a
     // long-lived connection with no read side, so a periodic keepalive write is
@@ -1781,6 +1879,9 @@ fn serve_events(mut stream: TcpStream, clients: Clients) -> io::Result<()> {
         match rx.recv_timeout(EVENTS_KEEPALIVE) {
             Ok(ReloadKind::Annotations(route)) => {
                 write!(stream, "event: annotations\ndata: {route}\n\n")?
+            }
+            Ok(ReloadKind::ReviewFinished) => {
+                return stream.write_all(b"event: review-finished\ndata: finished\n\n");
             }
             Ok(ReloadKind::Content) => stream.write_all(b"data: reload\n\n")?,
             Ok(ReloadKind::Structure) => stream.write_all(b"data: rescan\n\n")?,
@@ -1799,6 +1900,7 @@ fn serve_events(mut stream: TcpStream, clients: Clients) -> io::Result<()> {
 struct ReviewHooks<'a> {
     nonce: Option<&'a str>,
     token: Option<&'a str>,
+    blocking_review: bool,
 }
 
 fn render_file(
@@ -2090,20 +2192,61 @@ fn inject_serve_shell(
   };
   updateModifiedTimes();
   updateRefreshTime();
+  const attachCodeCopy = createMarkviewCodeCopy(document.querySelector('main'));
+  window.markviewAttachCodeCopy = () => attachCodeCopy(text => navigator.clipboard.writeText(text));
+  window.markviewAttachCodeCopy();
   const events = new EventSource('/events');
-  events.onmessage = async (event) => {
+  let loadingDocument = false;
+  const refreshVerdict = () => { if (!loadingDocument) window.markviewVerdict?.refresh(); };
+  events.addEventListener('annotations', (event) => {
+    if (event.data === document.querySelector('main').dataset.markviewRoute) window.markviewReviewRefresh?.();
+    refreshVerdict();
+  });
+  events.addEventListener('review-finished', () => {
+    events.close();
+    window.markviewVerdict?.done();
+  });
+  events.addEventListener('open', refreshVerdict);
+  let refresh = 0;
+  window.markviewReloadDocument = async () => {
+    window.markviewVerdict?.invalidate();
+    const sequence = ++refresh;
+    loadingDocument = true;
+    try {
+      await reloadDocument(sequence);
+    } catch {
+      if (sequence === refresh) window.markviewVerdict?.unavailable();
+    } finally {
+      if (sequence === refresh) loadingDocument = false;
+    }
+  };
+  events.onmessage = (event) => {
     if (event.data === 'rescan') {
       location.reload();
       return;
     }
-    if (event.data !== 'reload') return;
+    if (event.data === 'reload') window.markviewReloadDocument();
+  };
+  async function reloadDocument(sequence) {
     const savedY = window.scrollY;
     const response = await fetch(location.pathname, { cache: 'no-store' });
     const text = await response.text();
     const next = new DOMParser().parseFromString(text, 'text/html');
     const currentMain = document.querySelector('main');
     const nextMain = next.querySelector('main');
-    if (currentMain && nextMain) currentMain.innerHTML = nextMain.innerHTML;
+    if (sequence !== refresh || window.markviewVerdict?.finished()) return;
+    if (!response.ok) {
+      if (response.status === 404 && window.markviewVerdict) location.replace('/');
+      else window.markviewVerdict?.unavailable();
+      return;
+    }
+    if (currentMain && nextMain) {
+      currentMain.innerHTML = nextMain.innerHTML;
+      currentMain.dataset.sourceRevision = nextMain.dataset.sourceRevision;
+      currentMain.dataset.markviewRoute = nextMain.dataset.markviewRoute;
+      window.markviewAttachCodeCopy();
+      window.markviewReviewRefresh?.();
+    }
     const currentNav = document.querySelector('[data-markview-nav]');
     const nextNav = next.querySelector('[data-markview-nav]');
     if (currentNav && nextNav) {
@@ -2122,7 +2265,9 @@ fn inject_serve_shell(
     updateModifiedTimes();
     updateRefreshTime();
     window.scrollTo(0, savedY);
-  };
+    loadingDocument = false;
+    await window.markviewVerdict?.refresh();
+  }
 })();
 </script>"#;
 
@@ -2326,63 +2471,39 @@ fn inject_serve_shell(
             .replacen("</main>", "</main></div>", 1),
         NavLayout::Empty | NavLayout::Tabs => html.replacen("<main>", &format!("{nav}\n<main>"), 1),
     };
-    let Some((revision, hooks)) = review else {
-        return html.replace("</body>", &format!("{footer}\n{script}\n</body>"));
-    };
-    let html = html.replacen(
-        "<main>",
-        &format!(r#"<main data-source-revision="{revision}">"#),
-        1,
-    );
-    let nonce_attr = hooks
-        .nonce
+    let nonce_attr = review
+        .and_then(|(_, hooks)| hooks.nonce)
         .map_or(String::new(), |nonce| format!(r#" nonce="{nonce}""#));
-    let review = serve_annotations::hooks(active_route, hooks.token, config.port, &nonce_attr);
-    let script = review_reload_script(script, &nonce_attr);
-    html.replace("</body>", &format!("{footer}\n{review}\n{script}\n</body>"))
+    let (html, hooks) = if let Some((revision, hooks)) = review {
+        let html = html.replacen(
+            "<main>",
+            &format!(
+                r#"<main data-source-revision="{revision}" data-markview-route="{}">"#,
+                html_escape(active_route)
+            ),
+            1,
+        );
+        (
+            html,
+            serve_annotations::hooks(
+                active_route,
+                hooks.token,
+                config.port,
+                &nonce_attr,
+                hooks.blocking_review,
+            ),
+        )
+    } else {
+        (html, String::new())
+    };
+    let copy = serve_annotations::copy_hooks(&nonce_attr);
+    let script = script.replacen("<script>", &format!("<script{nonce_attr}>"), 1);
+    html.replace(
+        "</body>",
+        &format!("{footer}\n{copy}\n{hooks}\n{script}\n</body>"),
+    )
 }
 
-/// The live-reload script of a page that shows annotations. It differs from
-/// the plain one in three places: it listens for `annotations` events, it
-/// refreshes the comments after patching the document, and it drops a reload
-/// that a newer one has overtaken, since each reload now ends in a fetch.
-fn review_reload_script(script: &str, nonce_attr: &str) -> String {
-    let edits = [
-        ("<script>", format!("<script{nonce_attr}>")),
-        (
-            "  events.onmessage = async (event) => {\n",
-            "  events.addEventListener('annotations', (event) => {
-    if (event.data === window.markviewReviewRoute) window.markviewReviewRefresh();
-  });
-  let refresh = 0;
-  events.onmessage = async (event) => {\n"
-                .to_owned(),
-        ),
-        (
-            "    const savedY = window.scrollY;\n",
-            "    const sequence = ++refresh;\n    const savedY = window.scrollY;\n".to_owned(),
-        ),
-        (
-            "    if (currentMain && nextMain) currentMain.innerHTML = nextMain.innerHTML;\n",
-            "    if (sequence !== refresh || !response.ok) return;
-    if (currentMain && nextMain) {
-      currentMain.innerHTML = nextMain.innerHTML;
-      currentMain.dataset.sourceRevision = nextMain.dataset.sourceRevision;
-      window.markviewReviewRefresh();
-    }\n"
-            .to_owned(),
-        ),
-    ];
-    let mut script = script.to_owned();
-    for (anchor, replacement) in edits {
-        assert_eq!(script.matches(anchor).count(), 1, "reload script anchor");
-        script = script.replacen(anchor, &replacement, 1);
-    }
-    script
-}
-
-/// Low-level "what's this file's mtime" primitive shared by every caller
-/// that needs one, each applying its own fallback for a failed/missing stat.
 fn file_mtime(path: &Path) -> Option<SystemTime> {
     path.metadata().ok()?.modified().ok()
 }
@@ -2713,6 +2834,28 @@ mod serve_nav_tests {
             "structural rescan blocked the watcher event handler"
         );
         std::fs::write(&fifo, "# Blocked\n").expect("unblock fifo reader");
+    }
+
+    #[test]
+    fn older_rescan_cannot_replace_the_newer_published_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let inputs = vec![dir.path().to_owned()];
+        fs::write(dir.path().join("README.md"), "# Home").unwrap();
+        let mut original = ServeConfig::from_inputs(inputs.clone(), 0, false).unwrap();
+        original.review_token = Some("session".to_owned());
+        let shared: SharedConfig = Arc::new(RwLock::new(Arc::new(original)));
+        let (tx, rx) = mpsc::channel();
+        let clients = Arc::new(Mutex::new(vec![(0, tx)]));
+        let older = ServeConfig::from_inputs(inputs.clone(), 0, false).unwrap();
+        fs::write(dir.path().join("next.md"), "# Next").unwrap();
+        let newer = ServeConfig::from_inputs(inputs, 0, false).unwrap();
+        publish_rescan(&shared, &clients, &test_stores(), newer, 2);
+        publish_rescan(&shared, &clients, &test_stores(), older, 1);
+        let config = shared.read().unwrap();
+        assert!(config.document_by_route("/next.md").is_some());
+        assert_eq!(config.review_token.as_deref(), Some("session"));
+        assert_eq!(rx.try_recv(), Ok(ReloadKind::Structure));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

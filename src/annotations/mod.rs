@@ -26,6 +26,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const REVIEW_SCRIPT: &str = include_str!("review.js");
 pub const REVIEW_STYLE: &str = include_str!("review.css");
+pub const COPY_SCRIPT: &str = include_str!("copy.js");
+pub const COPY_STYLE: &str = include_str!("copy.css");
 pub const FORM_CAP: usize = 160 * 1024;
 
 #[derive(Debug)]
@@ -89,7 +91,7 @@ pub fn source_revision(source: &str) -> String {
 /// a `0x00` separator (a path cannot contain NUL), a presence byte (`0x00`
 /// for a missing file, `0x01` for an existing one), then the exact file bytes.
 /// A missing file and an empty file therefore have different revisions.
-fn store_revision(path: &Path, bytes: Option<&[u8]>) -> String {
+pub fn store_revision(path: &Path, bytes: Option<&[u8]>) -> String {
     revision(&[
         path.as_os_str().as_encoded_bytes(),
         &[0, u8::from(bytes.is_some())],
@@ -121,7 +123,7 @@ pub struct Review {
 }
 
 impl Review {
-    fn from_snapshot(
+    pub fn from_snapshot(
         location: &Location,
         bytes: Option<&[u8]>,
         projection: &TextProjection,
@@ -495,36 +497,41 @@ fn decode_form(value: &[u8]) -> Result<String, Error> {
     Ok(value)
 }
 
+pub fn parse_form(bytes: &[u8]) -> Result<HashMap<String, String>, Error> {
+    if bytes.len() > FORM_CAP {
+        return Err(Error::Invalid("annotation form too large"));
+    }
+    let mut overhead = bytes.len();
+    let mut fields = HashMap::new();
+    for field in bytes.split(|byte| *byte == b'&') {
+        let split = field
+            .iter()
+            .position(|byte| *byte == b'=')
+            .ok_or(Error::Invalid("invalid form field"))?;
+        let key = decode_form(&field[..split])?;
+        let value = &field[split + 1..];
+        let limit = match key.as_str() {
+            "quote" => 1_000,
+            "body" => 10_000,
+            _ => 16 * 1024,
+        };
+        if matches!(key.as_str(), "quote" | "body") {
+            overhead -= value.len();
+        }
+        let value = decode_form(value)?;
+        if value.chars().count() > limit || fields.insert(key, value).is_some() {
+            return Err(Error::Invalid("duplicate or oversized annotation field"));
+        }
+    }
+    if overhead > 16 * 1024 {
+        return Err(Error::Invalid("annotation form overhead too large"));
+    }
+    Ok(fields)
+}
+
 impl Request {
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.len() > FORM_CAP {
-            return Err(Error::Invalid("annotation form too large"));
-        }
-        let mut overhead = bytes.len();
-        let mut fields = HashMap::new();
-        for field in bytes.split(|byte| *byte == b'&') {
-            let split = field
-                .iter()
-                .position(|byte| *byte == b'=')
-                .ok_or(Error::Invalid("invalid form field"))?;
-            let key = decode_form(&field[..split])?;
-            let value = &field[split + 1..];
-            let limit = match key.as_str() {
-                "quote" => 1_000,
-                "body" => 10_000,
-                _ => 16 * 1024,
-            };
-            if matches!(key.as_str(), "quote" | "body") {
-                overhead -= value.len();
-            }
-            let value = decode_form(value)?;
-            if value.chars().count() > limit || fields.insert(key, value).is_some() {
-                return Err(Error::Invalid("duplicate or oversized annotation field"));
-            }
-        }
-        if overhead > 16 * 1024 {
-            return Err(Error::Invalid("annotation form overhead too large"));
-        }
+        let mut fields = parse_form(bytes)?;
         let invalid = Error::Invalid("missing or invalid annotation fields");
         let doc = fields.remove("doc");
         let operation = match fields.remove("op").as_deref() {

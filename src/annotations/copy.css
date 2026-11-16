@@ -1,0 +1,34 @@
+.markview-code-block { position: relative; }
+.markview-copy-code {
+  position: absolute;
+  inset: 0.4rem 0.4rem auto auto;
+  padding: 0.3rem 0.55rem;
+  border: 1px solid var(--rule);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+}
+.markview-code-block:hover > .markview-copy-code,
+.markview-copy-code:focus {
+  opacity: 1;
+  pointer-events: auto;
+}
+@media (hover: none) {
+  .markview-copy-code { opacity: 1; pointer-events: auto; }
+}
+.markview-copy-status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+@media print {
+  .markview-copy-code, .markview-copy-status { display: none; }
+}

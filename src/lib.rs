@@ -3,7 +3,7 @@ pub mod annotations;
 use std::path::{Path, PathBuf};
 
 use pulldown_cmark::{
-    html, CodeBlockKind, CowStr, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+    html, BlockQuoteKind, CodeBlockKind, CowStr, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
 };
 
 /// Light-theme palette for diff rows in every HTML frontend.
@@ -34,6 +34,43 @@ pre.diff code { display: block; width: max-content; min-width: 100%; line-height
 /// Neutral diff colours for printing, independent of the selected screen theme.
 pub const DIFF_PRINT_RULES: &str =
     ".diff-addition, .diff-deletion, .diff-hunk, .diff-header { background: none; color: #000; }";
+
+pub const ALERT_LIGHT_VARIABLES: &str = r#"  --alert-note: #0969da;
+  --alert-tip: #1a7f37;
+  --alert-important: #8250df;
+  --alert-warning: #9a6700;
+  --alert-caution: #cf222e;"#;
+
+pub const ALERT_DARK_VARIABLES: &str = r#"  --alert-note: #58a6ff;
+  --alert-tip: #3fb950;
+  --alert-important: #a371f7;
+  --alert-warning: #d29922;
+  --alert-caution: #f85149;"#;
+
+pub const ALERT_RULES: &str = r#"blockquote[class^="markdown-alert-"] {
+  border-left-color: var(--alert-accent);
+  color: var(--fg);
+}
+.markdown-alert-note { --alert-accent: var(--alert-note); }
+.markdown-alert-tip { --alert-accent: var(--alert-tip); }
+.markdown-alert-important { --alert-accent: var(--alert-important); }
+.markdown-alert-warning { --alert-accent: var(--alert-warning); }
+.markdown-alert-caution { --alert-accent: var(--alert-caution); }
+.markdown-alert-title { color: var(--alert-accent); }
+@media print {
+  blockquote[class^="markdown-alert-"] { border-left: 4px solid #000; background: none; }
+  .markdown-alert-title { color: #000; }
+}"#;
+
+fn alert_title(kind: BlockQuoteKind) -> &'static str {
+    match kind {
+        BlockQuoteKind::Note => "Note",
+        BlockQuoteKind::Tip => "Tip",
+        BlockQuoteKind::Important => "Important",
+        BlockQuoteKind::Warning => "Warning",
+        BlockQuoteKind::Caution => "Caution",
+    }
+}
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -115,6 +152,7 @@ pub struct GuiPreferences {
     pub theme: ThemePreference,
     pub sidebar_visible: bool,
     pub auto_refresh: bool,
+    pub single_key_shortcuts: bool,
     pub window_width: u32,
     pub window_height: u32,
     pub recent_files: Vec<PathBuf>,
@@ -128,6 +166,7 @@ impl Default for GuiPreferences {
             theme: ThemePreference::System,
             sidebar_visible: true,
             auto_refresh: true,
+            single_key_shortcuts: true,
             window_width: 980,
             window_height: 760,
             recent_files: Vec::new(),
@@ -153,6 +192,9 @@ impl GuiPreferences {
                 }
                 "sidebar_visible" => preferences.sidebar_visible = parse_bool(value, true),
                 "auto_refresh" => preferences.auto_refresh = parse_bool(value, true),
+                "single_key_shortcuts" => {
+                    preferences.single_key_shortcuts = parse_bool(value, true)
+                }
                 "window_width" => {
                     preferences.window_width = parse_dimension(value, preferences.window_width);
                 }
@@ -193,6 +235,10 @@ impl GuiPreferences {
         output.push_str("auto_refresh=");
         output.push_str(if self.auto_refresh { "true" } else { "false" });
         output.push('\n');
+        output.push_str(&format!(
+            "single_key_shortcuts={}\n",
+            self.single_key_shortcuts
+        ));
         output.push_str(&format!("window_width={}\n", self.window_width));
         output.push_str(&format!("window_height={}\n", self.window_height));
         for path in &self.recent_files {
@@ -409,11 +455,13 @@ pub enum CliError {
     LegacyServePortForm,
     AnnotationUsage(&'static str),
     AnnotationConflict(&'static str),
+    ReviewConflict(&'static str),
 }
 
 impl std::fmt::Display for CliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ReviewConflict(flag) => write!(f, "--review cannot be combined with {flag}"),
             Self::AnnotationUsage(message) => f.write_str(message),
             Self::AnnotationConflict(flag) => {
                 write!(f, "--annotations cannot be combined with {flag}")
@@ -441,6 +489,9 @@ pub struct Cli {
     pub options: RenderOptions,
     pub output: OutputFormat,
     pub serve: Option<u16>,
+    pub review: Option<u16>,
+    pub gate: bool,
+    pub no_open: bool,
     pub annotations: bool,
     pub include_resolved: bool,
     pub annotate: bool,
@@ -468,6 +519,9 @@ impl Cli {
         let mut serve = None;
         let mut serve_port = None;
         let mut saw_serve = false;
+        let mut saw_review = false;
+        let mut gate = false;
+        let mut no_open = false;
         let mut annotations = false;
         let mut include_resolved = false;
         let mut annotate = false;
@@ -484,6 +538,9 @@ impl Cli {
                 "--annotations" => annotations = true,
                 "--include-resolved" => include_resolved = true,
                 "--annotate" => annotate = true,
+                "--review" => saw_review = true,
+                "--gate" => gate = true,
+                "--no-open" => no_open = true,
                 "--html" => output = OutputFormat::Html,
                 "--serve" => {
                     saw_serve = true;
@@ -524,6 +581,30 @@ impl Cli {
             }
         }
 
+        if saw_review {
+            if let Some((flag, _)) = [
+                ("--serve", saw_serve),
+                ("--daemon", daemon),
+                ("--annotations", annotations),
+                ("--include-resolved", include_resolved),
+                ("--html", output == OutputFormat::Html),
+                ("--open", open),
+                ("--annotate", annotate),
+            ]
+            .into_iter()
+            .find(|(_, used)| *used)
+            {
+                return Err(CliError::ReviewConflict(flag));
+            }
+            if inputs.is_empty() && !help {
+                return Err(CliError::MissingValue("--review"));
+            }
+        } else if gate {
+            return Err(CliError::AnnotationUsage("--gate requires --review"));
+        } else if no_open {
+            return Err(CliError::AnnotationUsage("--no-open requires --review"));
+        }
+
         if annotations {
             // `--annotations` is its own mode. Name the flag that does not
             // belong before any other check complains about what that flag
@@ -551,9 +632,9 @@ impl Cli {
 
         if saw_serve {
             serve = Some(serve_port.unwrap_or(DEFAULT_SERVE_PORT));
-        } else if serve_port.is_some() {
+        } else if !saw_review && serve_port.is_some() {
             return Err(CliError::UnknownArgument("--port".to_owned()));
-        } else if recurse {
+        } else if !saw_review && recurse {
             return Err(CliError::UnknownArgument("--recurse".to_owned()));
         } else if open {
             return Err(CliError::UnknownArgument("--open".to_owned()));
@@ -575,7 +656,7 @@ impl Cli {
         if annotations && inputs.is_empty() && !help {
             return Err(CliError::MissingValue("--annotations"));
         }
-        if serve.is_none() && !annotations && inputs.len() > 1 {
+        if serve.is_none() && !saw_review && !annotations && inputs.len() > 1 {
             return Err(CliError::TooManyInputs);
         }
 
@@ -587,6 +668,9 @@ impl Cli {
             options,
             output,
             serve,
+            review: saw_review.then_some(serve_port.unwrap_or(0)),
+            gate,
+            no_open,
             annotations,
             include_resolved,
             annotate,
@@ -629,6 +713,7 @@ pub fn help() -> &'static str {
     "\
 Usage: markview [OPTIONS] [FILE]
        markview --serve [OPTIONS] <FILE>... | <DIR>
+       markview --review [--gate] [--no-open] [--port PORT] [--recurse] <FILE>... | <DIR>
        markview --annotations [--include-resolved] <FILE or DIR>...
 
 Renders FILE (or stdin) as Markdown in the terminal or as HTML, or serves
@@ -640,15 +725,18 @@ Render options:
       --no-color         Drop ANSI colors, keep bold text attributes
 
 Review options:
+      --review           Open an annotatable browser review and wait for a verdict
+      --gate             Exit 2 if changes are requested (requires --review)
+      --no-open          Skip launching a browser (requires --review)
       --annotations      List open comments for Markdown files or directories
       --include-resolved
                          Include resolved comments after open comments
 
-Serve options (all require --serve):
+Serve options:
       --annotate         Enable writing review comments from the browser
       --serve            Serve the given files, or the top-level Markdown files of a
                          directory, with navigation between documents
-      --port <PORT>      Listen on PORT (default 7878); 0 picks any free port and prints it
+      --port <PORT>      Listen on PORT (serve defaults to 7878, review to any free port)
       --recurse          Discover Markdown files at any depth; takes a single directory
       --open             Open the default browser once the server is ready
       --daemon           Run the server in the background and return immediately;
@@ -1279,6 +1367,33 @@ fn render_document_with_destinations(
     }
 }
 
+pub fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hi = *bytes.get(index + 1)?;
+            let lo = *bytes.get(index + 2)?;
+            output.push((hex_value(hi)? << 4) | hex_value(lo)?);
+            index += 3;
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(output).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// The source text every HTML-facing consumer parses: the renderer and the
 /// annotation `TextProjection` must see identical input.
 ///
@@ -1337,7 +1452,16 @@ fn render_html_body(events: &[Event<'_>], headings: &[HeadingView]) -> String {
         .iter()
         .cloned()
         .map(|event| add_heading_id(event, &mut heading_ids));
-    html::push_html(&mut body, highlight_fenced_events(events));
+    let events = highlight_fenced_events(events).flat_map(|event| {
+        let title = match event {
+            Event::Start(Tag::BlockQuote(Some(kind))) => Some(Event::Html(
+                format!(r#"<p class="markdown-alert-title" data-markview-review-exclude><strong>{}</strong></p>"#, alert_title(kind)).into(),
+            )),
+            _ => None,
+        };
+        [Some(event), title].into_iter().flatten()
+    });
+    html::push_html(&mut body, events);
     escape_non_ascii_html(&body)
 }
 
@@ -1676,6 +1800,7 @@ fn render_html_document(document: &RenderedDocument) -> String {
   --code-bg: #ebe6de;
   --quote-bg: #f1ede7;
 {DIFF_LIGHT_VARIABLES}
+{ALERT_LIGHT_VARIABLES}
 }}
 @media (prefers-color-scheme: dark) {{
   :root {{
@@ -1687,6 +1812,7 @@ fn render_html_document(document: &RenderedDocument) -> String {
     --code-bg: #25221f;
     --quote-bg: #211f1c;
 {DIFF_DARK_VARIABLES}
+{ALERT_DARK_VARIABLES}
   }}
 }}
 * {{ box-sizing: border-box; }}
@@ -1734,6 +1860,7 @@ pre {{
 }}
 pre code {{ background: transparent; padding: 0; }}
 {DIFF_RULES}
+{ALERT_RULES}
 .syntax-keyword {{ color: var(--accent); font-weight: 700; }}
 .syntax-comment {{ color: var(--muted); font-style: italic; }}
 table {{
@@ -1801,6 +1928,7 @@ fn markdown_options() -> Options {
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_GFM
 }
 
 fn escape_html(value: &str) -> String {
@@ -1919,9 +2047,13 @@ impl Renderer {
                 self.push_style(TerminalStyle::Cyan);
                 self.push_text(&heading_prefix(level));
             }
-            Tag::BlockQuote(_) => {
+            Tag::BlockQuote(kind) => {
                 self.flush_line();
                 self.quote_depth += 1;
+                if let Some(kind) = kind {
+                    self.push_styled(alert_title(kind), &[TerminalStyle::Bold]);
+                    self.flush_line();
+                }
             }
             Tag::CodeBlock(kind) => {
                 self.blank();
@@ -2035,8 +2167,13 @@ impl Renderer {
     }
 
     fn push_text(&mut self, text: &str) {
-        for word in text.split_whitespace() {
-            self.push_word(word);
+        // The parser can emit an unmatched opening bracket separately.
+        let literal_alert_marker = self.quote_depth > 0
+            && text.starts_with('!')
+            && !self.pending_space
+            && last_visible_char(&self.line) == Some('[');
+        for (index, word) in text.split_whitespace().enumerate() {
+            self.push_word(word, index == 0 && literal_alert_marker);
         }
 
         self.pending_space = text.chars().last().is_some_and(char::is_whitespace);
@@ -2046,20 +2183,23 @@ impl Renderer {
         }
     }
 
-    fn push_word(&mut self, word: &str) {
+    fn push_word(&mut self, word: &str, join_bracket: bool) {
         let indent = self.indent();
         let limit = self.options.width.max(indent.len() + 20);
         let has_visible_text = line_has_visible_text(&self.line);
         let projected =
             visible_len(&self.line) + word.chars().count() + usize::from(has_visible_text);
 
-        if projected > limit && has_visible_text {
+        if projected > limit && has_visible_text && !join_bracket {
             self.flush_line();
         }
 
         if !line_has_visible_text(&self.line) {
             self.line.push_str(&indent);
-        } else if !line_ends_with_visible_space(&self.line) && !attaches_to_previous(word) {
+        } else if !join_bracket
+            && !line_ends_with_visible_space(&self.line)
+            && !attaches_to_previous(word)
+        {
             self.line.push(' ');
         }
 
@@ -2625,6 +2765,42 @@ mod tests {
             Options::all() - markdown_options() - scanner_options(),
             declined
         );
+    }
+
+    #[test]
+    fn github_alerts_keep_visible_titles_and_nested_content() {
+        for (marker, title) in [
+            ("NOTE", "Note"),
+            ("TIP", "Tip"),
+            ("IMPORTANT", "Important"),
+            ("WARNING", "Warning"),
+            ("CAUTION", "Caution"),
+        ] {
+            let source = format!("> [!{marker}]\n> Body **text**\n>\n> - Nested\n");
+            let html = render_html(&source);
+            let kind = marker.to_ascii_lowercase();
+            assert!(html.contains(&format!(r#"<blockquote class="markdown-alert-{kind}">"#)));
+            assert!(html.contains(&format!(
+                r#"data-markview-review-exclude><strong>{title}</strong>"#
+            )));
+            assert!(html.contains("<li>Nested</li>"));
+            assert!(html.contains("border-left: 4px solid #000"));
+            assert!(html.contains(&format!("--alert-{kind}:")));
+            let terminal = render(
+                &source,
+                RenderOptions {
+                    color: false,
+                    ..RenderOptions::default()
+                },
+            );
+            assert!(
+                terminal.contains(&format!("{BOLD}> {title}{RESET}\n")),
+                "{terminal:?}"
+            );
+        }
+        let unknown = "> [!FOO]\n> Body\n";
+        assert!(render_html(unknown).contains("<blockquote>\n<p>[!FOO]"));
+        assert!(plain(unknown).contains("> [!FOO]"));
     }
 
     #[test]
@@ -3333,6 +3509,7 @@ mod tests {
             theme: ThemePreference::Dark,
             sidebar_visible: false,
             auto_refresh: false,
+            single_key_shortcuts: false,
             window_width: 1200,
             window_height: 840,
             ..GuiPreferences::default()

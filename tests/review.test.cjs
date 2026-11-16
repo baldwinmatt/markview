@@ -432,13 +432,14 @@ test('cards and their buttons are labelled with the comment they belong to', asy
     comment('a2'),
   ])));
   const cards = page.panel.querySelectorAll('.markview-review-card');
-  assert.equal(cards[0].getAttribute('aria-label'), 'Comment a1 on “only referenced assets are served”');
-  assert.equal(cards[1].getAttribute('aria-label'), 'Comment a2 on the document');
+  assert.deepEqual(cards.map(card => card.dataset.annotation), ['a2', 'a1']);
+  assert.equal(cards[1].getAttribute('aria-label'), 'Comment a1 on “only referenced assets are served”');
+  assert.equal(cards[0].getAttribute('aria-label'), 'Comment a2 on the document');
   const labels = card => card.querySelectorAll('button').map(button => button.getAttribute('aria-label'));
-  assert.deepEqual(labels(cards[0]), ['Edit comment a1', 'Resolve comment a1', 'Delete comment a1']);
-  assert.deepEqual(labels(cards[1]), ['Edit comment a2', 'Resolve comment a2', 'Delete comment a2']);
+  assert.deepEqual(labels(cards[1]), ['Edit comment a1', 'Resolve comment a1', 'Delete comment a1']);
+  assert.deepEqual(labels(cards[0]), ['Edit comment a2', 'Resolve comment a2', 'Delete comment a2']);
   // The accessible name starts with the visible label.
-  for (const button of cards[0].querySelectorAll('button')) assert.ok(button.getAttribute('aria-label').startsWith(button.textContent));
+  for (const button of cards[1].querySelectorAll('button')) assert.ok(button.getAttribute('aria-label').startsWith(button.textContent));
 });
 
 test('focus returns to the control that opened the draft after saving or cancelling', async () => {
@@ -720,7 +721,7 @@ test('a text draft is kept but cannot be saved once the document has changed', (
   const body = page.find('textarea');
   body.value = 'About this word';
   body.dispatchEvent({type: 'input'});
-  assert.equal(page.find('form').querySelectorAll('button')[0].disabled, false);
+  assert.equal(page.find('form').querySelectorAll('button').find(button => button.textContent === 'Save comment').disabled, false);
 
   // The document is edited and re-rendered: the selection's offsets are stale.
   page.review.show('doc', 'source-2', true, true);
@@ -728,7 +729,7 @@ test('a text draft is kept but cannot be saved once the document has changed', (
   assert.equal(page.find('form').visible, true);
   assert.equal(body.value, 'About this word');
   assert.equal(page.find('form').querySelector('blockquote').textContent, 'second');
-  assert.equal(page.find('form').querySelectorAll('button')[0].disabled, true);
+  assert.equal(page.find('form').querySelectorAll('button').find(button => button.textContent === 'Save comment').disabled, true);
   assert.equal(page.find('.markview-review-message').textContent, 'The document changed. Select the text again to continue this draft.');
   // The stored draft still names the revision it was made against.
   assert.equal(JSON.parse(page.storage.get('markview-review:doc')).source_revision, 'source-1');

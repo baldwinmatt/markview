@@ -1034,3 +1034,12 @@ fn review_styles_keep_annotations_out_of_print() {
     assert!(print.contains("display: none !important"));
     assert!(print.contains("::highlight(markview-annotations) { background: transparent;"));
 }
+
+#[test]
+
+fn alert_projection_excludes_marker_and_preserves_source_lines() {
+    let projection = TextProjection::new("> [!NOTE]\n> Body **text**\n>\n> - Nested\n");
+    assert_eq!(projection.text(), "Body text Nested");
+    assert_eq!(projection.lines(0..8), (2, 2));
+    assert_eq!(projection.lines(8..14), (4, 4));
+}

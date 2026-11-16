@@ -20,6 +20,11 @@
   --diff-del-fg: #82071e;
   --diff-hunk-bg: #ddf4ff;
   --diff-hunk-fg: #0550ae;
+  --alert-note: #0969da;
+  --alert-tip: #1a7f37;
+  --alert-important: #8250df;
+  --alert-warning: #9a6700;
+  --alert-caution: #cf222e;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -36,6 +41,11 @@
   --diff-del-fg: #ffdcd7;
   --diff-hunk-bg: #0c2d6b;
   --diff-hunk-fg: #a5d6ff;
+  --alert-note: #58a6ff;
+  --alert-tip: #3fb950;
+  --alert-important: #a371f7;
+  --alert-warning: #d29922;
+  --alert-caution: #f85149;
   }
 }
 * { box-sizing: border-box; }
@@ -89,6 +99,20 @@ pre.diff code { display: block; width: max-content; min-width: 100%; line-height
 .diff-deletion { background: var(--diff-del-bg); color: var(--diff-del-fg); }
 .diff-hunk { background: var(--diff-hunk-bg); color: var(--diff-hunk-fg); }
 .diff-header { color: inherit; font-weight: 700; }
+blockquote[class^="markdown-alert-"] {
+  border-left-color: var(--alert-accent);
+  color: var(--fg);
+}
+.markdown-alert-note { --alert-accent: var(--alert-note); }
+.markdown-alert-tip { --alert-accent: var(--alert-tip); }
+.markdown-alert-important { --alert-accent: var(--alert-important); }
+.markdown-alert-warning { --alert-accent: var(--alert-warning); }
+.markdown-alert-caution { --alert-accent: var(--alert-caution); }
+.markdown-alert-title { color: var(--alert-accent); }
+@media print {
+  blockquote[class^="markdown-alert-"] { border-left: 4px solid #000; background: none; }
+  .markdown-alert-title { color: #000; }
+}
 .syntax-keyword { color: var(--accent); font-weight: 700; }
 .syntax-comment { color: var(--muted); font-style: italic; }
 table {
@@ -333,6 +357,9 @@ open</li>
 <span class="markview-refreshed">Last refreshed <time data-markview-refreshed-at></time></span>
 </span>
 </footer>
+<link rel="stylesheet" href="/_markview/copy.css?v=e91c96d8c0f29503">
+<script src="/_markview/copy.js?v=e91c96d8c0f29503"></script>
+
 <script>
 (() => {
   const formatTime = (date) => date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
@@ -357,20 +384,61 @@ open</li>
   };
   updateModifiedTimes();
   updateRefreshTime();
+  const attachCodeCopy = createMarkviewCodeCopy(document.querySelector('main'));
+  window.markviewAttachCodeCopy = () => attachCodeCopy(text => navigator.clipboard.writeText(text));
+  window.markviewAttachCodeCopy();
   const events = new EventSource('/events');
-  events.onmessage = async (event) => {
+  let loadingDocument = false;
+  const refreshVerdict = () => { if (!loadingDocument) window.markviewVerdict?.refresh(); };
+  events.addEventListener('annotations', (event) => {
+    if (event.data === document.querySelector('main').dataset.markviewRoute) window.markviewReviewRefresh?.();
+    refreshVerdict();
+  });
+  events.addEventListener('review-finished', () => {
+    events.close();
+    window.markviewVerdict?.done();
+  });
+  events.addEventListener('open', refreshVerdict);
+  let refresh = 0;
+  window.markviewReloadDocument = async () => {
+    window.markviewVerdict?.invalidate();
+    const sequence = ++refresh;
+    loadingDocument = true;
+    try {
+      await reloadDocument(sequence);
+    } catch {
+      if (sequence === refresh) window.markviewVerdict?.unavailable();
+    } finally {
+      if (sequence === refresh) loadingDocument = false;
+    }
+  };
+  events.onmessage = (event) => {
     if (event.data === 'rescan') {
       location.reload();
       return;
     }
-    if (event.data !== 'reload') return;
+    if (event.data === 'reload') window.markviewReloadDocument();
+  };
+  async function reloadDocument(sequence) {
     const savedY = window.scrollY;
     const response = await fetch(location.pathname, { cache: 'no-store' });
     const text = await response.text();
     const next = new DOMParser().parseFromString(text, 'text/html');
     const currentMain = document.querySelector('main');
     const nextMain = next.querySelector('main');
-    if (currentMain && nextMain) currentMain.innerHTML = nextMain.innerHTML;
+    if (sequence !== refresh || window.markviewVerdict?.finished()) return;
+    if (!response.ok) {
+      if (response.status === 404 && window.markviewVerdict) location.replace('/');
+      else window.markviewVerdict?.unavailable();
+      return;
+    }
+    if (currentMain && nextMain) {
+      currentMain.innerHTML = nextMain.innerHTML;
+      currentMain.dataset.sourceRevision = nextMain.dataset.sourceRevision;
+      currentMain.dataset.markviewRoute = nextMain.dataset.markviewRoute;
+      window.markviewAttachCodeCopy();
+      window.markviewReviewRefresh?.();
+    }
     const currentNav = document.querySelector('[data-markview-nav]');
     const nextNav = next.querySelector('[data-markview-nav]');
     if (currentNav && nextNav) {
@@ -389,7 +457,9 @@ open</li>
     updateModifiedTimes();
     updateRefreshTime();
     window.scrollTo(0, savedY);
-  };
+    loadingDocument = false;
+    await window.markviewVerdict?.refresh();
+  }
 })();
 </script>
 </body>

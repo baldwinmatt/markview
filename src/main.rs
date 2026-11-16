@@ -426,7 +426,7 @@ fn serve_markdown(
     annotate: bool,
     review: Option<(
         Arc<serve_review::Session>,
-        mpsc::Receiver<serve_review::AcceptedReview>,
+        mpsc::Receiver<io::Result<serve_review::AcceptedReview>>,
     )>,
 ) -> Result<Option<serve_review::AcceptedReview>, Box<dyn std::error::Error>> {
     let mut config = ServeConfig::from_inputs(inputs.clone(), port, recurse)?;
@@ -471,7 +471,6 @@ fn serve_markdown(
     )?;
 
     if review.is_some() {
-        listener.set_nonblocking(true)?;
         eprintln!("Waiting for review at {}", serve_open_url(bound_port));
     } else {
         println!("Serving on http://localhost:{bound_port} — press Ctrl+C to stop");
@@ -487,31 +486,75 @@ fn serve_markdown(
         }
     }
 
-    let mut accepted = None;
-    loop {
-        if let Some((_, receiver)) = &review {
-            if accepted.is_none() {
-                if let Ok(result) = receiver.try_recv() {
-                    // Give SSE clients a bounded window to receive the event,
-                    // while still returning conflicts to concurrent writers.
-                    accepted = Some((
-                        std::time::Instant::now() + Duration::from_millis(150),
-                        result,
-                    ));
-                }
-            }
-            if accepted
-                .as_ref()
-                .is_some_and(|(until, _)| std::time::Instant::now() >= *until)
-            {
-                return Ok(accepted.map(|(_, result)| result));
-            }
+    let Some((session, verdict)) = review else {
+        return Err(accept_connections(&listener, &shared, &clients, &stores, None).into());
+    };
+    // Connections are accepted on their own thread, so this one can sleep
+    // until there is a verdict instead of polling a nonblocking listener.
+    thread::spawn(move || {
+        let lost = accept_connections(&listener, &shared, &clients, &stores, Some(&session));
+        session.fail(lost);
+    });
+    let result = verdict.recv()??;
+    // Give SSE clients a bounded window to receive the event, while the
+    // acceptor still returns conflicts to concurrent writers.
+    thread::sleep(REVIEW_SHUTDOWN_GRACE);
+    Ok(Some(result))
+}
+
+const REVIEW_SHUTDOWN_GRACE: Duration = Duration::from_millis(150);
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(10);
+
+/// What a failed `accept` says about the listener.
+#[derive(Debug, PartialEq, Eq)]
+enum AcceptFailure {
+    /// A signal arrived. Nothing is wrong.
+    Interrupted,
+    /// This one connection failed, for example it was reset while queued.
+    Connection,
+    /// The process or system is out of descriptors or memory. Connections
+    /// stay queued, so waiting for some to close is enough.
+    Exhausted,
+    /// The listening socket itself is gone. No later `accept` can succeed.
+    Lost,
+}
+
+fn accept_failure(error: &io::Error) -> AcceptFailure {
+    if error.kind() == io::ErrorKind::Interrupted {
+        return AcceptFailure::Interrupted;
+    }
+    #[cfg(unix)]
+    match error.raw_os_error() {
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => {
+            return AcceptFailure::Exhausted
         }
+        Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK | libc::EOPNOTSUPP) => {
+            return AcceptFailure::Lost
+        }
+        _ => {}
+    }
+    AcceptFailure::Connection
+}
+
+/// Serves connections until the listener is lost, and returns why. A failed
+/// `accept` otherwise never ends the server: under `--review` that would
+/// throw away the verdict the command exists to wait for.
+fn accept_connections(
+    listener: &TcpListener,
+    shared: &SharedConfig,
+    clients: &Clients,
+    stores: &Arc<serve_annotations::Stores>,
+    session: Option<&Arc<serve_review::Session>>,
+) -> io::Error {
+    // Said once per shortage, not once per 10 ms retry.
+    let mut exhausted = false;
+    loop {
         match listener.accept() {
             Ok((stream, _)) => {
+                exhausted = false;
                 let shared = shared.clone();
                 let clients = clients.clone();
-                let session = review.as_ref().map(|(session, _)| session.clone());
+                let session = session.cloned();
                 let stores = stores.clone();
                 thread::spawn(move || {
                     if let Err(error) =
@@ -521,15 +564,18 @@ fn serve_markdown(
                     }
                 });
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock && review.is_some() => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) if error.kind() == io::ErrorKind::ConnectionAborted => {
-                eprintln!("markview: connection failed: {error}");
-            }
-            Err(error) if review.is_none() => eprintln!("markview: connection failed: {error}"),
-            Err(error) => return Err(error.into()),
+            Err(error) => match accept_failure(&error) {
+                AcceptFailure::Interrupted => {}
+                AcceptFailure::Connection => eprintln!("markview: connection failed: {error}"),
+                AcceptFailure::Exhausted => {
+                    if !exhausted {
+                        eprintln!("markview: connection failed: {error}; retrying");
+                    }
+                    exhausted = true;
+                    thread::sleep(ACCEPT_BACKOFF);
+                }
+                AcceptFailure::Lost => return error,
+            },
         }
     }
 }
@@ -1556,7 +1602,6 @@ fn handle_connection(
     stores: &serve_annotations::Stores,
     session: Option<Arc<serve_review::Session>>,
 ) -> io::Result<()> {
-    stream.set_nonblocking(false)?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     // Pages, assets and `/events` need only the method and target, so the
@@ -2950,6 +2995,34 @@ mod serve_nav_tests {
             client_rx.recv_timeout(Duration::from_secs(1)),
             Ok(ReloadKind::Content)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accept_loop_ends_only_when_the_listener_itself_is_lost() {
+        for (errno, failure) in [
+            (libc::EMFILE, AcceptFailure::Exhausted),
+            (libc::ENFILE, AcceptFailure::Exhausted),
+            (libc::ENOBUFS, AcceptFailure::Exhausted),
+            (libc::ENOMEM, AcceptFailure::Exhausted),
+            (libc::ECONNABORTED, AcceptFailure::Connection),
+            (libc::EPROTO, AcceptFailure::Connection),
+            (libc::EINTR, AcceptFailure::Interrupted),
+            (libc::EBADF, AcceptFailure::Lost),
+        ] {
+            let error = io::Error::from_raw_os_error(errno);
+            assert_eq!(accept_failure(&error), failure, "{error}");
+        }
+        // A descriptor that is not a socket can never accept: the loop
+        // returns the error instead of spinning on it.
+        let listener = TcpListener::from(OwnedFd::from(fs::File::open("/dev/null").unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("README.md"), "# Home").unwrap();
+        let config = ServeConfig::from_inputs(vec![dir.path().to_owned()], 0, false).unwrap();
+        let shared: SharedConfig = Arc::new(RwLock::new(Arc::new(config)));
+        let clients: Clients = Arc::new(Mutex::new(Vec::new()));
+        let lost = accept_connections(&listener, &shared, &clients, &test_stores(), None);
+        assert_eq!(lost.raw_os_error(), Some(libc::ENOTSOCK));
     }
 
     fn test_stores() -> Arc<serve_annotations::Stores> {

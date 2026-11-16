@@ -1166,7 +1166,10 @@ fn serve_mode_recurse_rescans_when_a_served_file_is_deleted() {
 
     let mut reader = open_reload_stream(server.port);
     std::fs::remove_file(&stale).expect("delete stale doc");
-    let event = read_until(&mut reader, "data:", Duration::from_secs(5));
+    // The page was served, so its store is watched too. That watcher may
+    // report the vanished document as an `annotations` event before the
+    // rescan lands; read on to the reload or rescan itself.
+    let event = read_until(&mut reader, "data: re", Duration::from_secs(5));
 
     assert!(
         event.contains("data: reload"),
@@ -3414,6 +3417,176 @@ fn start_review(cwd: &std::path::Path, options: &[&str]) -> ServeProcess {
         .unwrap();
     assert_ne!(server.port, 0);
     server
+}
+
+/// Starts `--review` with at most `limit` open file descriptors, keeping its
+/// stderr readable for the whole run. `spare` leaves one more descriptor open
+/// in the server. `None` (with the reason printed) where the shell cannot
+/// lower the limit.
+#[cfg(unix)]
+fn start_review_with_fd_limit(
+    cwd: &std::path::Path,
+    limit: u32,
+    spare: bool,
+) -> Option<ServeProcess> {
+    let spare = if spare { "exec 9</dev/null; " } else { "" };
+    let mut child = std::process::Command::new("sh")
+        .current_dir(cwd)
+        .arg("-c")
+        .arg(format!(
+            "ulimit -n {limit} || exit 97; {spare}exec \"$0\" --review --no-open sample.md"
+        ))
+        .arg(cargo_bin("markview"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr_pipe = BufReader::new(child.stderr.take().unwrap());
+    let mut notice = String::new();
+    stderr_pipe.read_line(&mut notice).unwrap();
+    let Some(port) = notice
+        .trim()
+        .strip_prefix("Waiting for review at http://localhost:")
+        .and_then(|url| url.strip_suffix('/'))
+    else {
+        let status = child.wait().unwrap();
+        assert_eq!(status.code(), Some(97), "review did not start: {notice:?}");
+        eprintln!("skipped: this shell cannot lower RLIMIT_NOFILE to {limit}: {notice:?}");
+        return None;
+    };
+    let stderr = Arc::new(Mutex::new(String::new()));
+    let stderr_writer = stderr.clone();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        while stderr_pipe.read_line(&mut line).unwrap_or(0) > 0 {
+            stderr_writer.lock().unwrap().push_str(&line);
+            line.clear();
+        }
+    });
+    Some(ServeProcess {
+        child,
+        port: port.parse().unwrap(),
+        stderr,
+    })
+}
+
+/// Runs a review out of descriptors, then finishes it. Returns whether
+/// `accept` itself failed, or `None` if the limit could not be lowered.
+#[cfg(unix)]
+fn finish_review_after_fd_exhaustion(spare: bool) -> Option<bool> {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "# Sample\n";
+    std::fs::write(dir.path().join("sample.md"), source).unwrap();
+    let mut server = start_review_with_fd_limit(dir.path(), 40, spare)?;
+    let port = server.port;
+    let alive = |server: &mut ServeProcess| {
+        assert!(
+            server.child.try_wait().unwrap().is_none(),
+            "the review ended without a verdict: {}",
+            server.stderr_so_far()
+        );
+    };
+    let token = review_token(&http_get_local(port, "/"));
+    // Idle tabs and stalled clients. Each accepted connection holds two
+    // descriptors, so the server runs out well before the sixtieth.
+    let idle: Vec<_> = (0..60)
+        .map(|_| TcpStream::connect(("127.0.0.1", port)).unwrap())
+        .collect();
+    let until = Instant::now() + Duration::from_secs(10);
+    while !server.stderr_so_far().contains("Too many open files") {
+        alive(&mut server);
+        assert!(
+            Instant::now() < until,
+            "60 idle connections did not exhaust 40 descriptors"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // With an even number of descriptors to spare, the held connections use
+    // the last one and the next `accept` fails; give that failure time to be
+    // reported. With an odd number it may never happen.
+    let until = Instant::now() + Duration::from_secs(2);
+    let accept_failed = loop {
+        alive(&mut server);
+        if server.stderr_so_far().contains("connection failed") {
+            break true;
+        }
+        if Instant::now() >= until {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(idle);
+
+    // The session is still there once descriptors are free again.
+    let host = format!("localhost:{port}");
+    let until = Instant::now() + Duration::from_secs(10);
+    let revision = loop {
+        let summary = TcpStream::connect(("127.0.0.1", port))
+            .and_then(|mut stream| {
+                stream.set_read_timeout(Some(Duration::from_secs(8)))?;
+                write!(
+                    stream,
+                    "GET /_markview/review HTTP/1.1\r\nHost: {host}\r\n\r\n"
+                )?;
+                let mut response = String::new();
+                stream.read_to_string(&mut response)?;
+                Ok(response)
+            })
+            .unwrap_or_default();
+        if let Some(revision) = summary
+            .split("\"review_revision\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+        {
+            break revision.to_owned();
+        }
+        alive(&mut server);
+        assert!(
+            Instant::now() < until,
+            "no summary after recovery: {summary}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let form = format!(
+        "op=finish&verdict=approved&review_revision={revision}&doc=/sample.md&source_revision={}",
+        markview::annotations::source_revision(source)
+    );
+    let finished = raw_http(port, &format!(
+        "POST /_markview/review HTTP/1.1\r\nHost: {host}\r\nX-Markview-Token: {token}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{form}", form.len()));
+    assert!(finished.starts_with("HTTP/1.1 200"), "{finished}");
+    let until = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < until, "review server did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(status.code(), Some(0), "{}", server.stderr_so_far());
+    let mut stdout = String::new();
+    server
+        .child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    assert!(stdout.starts_with("Review: approved (0 open comments in 0 documents)"));
+    Some(accept_failed)
+}
+
+#[cfg(unix)]
+#[test]
+fn review_survives_running_out_of_file_descriptors() {
+    // Whether `accept` or a later `dup` is the call that fails depends on
+    // whether the descriptors left after startup are even or odd in number.
+    // One spare descriptor flips that, so one of the two runs always has a
+    // failing `accept`. Both must still deliver the verdict.
+    let Some(plain) = finish_review_after_fd_exhaustion(false) else {
+        return;
+    };
+    let spare = finish_review_after_fd_exhaustion(true).expect("the limit was lowered before");
+    assert!(plain || spare, "neither run made `accept` fail");
 }
 
 #[test]

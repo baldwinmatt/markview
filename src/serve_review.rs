@@ -203,7 +203,7 @@ fn project(source: &str) -> TextProjection {
 #[derive(Debug)]
 pub struct Session {
     accepted: Mutex<bool>,
-    result: mpsc::Sender<AcceptedReview>,
+    result: mpsc::Sender<io::Result<AcceptedReview>>,
 }
 
 pub struct AcceptedReview {
@@ -212,7 +212,7 @@ pub struct AcceptedReview {
 }
 
 impl Session {
-    pub fn new() -> (Arc<Self>, mpsc::Receiver<AcceptedReview>) {
+    pub fn new() -> (Arc<Self>, mpsc::Receiver<io::Result<AcceptedReview>>) {
         let (result, receiver) = mpsc::channel();
         (
             Arc::new(Self {
@@ -322,7 +322,12 @@ impl Session {
     }
 
     pub fn publish(&self, result: AcceptedReview) {
-        let _ = self.result.send(result);
+        let _ = self.result.send(Ok(result));
+    }
+
+    /// Ends the wait without a verdict: the server can no longer be reached.
+    pub fn fail(&self, error: io::Error) {
+        let _ = self.result.send(Err(error));
     }
 }
 

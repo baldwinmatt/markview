@@ -83,7 +83,7 @@ GUI settings are stored in a local text config:
 - macOS: `~/Library/Application Support/markview/preferences.conf`
 - Other platforms: `~/.config/markview/preferences.conf`
 
-Stored values include theme, sidebar visibility, auto-refresh, window size, recent files, last open files, and the active file. Paths are escaped with the library preference serializer so the file stays simple and portable.
+Stored values include theme, sidebar visibility, auto-refresh, single-key annotation shortcuts, window size, recent files, last open files, and the active file. Paths are escaped with the library preference serializer so the file stays simple and portable.
 
 ## Document annotations
 
@@ -142,7 +142,7 @@ a document's store the first time the document is served and blocks on watch
 events with no timer; a rescan drops watches for documents that are gone.
 Source changes still follow each shell's normal refresh path.
 
-Browser writes require `--annotate`, a loopback Host and the server's random
+Browser writes require `--annotate` or `--review`, a loopback Host and the server's random
 token, which is compared in constant time and embedded only in pages requested
 through a loopback Host. Token-bearing pages use a per-response script nonce
 and the policy from `content_security_policy`; assets are served sandboxed.
@@ -151,6 +151,29 @@ assets and `/events` read just the request line. Every response is followed by
 a bounded drain of the unread request, so the client receives it instead of a
 connection reset. The shared form parser checks encoded size, decoded scalar
 counts and allowed fields.
+
+## Collection review
+
+`src/serve_review.rs` owns the foreground review session. The
+`/_markview/review` endpoint reuses the annotation HTTP parser, loopback
+Host check, form limits, and server token. It exposes collection counts and
+a revision computed from the served routes and source and store revisions.
+
+Finish holds the published allowlist stable and uses the same session lock
+as annotation mutations. It captures source and store data, validates the
+page and collection revisions, builds the result with the CLI annotation
+formatter, and rechecks disk revisions before accepting the verdict.
+Independent processes can still edit files during capture. The accepted
+result is built from the captured data and stays fixed after acceptance.
+The server sends an SSE finish event, then gives connections a bounded
+window before exiting and printing the result.
+
+The annotation UI shares quick labels and keyboard handlers between serve
+and the WebView. The HTML renderer and annotation projection share parser
+options. Generated alert titles and code controls are excluded from the
+annotation text walk. Browser code copy uses the clipboard API. GUI code copy
+uses a bounded IPC frame addressed to the current Preview tab and source
+revision, with the same native pasteboard helper as Copy Path.
 
 ## Packaging
 

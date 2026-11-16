@@ -65,13 +65,36 @@ markview --serve --open --daemon docs/       # background server, browser opened
 | `--open` | Open the default browser once the server is ready. |
 | `--daemon` | Run in the background and return after the child is ready, printing the PID and URL. Logs go to `.markview-serve-<PORT>.log` in the current directory. |
 
-`--port`, `--recurse`, `--open`, `--daemon`, and `--annotate` require `--serve`.
+`--port` and `--recurse` also work with `--review`. `--open`, `--daemon`, and `--annotate` require `--serve`.
 
 The server renders Markdown as HTML and live-reloads open browser tabs whenever a served file changes (a file watcher feeds a `/events` server-sent-events stream). It serves the listed documents and assets allowlisted by relative Markdown image/link destinations (`![]()` and `[]()`, including reference-style links). Referenced assets inside hidden directories are allowed, except anything under a `.markview` directory: the whole tree is blocked, so annotation stores and their lock files are never served as assets. Raw HTML `<img src>` and absolute destinations do not add assets; those files return 404 unless independently allowlisted. `/favicon.ico` has a separate local-file/built-in fallback. Other files return 404. It binds to `127.0.0.1`; to view it from another machine, forward the port over SSH first, e.g. `ssh -L 8080:localhost:8080 user@host`.
 
 For directory collections, `/` chooses the top-level `README.md`, then `index.md` (case-insensitive), then the first relative Markdown path sorted by byte order. Explicit file sets use their first FILE argument. A one-document directory has an empty navigation area. Hidden files/directories and symlinked directories are excluded from document discovery, while aliases of already discovered files are silently dropped. Explicit file sets reject duplicate/aliased inputs.
 
 On daemon startup failure, read the log path printed by the launcher with `cat`, report that underlying error, and remove the failed log. Daemon children retain their concrete `--port` in process arguments; foreground processes may omit it or show `0`, so read their startup banner for the actual port. Unix daemons inherit the bound listener, keeping the selected port reserved throughout startup.
+
+### Request a collection verdict
+
+```sh
+markview --review notes.md api.md
+markview --review --recurse --gate docs/
+markview --review --no-open --port 8080 notes.md
+```
+
+`--review` opens an annotatable browser session and waits in the foreground.
+The URL goes to stderr. The reviewer can **Approve** or **Request changes**
+for the entire served collection. Request changes requires at least one
+saved open comment. Approval can include open comments.
+
+Once the reviewer confirms, stdout contains the verdict and saved open
+comments from that collection, including comments saved before the session.
+Both verdicts exit 0. With `--gate`, Request changes exits 2.
+Ctrl+C cancels a pending review. Use `--annotations` to recover saved
+comments if a session ends without a verdict.
+
+The default port is ephemeral. For SSH, use `--no-open` with a fixed
+`--port` and forward the same port on both sides, for example
+`ssh -L 8080:localhost:8080 user@host`.
 
 ### Review comments
 
@@ -96,6 +119,22 @@ available for read-only review with `--serve` alone. In macOS Preview, comments
 share the table-of-contents sidebar, which opens when you start a comment. Use
 **View → Add Comment** (Cmd+Shift+K) on a selection. Save a dirty or untitled
 tab before adding a comment.
+New comments have four quick labels. **Question**, **Needs a test**,
+**Out of scope**, and **Nit** save a blank draft immediately or prefix
+a draft that already has text.
+
+Single-key shortcuts are on by default in the browser and macOS Preview.
+Use the **Single-key shortcuts** toggle in the annotations panel to turn
+them off. The browser remembers the choice for its current origin. The
+macOS app saves it in its preferences.
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` | Focus the next or previous visible annotation, wrapping at the ends. |
+| `c` | Comment on the selection or, with no selection, on the document. |
+| `e` | Edit the focused comment. |
+| `r` | Resolve or reopen the focused comment. |
+| `Escape` | Cancel the composer or clear the focused annotation. |
 
 The browser and GUI update when the shared Markdown store changes. A comment
 whose text is missing or ambiguous stays visible as **Detached** with its
@@ -132,6 +171,16 @@ compares the on-disk file immediately before committing. A direct edit can
 still race between that comparison and the final rename or removal. Re-read
 the store immediately before editing it and verify the intended change after
 saving.
+
+### Alerts and code copy
+
+Start a blockquote with `[!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, or
+`[!CAUTION]` to render a GitHub alert. The terminal shows a bold title, and
+HTML uses a titled border that stays visible in print.
+
+In the browser and macOS Preview, hover over a code block or Tab to its
+**Copy** button to copy the displayed code, including indentation and the
+trailing newline. On touch devices, the button is always visible.
 
 ### Diff blocks
 
@@ -187,7 +236,7 @@ Run `markview --help` or `markview-gui --help` for the same option summary in th
 
 ## Agent skill
 
-The repo ships a `markview` agent skill ([skills/markview/SKILL.md](skills/markview/SKILL.md)) that teaches a coding agent to serve a Markdown directory as a browsable local site: it installs the CLI if missing, checks for servers already running, starts `markview --serve --recurse --daemon --port 0` from `/tmp/.markview`, checks the URL, and reports how to stop the server.
+The repo ships a `markview` agent skill ([skills/markview/SKILL.md](skills/markview/SKILL.md)) that teaches a coding agent to request a human verdict or serve a Markdown directory as a browsable local site. For ordinary serving, it installs the CLI if missing, checks for servers already running, starts `markview --serve --recurse --daemon --port 0` from `/tmp/.markview`, checks the URL, and reports how to stop the server.
 
 Install the published repository version with the [skills CLI](https://github.com/vercel-labs/skills):
 

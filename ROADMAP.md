@@ -132,6 +132,15 @@ Markview is a small, fast, local-first Markdown viewer written in Rust. The proj
 - [Build tickets and acceptance criteria](ANNOTATIONS_TICKETS.md)
 - [Annotation specification](ANNOTATIONS_SPEC.md)
 
+### FEAT-005: Collection review and reading controls
+
+- **Status** — Implemented.
+- Run a foreground browser review with `--review` to collect a verdict
+  and the served collection's saved comments. Browser and macOS Preview
+  share quick labels, keyboard navigation, and code copy. GitHub alerts
+  render in the terminal and every HTML frontend.
+- [Review workflow specification](REVIEW_WORKFLOW_SPEC.md)
+
 ## Review Workflow
 
 Every commit should be reviewed before starting the next task:

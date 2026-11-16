@@ -91,3 +91,16 @@ the header into comment text and the annotation disappears from the list.
 `markview --annotations` warns on stderr about a header that almost parses,
 and exits non-zero with `error: <document>: <problem>` lines if a store cannot
 be read, so check stderr and the exit status after editing.
+
+## Request a human verdict
+
+For an explicit collection verdict, start `markview --review [--recurse] <FILE>... | <DIR>`
+as a foreground process and keep it alive while the reviewer works. Read stderr
+for the browser URL and share it with the reviewer. The browser opens by default.
+Use `--no-open --port <PORT>` over SSH and forward the same port locally and remotely.
+
+Capture stdout through completion. It contains the accepted verdict and saved
+open comments for the served collection. Both verdicts exit 0 by default.
+Use `--gate` when Request changes should exit 2. If the process is interrupted,
+recover saved comments with `markview --annotations` and report that the session
+ended without a verdict.

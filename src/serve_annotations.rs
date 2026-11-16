@@ -426,6 +426,18 @@ pub fn handle(
         // A client that stops reading must not hold a worker on a large body.
         stream.set_write_timeout(Some(serve_api::WRITE_TIMEOUT))?;
     }
+    // Any other API route, or one this server does not offer, is not there,
+    // whatever the method; only a route that exists refuses a method.
+    if let Some(route) = api {
+        let offered = match route {
+            "documents" | "document" | "annotations" => true,
+            "review" => session.is_some(),
+            _ => false,
+        };
+        if !offered {
+            return fail(stream, "404 Not Found", "unknown endpoint");
+        }
+    }
     if matches!(api, Some("documents" | "document")) {
         if !matches!(request.method.as_str(), "GET" | "HEAD") {
             return fail(stream, "405 Method Not Allowed", "method not allowed");
@@ -501,7 +513,7 @@ pub fn handle(
                 .header("authorization")
                 .and_then(|header| header.split_once(' '))
                 .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
-                .map(|(_, token)| token);
+                .map(|(_, token)| token.trim_start_matches(' '));
             if !token_matches(presented, expected) {
                 return fail(stream, "403 Forbidden", "invalid API token");
             }
@@ -619,6 +631,16 @@ pub fn handle(
         ),
         Err(error) => respond_error(stream, error, "annotation store is unavailable", fail),
     }
+}
+
+/// The answer to a request to the reserved prefix that does not parse.
+pub fn malformed(stream: &mut TcpStream) -> io::Result<()> {
+    json_response(
+        stream,
+        "400 Bad Request",
+        r#"{"error":"Malformed request"}"#,
+        false,
+    )
 }
 
 fn respond_error(

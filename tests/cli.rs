@@ -4377,3 +4377,111 @@ fn an_add_whose_client_disconnected_is_not_doubled_by_the_retry() {
     let stored = std::fs::read_to_string(store.join("README.md")).unwrap();
     assert_eq!(stored.matches("Timed out").count(), 1, "{stored}");
 }
+
+#[test]
+fn bearer_credentials_follow_the_header_grammar() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("README.md"), "# Home\n").unwrap();
+    let token = "f6".repeat(32);
+    let server = start_api_server(dir.path(), &token, false);
+    let port = server.port;
+    // Passes authentication, then fails validation: no revision.
+    let form = "op=add&doc=%2FREADME.md&body=x";
+    let status = |authorization: &str| {
+        let response = post_form(port, "/_markview/api/v1/annotations", authorization, form);
+        response.lines().next().unwrap().to_owned()
+    };
+    for accepted in [
+        format!("Authorization: Bearer {token}"),
+        format!("Authorization: Bearer  {token}"),
+        format!("Authorization: Bearer    {token}"),
+        format!("Authorization: bearer {token}"),
+        format!("Authorization: BEARER {token}"),
+    ] {
+        assert_eq!(status(&accepted), "HTTP/1.1 400 Bad Request", "{accepted}");
+    }
+    for refused in [
+        format!("Authorization: Bearer\t{token}"),
+        format!("Authorization: Bearer {token} extra"),
+        format!("Authorization: Bearer {}", &token[1..]),
+        "Authorization: Bearer ".to_owned(),
+        "Authorization: Bearer".to_owned(),
+        format!("Authorization: Basic {token}"),
+        format!("Authorization: {token}"),
+        String::new(),
+    ] {
+        assert_eq!(status(&refused), "HTTP/1.1 403 Forbidden", "{refused:?}");
+    }
+    assert!(!dir.path().join(".markview").exists());
+}
+
+#[test]
+fn duplicate_authorization_headers_get_a_json_error_like_every_other_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("README.md"), "# Home\n").unwrap();
+    let token = "f6".repeat(32);
+    let server = start_api_server(dir.path(), &token, false);
+    let port = server.port;
+    let response = post_form(
+        port,
+        "/_markview/api/v1/annotations",
+        &format!("Authorization: Bearer {token}\r\nAuthorization: Bearer {token}"),
+        "op=add&body=x",
+    );
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    assert!(
+        response.contains("Content-Type: application/json"),
+        "{response}"
+    );
+    assert!(response.contains(r#"{"error":"#), "{response}");
+}
+
+#[test]
+fn api_routes_that_do_not_exist_are_404_for_every_method() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("README.md"), "# Home\n").unwrap();
+    let token = "f6".repeat(32);
+    let server = start_api_server(dir.path(), &token, false);
+    let port = server.port;
+    let bearer = format!("Authorization: Bearer {token}");
+    let request = |method: &str, route: &str| {
+        let response = raw_http(
+            port,
+            &format!("{method} /_markview/api/v1/{route} HTTP/1.1\r\nHost: localhost:{port}\r\n{bearer}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 0\r\n\r\n"),
+        );
+        response.lines().next().unwrap().to_owned()
+    };
+    // Unknown, or a review route outside --review: not there, whatever the verb.
+    for route in ["nope", "review", "", "documents/extra"] {
+        for method in ["GET", "HEAD", "POST", "PUT", "DELETE"] {
+            assert_eq!(
+                request(method, route),
+                "HTTP/1.1 404 Not Found",
+                "{method} {route}"
+            );
+        }
+    }
+    // A route that exists refuses the other verbs.
+    for (method, route) in [
+        ("POST", "documents"),
+        ("PUT", "document"),
+        ("DELETE", "annotations"),
+        ("PUT", "annotations"),
+    ] {
+        assert_eq!(
+            request(method, route),
+            "HTTP/1.1 405 Method Not Allowed",
+            "{method} {route}"
+        );
+    }
+}
+
+#[test]
+fn review_summary_says_whether_the_review_is_finished() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("sample.md"), "# Doc\n").unwrap();
+    let server = start_review(dir.path(), &[]);
+    let summary = http_get_local(server.port, "/_markview/api/v1/review");
+    assert!(summary.starts_with("HTTP/1.1 200"), "{summary}");
+    assert_eq!(json_field(&summary, "finished"), "false", "{summary}");
+}

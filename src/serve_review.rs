@@ -321,7 +321,7 @@ impl Session {
         }
         let (revision, comments, documents) = config.review_summary.read(config)?;
         Ok(format!(
-            r#"{{"review_revision":"{revision}","comments":{comments},"documents":{documents}}}"#
+            r#"{{"review_revision":"{revision}","comments":{comments},"documents":{documents},"finished":false}}"#
         ))
     }
 
@@ -705,7 +705,7 @@ mod tests {
 
     fn summary_json(revision: &str, comments: usize, documents: usize) -> String {
         format!(
-            r#"{{"review_revision":"{revision}","comments":{comments},"documents":{documents}}}"#
+            r#"{{"review_revision":"{revision}","comments":{comments},"documents":{documents},"finished":false}}"#
         )
     }
 

@@ -1700,13 +1700,7 @@ fn handle_connection(
                     session.as_deref(),
                     &clients,
                 ),
-                Err(_) => write_response(
-                    &mut stream,
-                    "400 Bad Request",
-                    "text/plain; charset=utf-8",
-                    "Malformed request",
-                    false,
-                ),
+                Err(_) => serve_annotations::malformed(&mut stream),
             };
         // A refused POST is answered before its body is read. Without the
         // drain, a body larger than the socket buffer resets the connection

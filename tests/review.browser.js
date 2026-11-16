@@ -219,11 +219,16 @@
     retrySummary.click();
     await settle();
     document.querySelector('.markview-review-toolbar button').click();
-    require(!document.querySelector('.markview-review-composer').hidden, 'The saved draft warning could not be exercised');
+    const servedComposer = document.querySelector('.markview-review-composer');
+    require(!servedComposer.hidden, 'The saved draft warning could not be exercised');
+    // An open composer is not a draft until something is typed into it.
+    const servedDraft = servedComposer.querySelector('textarea');
+    servedDraft.value = 'Typed but not saved';
+    servedDraft.dispatchEvent(new Event('input'));
     changes.click();
     await settle();
-    require(confirmations[0].includes('entire served collection') && confirmations[0].includes('unsaved comment draft'),
-      'Verdict confirmation omitted its scope or unsaved draft');
+    require(confirmations[0].includes('entire served collection') && /unsaved comment drafts?\. Only saved comments count\.$/.test(confirmations[0]),
+      'Verdict confirmation omitted its scope or unsaved draft: ' + confirmations[0]);
     require(finishes[0].review_revision === 'saved' && finishes[0].verdict === 'changes', 'The confirmed revision was not posted');
     require(bar.textContent.includes('Confirm the verdict again') && !changes.disabled,
       'A conflict did not refresh the review and require confirmation');

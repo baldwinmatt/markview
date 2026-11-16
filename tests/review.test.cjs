@@ -1326,14 +1326,15 @@ test('copy buttons do not change the text an annotation is anchored to', () => {
 // A blocking review page as `markview --review` serves it: the review
 // script, the verdict bar and the live-reload shell. `page.summaries` holds
 // one function per summary request still in flight; calling it answers.
-async function reviewPage(summary = {review_revision: 'r1', comments: 0, documents: 0}) {
-  const page = createPage();
+async function reviewPage(summary = {review_revision: 'r1', comments: 0, documents: 0}, {route = '/doc.md', storage} = {}) {
+  const page = createPage({storage});
   page.summary = summary;
   page.summaries = [];
   // What `POST /_markview/review` answers, and the forms it was sent.
   page.finish = () => response(200, {finished: true});
   page.finishes = [];
-  page.next = {root: page.h('html', {}, page.h('main', {'data-source-revision': 'source-1', 'data-markview-route': '/doc.md'}))};
+  page.comments = [];
+  page.next = {root: page.h('html', {}, page.h('main', {'data-source-revision': 'source-1', 'data-markview-route': route}))};
   page.fetch = (url, init = {}) => {
     if (url === '/_markview/review' && !init.method) {
       return new Promise(resolve => page.summaries.push(() => resolve(response(200, page.summary))));
@@ -1343,16 +1344,26 @@ async function reviewPage(summary = {review_revision: 'r1', comments: 0, documen
       return Promise.resolve(page.finish());
     }
     // The page itself, fetched again by a live reload.
-    if (url === '/doc.md') return Promise.resolve({ok: true, status: 200, text: async () => ''});
-    return Promise.resolve(response(200, review('store-1')));
+    if (url === route) return Promise.resolve({ok: true, status: 200, text: async () => ''});
+    if (init.method === 'POST') return Promise.resolve(response(200, review('store-2', [comment('a2', {body: init.body.get('body')})])));
+    return Promise.resolve(response(200, review('store-1-' + page.comments.length, page.comments)));
   };
-  page.main.dataset.markviewRoute = '/doc.md';
+  page.main.dataset.markviewRoute = route;
   page.loadVerdict();
-  await page.context.markviewServeReview('/doc.md', 'token', 7878, true);
-  page.events = page.loadShell();
+  await page.context.markviewServeReview(route, 'token', 7878, true);
+  page.events = page.loadShell(route);
   page.bar = page.document.querySelector('.markview-verdict');
   page.status = () => page.bar.querySelector('p').textContent;
   page.verdictButton = label => page.bar.querySelectorAll('button').find(button => button.textContent === label);
+  page.panel = page.document.querySelector('.markview-review');
+  page.find = selector => page.panel.querySelector(selector);
+  page.button = label => page.panel.querySelectorAll('button').find(button => button.textContent === label && button.visible);
+  // Asks for a verdict and returns what the confirmation dialog said.
+  page.confirmed = async label => {
+    page.verdictButton(label).click();
+    await page.settle();
+    return page.confirmations.at(-1);
+  };
   // Answers every summary request in flight, and any that follows from it.
   page.answerSummaries = async () => {
     for (let index = 0; index < page.summaries.length; index++) {
@@ -1384,8 +1395,8 @@ test('a review page asks for the collection summary once, and an event burst at 
 });
 
 // A review page whose first summary has arrived.
-async function openedReviewPage(summary) {
-  const page = await reviewPage(summary);
+async function openedReviewPage(summary, options) {
+  const page = await reviewPage(summary, options);
   page.events.dispatchEvent({type: 'open'});
   await page.settle();
   await page.answerSummaries();
@@ -1448,6 +1459,68 @@ test('a verdict accepted in another tab closes this one through the event stream
   page.events.dispatchEvent({type: 'annotations', data: '/other.md'});
   await page.settle();
   assert.equal(page.summaries.length, 1);
+});
+
+const counts = '1 open comment in 1 document.';
+const oneComment = {review_revision: 'r1', comments: 1, documents: 1};
+
+test('an open composer with nothing typed is not an unsaved draft', async () => {
+  const page = await openedReviewPage(oneComment);
+  page.loadVerdictAnswer(false);
+  page.button('Comment on document').click();
+  assert.equal(page.find('form').visible, true);
+  assert.equal(await page.confirmed('Approve'), 'Approve the entire served collection?\n' + counts);
+
+  // Text makes it one, and saving it makes it a comment instead.
+  const body = page.find('textarea');
+  body.value = 'Not saved yet';
+  body.dispatchEvent({type: 'input'});
+  assert.equal(await page.confirmed('Approve'), 'Approve the entire served collection?\n' + counts +
+    '\n\n1 document has an unsaved comment draft. Only saved comments count.');
+  page.find('form').requestSubmit();
+  await page.settle();
+  assert.equal(await page.confirmed('Approve'), 'Approve the entire served collection?\n' + counts);
+});
+
+test('an edit that changes nothing is not an unsaved draft, and one that does is', async () => {
+  const page = await reviewPage(oneComment);
+  page.comments = [comment('a1')];
+  await page.window.markviewReviewRefresh();
+  page.events.dispatchEvent({type: 'open'});
+  await page.settle();
+  await page.answerSummaries();
+  page.loadVerdictAnswer(false);
+  page.button('Edit').click();
+  assert.equal(await page.confirmed('Approve'), 'Approve the entire served collection?\n' + counts);
+  const body = page.find('textarea');
+  body.value = 'Body of a1, reworded';
+  body.dispatchEvent({type: 'input'});
+  assert.match(await page.confirmed('Approve'), /\n\n1 document has an unsaved comment draft\. Only saved comments count\.$/);
+});
+
+test('a draft left on another served document is called out before a verdict', async () => {
+  // One tab: its session storage outlives the navigation from a.md to b.md.
+  const storage = new Map();
+  const first = await openedReviewPage(oneComment, {route: '/a.md', storage});
+  openDocumentDraft(first, 'Left behind on a.md');
+
+  const second = await openedReviewPage(oneComment, {route: '/b.md', storage});
+  second.loadVerdictAnswer(false);
+  assert.equal(second.find('form').visible, false, 'the draft belongs to the other document');
+  assert.equal(await second.confirmed('Request changes'), 'Request changes for the entire served collection?\n' + counts +
+    '\n\n1 document has an unsaved comment draft. Only saved comments count.');
+
+  // With one here as well, the reviewer is told how many documents to visit.
+  openDocumentDraft(second, 'And one on b.md');
+  assert.equal(await second.confirmed('Approve'), 'Approve the entire served collection?\n' + counts +
+    '\n\n2 documents have unsaved comment drafts. Only saved comments count.');
+
+  // An empty composer left open elsewhere does not count.
+  const third = await openedReviewPage(oneComment, {route: '/c.md', storage});
+  third.button('Comment on document').click();
+  const fourth = await openedReviewPage(oneComment, {route: '/d.md', storage});
+  fourth.loadVerdictAnswer(false);
+  assert.match(await fourth.confirmed('Approve'), /\n\n2 documents have unsaved comment drafts\./);
 });
 
 test('the reconfirm warning after a conflict is shown once, not on every later refresh', async () => {

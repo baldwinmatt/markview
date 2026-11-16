@@ -100,7 +100,10 @@ function createMarkviewVerdict(page, review, token) {
     // The reviewer has read the warning and is acting on it.
     render(counts() + '.');
     const label = verdict === 'approved' ? 'Approve' : 'Request changes for';
-    const draft = review.hasDraft() ? '\n\nThis page has an unsaved comment draft. Only saved comments count.' : '';
+    // Drafts with text, here or on another served document opened in this tab.
+    const drafts = review.unsavedDrafts();
+    const draft = !drafts ? '' : '\n\n' + (drafts === 1 ? '1 document has an unsaved comment draft.' :
+      drafts + ' documents have unsaved comment drafts.') + ' Only saved comments count.';
     if (!window.confirm(label + ' the entire served collection?\n' + counts() + '.' + draft)) return;
     const body = new URLSearchParams({op: 'finish', verdict, review_revision: summary.review_revision,
       doc: page.dataset.markviewRoute, source_revision: page.dataset.sourceRevision});

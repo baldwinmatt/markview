@@ -202,7 +202,8 @@ function createMarkviewReview(root, mount, submit, {
   const errors = new Map();
   const showResolved = new Map();
 
-  function draftKey(documentKey) { return 'markview-review:' + documentKey; }
+  const draftPrefix = 'markview-review:';
+  function draftKey(documentKey) { return draftPrefix + documentKey; }
   function getDraft() {
     if (!key) return null;
     if (!drafts.has(key)) {
@@ -254,12 +255,27 @@ function createMarkviewReview(root, mount, submit, {
     body.focus();
     return true;
   }
-  // Whether the current draft holds text that cancelling would lose.
-  function draftHasText() {
-    const draft = getDraft();
+  // Whether a draft holds text that cancelling would lose. An edit starts
+  // from the comment's text, kept in `original`, so an untouched one does not.
+  function hasText(draft) {
     if (!draft) return false;
     if (draft.op !== 'edit') return draft.body.trim() !== '';
-    return draft.body !== review?.annotations.find(card => card.id === draft.id)?.body;
+    return draft.body !== draft.original;
+  }
+  function draftHasText() { return hasText(getDraft()); }
+  // How many documents have such a draft: this one, and any other whose
+  // draft this tab's session storage still holds from an earlier page.
+  function unsavedDrafts() {
+    const stored = new Map();
+    try {
+      for (let index = 0; index < sessionStorage.length; index++) {
+        const name = sessionStorage.key(index);
+        if (name.startsWith(draftPrefix)) stored.set(name.slice(draftPrefix.length), JSON.parse(sessionStorage.getItem(name)));
+      }
+    } catch { /* Optional storage. */ }
+    // What this page holds is newer than what it managed to store.
+    for (const [documentKey, draft] of drafts) stored.set(documentKey, draft);
+    return Array.from(stored.values()).filter(hasText).length;
   }
   function cancelDraft() {
     discarding = null;
@@ -401,7 +417,9 @@ function createMarkviewReview(root, mount, submit, {
       setMessage('Comments can contain at most 10,000 characters.');
       return;
     }
-    send(draft, draft);
+    // `original` is the draft's own note of where an edit started.
+    const {original, ...fields} = draft;
+    send(fields, draft);
   }
   composer.addEventListener('submit', event => {
     event.preventDefault();
@@ -510,7 +528,7 @@ function createMarkviewReview(root, mount, submit, {
         const fields = {id: entry.id, store_revision: review.store_revision};
         const nextStatus = entry.status === 'open' ? 'resolved' : 'open';
         const statusLabel = entry.status === 'open' ? 'Resolve' : 'Reopen';
-        const editDraft = () => startDraft({op: 'edit', ...fields, body: entry.body}, {id: entry.id, label: 'Edit'});
+        const editDraft = () => startDraft({op: 'edit', ...fields, body: entry.body, original: entry.body}, {id: entry.id, label: 'Edit'});
         const changeStatus = () => send({op: 'status', ...fields, status: nextStatus});
         cardActionsByElement.set(card, {editDraft, changeStatus});
         controls.Edit = cardButton('Edit', about, editDraft);
@@ -645,7 +663,8 @@ function createMarkviewReview(root, mount, submit, {
       repaint();
     },
     addSelection,
-    hasDraft: () => Boolean(getDraft()),
+    unsavedDrafts,
+    hasUnsavedDraft: () => unsavedDrafts() > 0,
     setShortcuts: enabled => { shortcutsToggle.checked = enabled; },
     // The annotations cannot be read at all: show why instead of a list.
     unavailable(message) {

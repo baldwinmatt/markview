@@ -226,7 +226,9 @@ function builder(document) {
 
 // A page with <main> ready for the review script, which is loaded into its
 // own VM context so each test starts from a clean script state.
-function createPage({revision = 'source-1'} = {}) {
+// `storage` is the tab's session storage: pass the same Map to two pages to
+// model navigating from one served document to another in one tab.
+function createPage({revision = 'source-1', storage = new Map()} = {}) {
   const document = {listeners: new Map(), activeElement: null};
   document.createElement = tag => new StubElement(document, tag);
   document.createTextNode = data => new StubText(document, data);
@@ -248,7 +250,6 @@ function createPage({revision = 'source-1'} = {}) {
   if (revision !== null) main.dataset.sourceRevision = revision;
   document.body.append(main);
 
-  const storage = new Map();
   const selection = {rangeCount: 0, isCollapsed: true, getRangeAt() { return this.range; }};
   const page = {
     document,
@@ -294,6 +295,8 @@ function createPage({revision = 'source-1'} = {}) {
       getItem: key => (storage.has(key) ? storage.get(key) : null),
       setItem: (key, value) => storage.set(key, String(value)),
       removeItem: key => storage.delete(key),
+      key: index => [...storage.keys()][index] ?? null,
+      get length() { return storage.size; },
     },
     CSS: {highlights: page.highlights},
     Highlight: class { constructor(...ranges) { this.ranges = ranges; this.size = ranges.length; } },
@@ -322,10 +325,10 @@ function createPage({revision = 'source-1'} = {}) {
   };
   // The live-reload shell every served page ends with. Returns its
   // EventSource, so a test can deliver server events.
-  page.loadShell = () => {
+  page.loadShell = (pathname = '/doc.md') => {
     let events = null;
     Object.assign(page.context, {
-      location: {pathname: '/doc.md', reload() { page.reloads = (page.reloads || 0) + 1; }, replace() {}},
+      location: {pathname, reload() { page.reloads = (page.reloads || 0) + 1; }, replace() {}},
       navigator: {clipboard: {writeText: async () => {}}},
       EventSource: class {
         constructor() { this.listeners = new Map(); this.closed = false; events = this; }

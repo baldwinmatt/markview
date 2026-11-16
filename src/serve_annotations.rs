@@ -123,7 +123,7 @@ fn token_difference(presented: &[u8], expected: &[u8]) -> (usize, usize) {
     (difference, compared)
 }
 
-fn token_matches(presented: Option<&str>, expected: &str) -> bool {
+pub(super) fn token_matches(presented: Option<&str>, expected: &str) -> bool {
     presented
         .is_some_and(|presented| token_difference(presented.as_bytes(), expected.as_bytes()).0 == 0)
 }
@@ -254,7 +254,7 @@ impl HttpRequest {
         })
     }
 
-    fn header(&self, key: &str) -> Option<&str> {
+    pub(super) fn header(&self, key: &str) -> Option<&str> {
         self.headers.get(key).map(String::as_str)
     }
 }
@@ -347,7 +347,12 @@ fn mutate_review(
     config.review_cache.mutate(location, operation)
 }
 
-fn json_response(stream: &mut TcpStream, status: &str, body: &str, head: bool) -> io::Result<()> {
+pub(super) fn json_response(
+    stream: &mut TcpStream,
+    status: &str,
+    body: &str,
+    head: bool,
+) -> io::Result<()> {
     write_response_headers(
         stream,
         status,
@@ -358,7 +363,7 @@ fn json_response(stream: &mut TcpStream, status: &str, body: &str, head: bool) -
     )
 }
 
-fn post_body(
+pub(super) fn post_body(
     reader: &mut BufReader<TcpStream>,
     request: &HttpRequest,
     query: &str,
@@ -385,11 +390,46 @@ fn post_body(
     bounded_bytes(reader, deadline, length, false).map_err(|_| "incomplete annotation request")
 }
 
-fn query_document(query: &str) -> Option<String> {
+pub(super) fn query_document(query: &str) -> Option<String> {
     query
         .strip_prefix("doc=")
         .filter(|route| !route.contains('&'))
         .and_then(|route| super::percent_decode(&route.replace('+', " ")))
+}
+
+/// What one request to the reserved prefix has in hand.
+pub(super) struct Exchange<'a> {
+    pub shared: &'a SharedConfig,
+    /// The config as it was when the request arrived.
+    pub initial: Arc<ServeConfig>,
+    pub request: &'a HttpRequest,
+    pub session: Option<&'a serve_review::Session>,
+    pub clients: &'a Clients,
+    pub query: &'a str,
+}
+
+impl Exchange<'_> {
+    pub fn head(&self) -> bool {
+        self.request.method == "HEAD"
+    }
+
+    pub fn fail(&self, stream: &mut TcpStream, status: &str, message: &str) -> io::Result<()> {
+        fail(stream, self.head(), status, message)
+    }
+}
+
+pub(super) fn fail(
+    stream: &mut TcpStream,
+    head: bool,
+    status: &str,
+    message: &str,
+) -> io::Result<()> {
+    json_response(
+        stream,
+        status,
+        &format!("{{\"error\":{}}}", annotations::json_string(message)),
+        head,
+    )
 }
 
 pub fn handle(
@@ -401,188 +441,154 @@ pub fn handle(
     session: Option<&serve_review::Session>,
     clients: &Clients,
 ) -> io::Result<()> {
-    let head = request.method == "HEAD";
-    let fail = |stream: &mut TcpStream, status: &str, message: &str| {
-        json_response(
-            stream,
-            status,
-            &format!("{{\"error\":{}}}", annotations::json_string(message)),
-            head,
-        )
-    };
     let initial = shared.read().expect("config lock").clone();
+    let head = request.method == "HEAD";
     if !request
         .header("host")
         .is_some_and(|host| loopback_host(host, initial.port))
     {
-        return fail(stream, "403 Forbidden", "invalid Host");
+        return fail(stream, head, "403 Forbidden", "invalid Host");
     }
     let (path, query) = request
         .target
         .split_once('?')
         .unwrap_or((&request.target, ""));
-    let api = path.strip_prefix(serve_api::PREFIX);
-    if api.is_some() {
-        // A client that stops reading must not hold a worker on a large body.
-        stream.set_write_timeout(Some(serve_api::WRITE_TIMEOUT))?;
-    }
-    // Any other API route, or one this server does not offer, is not there,
-    // whatever the method; only a route that exists refuses a method.
-    if let Some(route) = api {
-        let offered = match route {
-            "documents" | "document" | "annotations" => true,
-            "review" => session.is_some(),
-            _ => false,
-        };
-        if !offered {
-            return fail(stream, "404 Not Found", "unknown endpoint");
-        }
-    }
-    if matches!(api, Some("documents" | "document")) {
-        if !matches!(request.method.as_str(), "GET" | "HEAD") {
-            return fail(stream, "405 Method Not Allowed", "method not allowed");
-        }
-        if api == Some("documents") {
-            if !query.is_empty() {
-                return fail(stream, "400 Bad Request", "unexpected documents query");
-            }
-            return json_response(
-                stream,
-                "200 OK",
-                &serve_api::catalog(&initial, session.is_some()),
-                head,
-            );
-        }
-        let Some(route) = query_document(query) else {
-            return fail(stream, "400 Bad Request", "expected a document route");
-        };
-        let Some(document) = initial.document_for_route(&route) else {
-            return fail(stream, "404 Not Found", "document is unavailable");
-        };
-        let loaded = match serve_api::load(&initial, document) {
-            Ok(loaded) => loaded,
-            Err(error) => return respond_error(stream, error, "document is unavailable", fail),
-        };
-        let headers = format!(
-            "ETag: \"{}\"\r\nCache-Control: no-cache\r\n",
-            loaded.revision
-        );
-        if request
-            .header("if-none-match")
-            .is_some_and(|value| serve_api::etag_matches(value, &loaded.revision))
-        {
-            return write_response_headers(
-                stream,
-                "304 Not Modified",
-                "application/json; charset=utf-8",
-                b"",
-                true,
-                &headers,
-            );
-        }
-        let body = serve_api::body(&initial, document, &loaded);
-        return write_response_headers(
-            stream,
-            "200 OK",
-            "application/json; charset=utf-8",
-            body.as_bytes(),
-            head,
-            &headers,
-        );
-    }
-    let path = match api {
-        Some("annotations") => ENDPOINT,
-        Some("review") => serve_review::ENDPOINT,
-        _ => path,
+    let exchange = Exchange {
+        shared,
+        initial,
+        request,
+        session,
+        clients,
+        query,
     };
-    let review_endpoint = session.filter(|_| path == serve_review::ENDPOINT);
-    if path != ENDPOINT && review_endpoint.is_none() {
+    if let Some(route) = path.strip_prefix(serve_api::PREFIX) {
+        return serve_api::handle(stream, reader, &exchange, route, deadline);
+    }
+    let review = session.filter(|_| path == serve_review::ENDPOINT);
+    if path != ENDPOINT && review.is_none() {
         return if matches!(request.method.as_str(), "GET" | "HEAD") {
-            fail(stream, "404 Not Found", "unknown endpoint")
+            exchange.fail(stream, "404 Not Found", "unknown endpoint")
         } else {
-            fail(stream, "405 Method Not Allowed", "method not allowed")
+            exchange.fail(stream, "405 Method Not Allowed", "method not allowed")
         };
     }
     let body = if request.method == "POST" {
-        if api.is_some() {
-            let Some(expected) = initial.session.api_token.as_deref() else {
-                return fail(stream, "403 Forbidden", "API writes are disabled: set MARKVIEW_API_TOKEN and use --annotate or --review",
-                );
-            };
-            let presented = request
-                .header("authorization")
-                .and_then(|header| header.split_once(' '))
-                .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
-                .map(|(_, token)| token.trim_start_matches(' '));
-            if !token_matches(presented, expected) {
-                return fail(stream, "403 Forbidden", "invalid API token");
-            }
-        } else {
-            let Some(expected) = initial.session.review_token.as_deref() else {
-                return fail(stream, "405 Method Not Allowed", "method not allowed");
-            };
-            if !token_matches(request.header("x-markview-token"), expected) {
-                return fail(stream, "403 Forbidden", "invalid annotation token");
-            }
+        let Some(expected) = exchange.initial.session.review_token.as_deref() else {
+            return exchange.fail(stream, "405 Method Not Allowed", "method not allowed");
+        };
+        if !token_matches(request.header("x-markview-token"), expected) {
+            return exchange.fail(stream, "403 Forbidden", "invalid annotation token");
         }
         match post_body(reader, request, query, deadline) {
             Ok(body) => Some(body),
-            Err(message) => return fail(stream, "400 Bad Request", message),
+            Err(message) => return exchange.fail(stream, "400 Bad Request", message),
         }
     } else {
         None
     };
-    if let Some(session) = review_endpoint {
-        if !query.is_empty() {
-            return fail(stream, "400 Bad Request", "unexpected review query");
-        }
-        // Both read the whole collection, so neither holds the config lock:
-        // a rescan waiting to publish would otherwise stall every request.
-        let config = shared.read().expect("config lock").clone();
-        let result = match request.method.as_str() {
-            "GET" | "HEAD" => session.summary(&config).map(|json| (json, None)),
-            "POST" if body.is_some() => session
-                .finish(&config, body.as_deref().expect("validated POST"), || {
-                    // `try_read`: this runs under the session lock, which a
-                    // save takes while holding the config lock. A rescan
-                    // that is publishing right now is a conflict too.
-                    shared
-                        .try_read()
-                        .is_ok_and(|published| Arc::ptr_eq(&published, &config))
-                })
-                .map(|result| ("{\"finished\":true}".to_owned(), Some(result))),
-            _ => return fail(stream, "405 Method Not Allowed", "method not allowed"),
-        };
-        return match result {
-            Ok((json, Some(result))) => {
-                broadcast_reload(clients, ReloadKind::ReviewFinished);
-                let response = stream
-                    .set_write_timeout(Some(Duration::from_millis(250)))
-                    .and_then(|()| json_response(stream, "200 OK", &json, false));
-                session.publish(result);
-                response
-            }
-            Ok((json, None)) => json_response(stream, "200 OK", &json, head),
-            Err(error) => respond_error(stream, error, "review summary is unavailable", fail),
-        };
+    match review {
+        Some(session) => review_endpoint(stream, &exchange, session, body.as_deref()),
+        None => annotations_endpoint(stream, &exchange, body.as_deref(), &Writes::PAGE),
     }
-    let result = match request.method.as_str() {
-        "GET" | "HEAD" => {
+}
+
+/// `GET` the review summary, or `POST` the verdict, whichever frontend asks.
+pub(super) fn review_endpoint(
+    stream: &mut TcpStream,
+    exchange: &Exchange,
+    session: &serve_review::Session,
+    body: Option<&[u8]>,
+) -> io::Result<()> {
+    let Exchange {
+        shared,
+        request,
+        clients,
+        ..
+    } = *exchange;
+    if !exchange.query.is_empty() {
+        return exchange.fail(stream, "400 Bad Request", "unexpected review query");
+    }
+    // Both read the whole collection, so neither holds the config lock:
+    // a rescan waiting to publish would otherwise stall every request.
+    let config = shared.read().expect("config lock").clone();
+    let result = match (request.method.as_str(), body) {
+        ("GET" | "HEAD", _) => session.summary(&config).map(|json| (json, None)),
+        ("POST", Some(body)) => session
+            .finish(&config, body, || {
+                // `try_read`: this runs under the session lock, which a
+                // save takes while holding the config lock. A rescan
+                // that is publishing right now is a conflict too.
+                shared
+                    .try_read()
+                    .is_ok_and(|published| Arc::ptr_eq(&published, &config))
+            })
+            .map(|result| ("{\"finished\":true}".to_owned(), Some(result))),
+        _ => return exchange.fail(stream, "405 Method Not Allowed", "method not allowed"),
+    };
+    match result {
+        Ok((json, Some(result))) => {
+            broadcast_reload(clients, ReloadKind::ReviewFinished);
+            let response = stream
+                .set_write_timeout(Some(Duration::from_millis(250)))
+                .and_then(|()| json_response(stream, "200 OK", &json, false));
+            session.publish(result);
+            response
+        }
+        Ok((json, None)) => json_response(stream, "200 OK", &json, exchange.head()),
+        Err(error) => respond_error(stream, exchange, error, "review summary is unavailable"),
+    }
+}
+
+/// How a frontend's annotation writes differ from another's.
+pub(super) struct Writes {
+    /// Whether a write must name the source revision it was made against.
+    pub revision: annotations::RevisionPolicy,
+    /// Whether a write without a review session uses the config as it is
+    /// now rather than as the request found it.
+    pub live_config: bool,
+    /// How the resulting review is written.
+    pub render: fn(&annotations::Review) -> String,
+}
+
+impl Writes {
+    /// The page's own writes: the config of the request, optional revisions.
+    const PAGE: Self = Self {
+        revision: annotations::RevisionPolicy::Optional,
+        live_config: false,
+        render: annotations::Review::json,
+    };
+}
+
+/// `GET` the resolved annotations of a document, or `POST` one operation.
+pub(super) fn annotations_endpoint(
+    stream: &mut TcpStream,
+    exchange: &Exchange,
+    body: Option<&[u8]>,
+    writes: &Writes,
+) -> io::Result<()> {
+    let Exchange {
+        shared,
+        initial,
+        request,
+        session,
+        clients,
+        query,
+    } = exchange;
+    let result = match (request.method.as_str(), body) {
+        ("GET" | "HEAD", _) => {
             let Some(route) = query_document(query) else {
-                return fail(stream, "400 Bad Request", "expected a document route");
+                return exchange.fail(stream, "400 Bad Request", "expected a document route");
             };
             let Some(document) = initial.document_for_route(&route) else {
-                return fail(
+                return exchange.fail(
                     stream,
                     "404 Not Found",
                     "document route or store is unavailable",
                 );
             };
-            page_review(&initial, document).map(Some)
+            page_review(initial, document).map(Some)
         }
-        "POST" if body.is_some() => {
-            // Agent writes and blocking reviews use the current allowlist
-            // and hold it stable through validation and writing.
+        ("POST", Some(body)) => {
             // Only a review session holds the guard: its saves must see a
             // stable allowlist. An API write without a session takes the
             // live config but never holds the lock across the store's
@@ -591,16 +597,11 @@ pub fn handle(
             let published = session
                 .is_some()
                 .then(|| shared.read().expect("config lock"));
-            let live = (session.is_none() && api.is_some())
+            let live = (session.is_none() && writes.live_config)
                 .then(|| shared.read().expect("config lock").clone());
-            let config = published.as_deref().or(live.as_ref()).unwrap_or(&initial);
+            let config = published.as_deref().or(live.as_ref()).unwrap_or(initial);
             let mutation = || {
-                let policy = if api.is_some() {
-                    annotations::RevisionPolicy::Required
-                } else {
-                    annotations::RevisionPolicy::Optional
-                };
-                let form = Request::parse_with(body.as_deref().expect("validated POST"), policy)?;
+                let form = Request::parse_with(body, writes.revision)?;
                 let route = form
                     .doc
                     .ok_or(Error::Invalid("expected a document route"))?;
@@ -620,16 +621,18 @@ pub fn handle(
                 None => mutation(),
             }
         }
-        _ => return fail(stream, "405 Method Not Allowed", "method not allowed"),
+        _ => return exchange.fail(stream, "405 Method Not Allowed", "method not allowed"),
     };
     match result {
-        Ok(Some(review)) => json_response(stream, "200 OK", &review.json(), head),
-        Ok(None) => fail(
+        Ok(Some(review)) => {
+            json_response(stream, "200 OK", &(writes.render)(&review), exchange.head())
+        }
+        Ok(None) => exchange.fail(
             stream,
             "404 Not Found",
             "document route or store is unavailable",
         ),
-        Err(error) => respond_error(stream, error, "annotation store is unavailable", fail),
+        Err(error) => respond_error(stream, exchange, error, "annotation store is unavailable"),
     }
 }
 
@@ -643,19 +646,19 @@ pub fn malformed(stream: &mut TcpStream) -> io::Result<()> {
     )
 }
 
-fn respond_error(
+pub(super) fn respond_error(
     stream: &mut TcpStream,
+    exchange: &Exchange,
     error: Error,
     unavailable: &str,
-    fail: impl FnOnce(&mut TcpStream, &str, &str) -> io::Result<()>,
 ) -> io::Result<()> {
     if let Some(problem) = serve_review::DocumentProblem::of(&error) {
         eprintln!("markview: {problem}");
-        return fail(stream, problem.status, &problem.public);
+        return exchange.fail(stream, problem.status, &problem.public);
     }
     let message = error.to_string();
     match error {
-        Error::Invalid(_) => fail(stream, "400 Bad Request", &message),
+        Error::Invalid(_) => exchange.fail(stream, "400 Bad Request", &message),
         Error::Conflict(_) if serve_review::is_finished(&error) => json_response(
             stream,
             "409 Conflict",
@@ -665,10 +668,10 @@ fn respond_error(
             ),
             false,
         ),
-        Error::Conflict(_) | Error::Section(..) => fail(stream, "409 Conflict", &message),
+        Error::Conflict(_) | Error::Section(..) => exchange.fail(stream, "409 Conflict", &message),
         Error::Io(_) => {
             eprintln!("markview: {message}");
-            fail(stream, "500 Internal Server Error", unavailable)
+            exchange.fail(stream, "500 Internal Server Error", unavailable)
         }
     }
 }

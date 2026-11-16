@@ -332,6 +332,24 @@ struct ServeSession {
     rescan_id: u64,
 }
 
+/// What the API's credential is allowed to do.
+struct ApiAccess<'a> {
+    token: &'a str,
+    /// Whether it may also give the review's verdict.
+    finish: bool,
+}
+
+impl ServeSession {
+    /// The API's write access, or `None` while its writes are disabled. The
+    /// catalog reports it and the write gate enforces it, from this alone.
+    fn api_access(&self) -> Option<ApiAccess<'_>> {
+        self.api_token.as_deref().map(|token| ApiAccess {
+            token,
+            finish: self.blocking_review,
+        })
+    }
+}
+
 #[derive(Debug)]
 struct AssetCache {
     signature: Vec<SystemTime>,

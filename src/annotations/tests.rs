@@ -7,6 +7,7 @@ fn add(body: &str) -> Operation {
         body: body.to_owned(),
         selection: None,
         revision: None,
+        guard: AddGuard::default(),
     }
 }
 
@@ -18,6 +19,7 @@ fn selection(source: &str, quote: &str, range: Range<usize>, body: &str) -> Oper
             range,
         }),
         revision: Some(source_revision(source)),
+        guard: AddGuard::default(),
     }
 }
 
@@ -1181,6 +1183,7 @@ fn a_source_that_changes_between_the_check_and_the_lock_is_rejected_alike() {
                 range: 8..14,
             }),
             revision: Some(revision),
+            guard: AddGuard::default(),
         };
         // Stale when the add starts: refused before anything is created.
         let before = mutate(&location, add(source_revision(changed))).unwrap_err();
@@ -1240,6 +1243,7 @@ fn a_stale_whole_document_add_builds_no_projection() {
         body: "Note".to_owned(),
         selection: None,
         revision: Some(source_revision("something else")),
+        guard: AddGuard::default(),
     };
     assert!(matches!(
         cache.mutate(&location, stale),
@@ -1271,6 +1275,7 @@ fn a_stale_add_is_refused_before_anything_is_created() {
                     range: 8..14,
                 }),
                 revision: Some(source_revision("stale")),
+                guard: AddGuard::default(),
             },
         )
     });

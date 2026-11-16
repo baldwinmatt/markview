@@ -133,7 +133,7 @@ token. All POST requests use `Authorization: Bearer <token>` and
 
 | Operation | Form fields |
 | --- | --- |
-| Add a document comment | `op=add`, `doc`, `body`, `source_revision` from the document response |
+| Add a document comment | `op=add`, `doc`, `body`, `source_revision` from the document response; optionally `client_id` and `store_revision` |
 | Add an anchored comment | The same fields plus `quote`, `start`, `end` |
 | Edit a comment | `op=edit`, `doc`, `id`, `body`, `store_revision` from the annotations response |
 | Resolve or reopen a comment | `op=status`, `doc`, `id`, `status=resolved` or `status=open`, `store_revision` |
@@ -161,8 +161,14 @@ after saving comments, then verify that each document still has the
 `source_revision` you reviewed before submitting. An HTTP `409` means
 the revision is stale, a store conflict needs attention, or the verdict
 has already been accepted. Re-fetch the relevant state before resubmitting.
-If an add request loses its response, check the annotations before retrying
-so the same finding is only added once.
+An add can lose its response, and the first attempt may still be applied.
+To retry safely, send `client_id` (1-64 letters, digits or `. _ : -`) with the
+add. The server saves it with the comment and returns it as `client_id` in the
+annotations. A repeated `client_id` changes nothing and answers `200` with the
+current annotations, even if the document or store changed since the first
+attempt, so the same finding is only added once. An add may also send
+`store_revision` to be refused with `409` when the store changed since that
+revision.
 
 ### Review comments
 

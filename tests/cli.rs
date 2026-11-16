@@ -4246,3 +4246,134 @@ fn browser_endpoint_validates_a_lone_source_revision_on_whole_document_comments(
     // The browser UI may still send no revision at all.
     assert!(post_annotation(port, &token, "op=add&doc=%2F&body=Bare").starts_with("HTTP/1.1 200"));
 }
+
+fn post_form(port: u16, path: &str, header: &str, form: &str) -> String {
+    raw_http(port, &format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost:{port}\r\n{header}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{form}",
+        form.len()
+    ))
+}
+
+fn json_field(response: &str, key: &str) -> String {
+    let body = response
+        .split_once("\r\n\r\n")
+        .map_or(response, |(_, body)| body);
+    let rest = body
+        .split(&format!("\"{key}\":"))
+        .nth(1)
+        .unwrap_or_else(|| panic!("no {key} in {response}"));
+    match rest.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap().to_owned(),
+        None => rest.split([',', '}']).next().unwrap().to_owned(),
+    }
+}
+
+#[test]
+fn an_add_with_a_client_id_is_applied_once_however_often_it_is_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "# Home\n\ntext\n";
+    std::fs::write(dir.path().join("README.md"), source).unwrap();
+    let token = "c3".repeat(32);
+    let server = start_api_server(dir.path(), &token, false);
+    let port = server.port;
+    let bearer = format!("Authorization: Bearer {token}");
+    let api = "/_markview/api/v1/annotations";
+    let revision = markview::annotations::source_revision(source);
+    let form =
+        format!("op=add&doc=%2FREADME.md&body=Once&source_revision={revision}&client_id=try-1");
+    let first = post_form(port, api, &bearer, &form);
+    assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+    // The source changed since: the retry is still the answer to the first.
+    std::fs::write(dir.path().join("README.md"), "# Home\n\nedited\n").unwrap();
+    let second = post_form(port, api, &bearer, &form);
+    assert!(second.starts_with("HTTP/1.1 200"), "{second}");
+    assert_eq!(json_field(&first, "id"), json_field(&second, "id"));
+    assert_eq!(json_field(&second, "client_id"), "try-1");
+    let store =
+        std::fs::read_to_string(dir.path().join(".markview/annotations/README.md")).unwrap();
+    assert_eq!(store.matches("Once").count(), 1, "{store}");
+    // Another key is another comment.
+    let other = form.replace("try-1", "try-2");
+    let revision = markview::annotations::source_revision("# Home\n\nedited\n");
+    let other = other.replace(&markview::annotations::source_revision(source), &revision);
+    assert!(post_form(port, api, &bearer, &other).starts_with("HTTP/1.1 200"));
+    let listed = http_get_local(port, &format!("{api}?doc=%2FREADME.md"));
+    assert_eq!(listed.matches("\"body\":\"Once\"").count(), 2, "{listed}");
+    let bad = form.replace("try-1", "bad%20key");
+    assert!(post_form(port, api, &bearer, &bad).starts_with("HTTP/1.1 400"));
+}
+
+#[test]
+fn an_add_can_be_conditional_on_the_store_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "# Home\n\ntext\n";
+    std::fs::write(dir.path().join("README.md"), source).unwrap();
+    let token = "d4".repeat(32);
+    let server = start_api_server(dir.path(), &token, false);
+    let port = server.port;
+    let bearer = format!("Authorization: Bearer {token}");
+    let api = "/_markview/api/v1/annotations";
+    let revision = markview::annotations::source_revision(source);
+    let listed = http_get_local(port, &format!("{api}?doc=%2FREADME.md"));
+    let empty_store = json_field(&listed, "store_revision");
+    let add = |body: &str, store: &str| {
+        post_form(
+            port,
+            api,
+            &bearer,
+            &format!("op=add&doc=%2FREADME.md&body={body}&source_revision={revision}&store_revision={store}"),
+        )
+    };
+    let first = add("First", &empty_store);
+    assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+    let stale = add("Second", &empty_store);
+    assert!(stale.starts_with("HTTP/1.1 409"), "{stale}");
+    let current = add("Second", &json_field(&first, "store_revision"));
+    assert!(current.starts_with("HTTP/1.1 200"), "{current}");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_add_whose_client_disconnected_is_not_doubled_by_the_retry() {
+    use std::os::unix::io::AsRawFd;
+    let dir = tempfile::tempdir().unwrap();
+    let source = "# Home\n\ntext\n";
+    std::fs::write(dir.path().join("README.md"), source).unwrap();
+    let token = "e5".repeat(32);
+    let server = start_api_server(dir.path(), &token, false);
+    let port = server.port;
+    let store = dir.path().join(".markview/annotations");
+    std::fs::create_dir_all(&store).unwrap();
+    let lock = std::fs::File::create(store.join("README.md.markview-lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let revision = markview::annotations::source_revision(source);
+    let form =
+        format!("op=add&doc=%2FREADME.md&body=Timed+out&source_revision={revision}&client_id=t-1");
+    {
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            client,
+            "POST /_markview/api/v1/annotations HTTP/1.1\r\nHost: localhost:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{form}",
+            form.len()
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+    } // the client gives up while the write waits for the store lock
+    let retry = std::thread::spawn({
+        let (token, form) = (token.clone(), form.clone());
+        move || {
+            post_form(
+                port,
+                "/_markview/api/v1/annotations",
+                &format!("Authorization: Bearer {token}"),
+                &form,
+            )
+        }
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    let retry = retry.join().unwrap();
+    assert!(retry.starts_with("HTTP/1.1 200"), "{retry}");
+    let stored = std::fs::read_to_string(store.join("README.md")).unwrap();
+    assert_eq!(stored.matches("Timed out").count(), 1, "{stored}");
+}

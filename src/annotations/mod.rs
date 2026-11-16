@@ -121,6 +121,8 @@ pub struct ResolvedAnnotation {
     pub section: Option<String>,
     pub attached: bool,
     pub range: Option<Range<usize>>,
+    /// The key a client gave when adding it, so a retried add can find it.
+    pub client_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,6 +181,7 @@ impl Review {
                     .filter(|section| !section.is_empty()),
                 attached: record.lines.is_none() || range.is_some(),
                 range,
+                client_id: record.metadata.get(CLIENT_ID).cloned(),
             })
             .collect();
         // Open before resolved. Within each: text comments in document
@@ -219,8 +222,8 @@ impl Review {
             let range = record.range.as_ref().map_or("null".to_owned(), |range| {
                 format!("[{},{}]", range.start, range.end)
             });
-            let _ = write!(output, "{{\"id\":\"a{}\",\"status\":\"{}\",\"body\":{},\"quote\":{},\"lines\":{lines},\"section\":{},\"attached\":{},\"range\":{range}}}",
-                record.id, record.status.label(), json_string(&record.body), json_optional(record.quote.as_deref()), json_optional(record.section.as_deref()), record.attached);
+            let _ = write!(output, "{{\"id\":\"a{}\",\"status\":\"{}\",\"body\":{},\"quote\":{},\"lines\":{lines},\"section\":{},\"attached\":{},\"range\":{range},\"client_id\":{}}}",
+                record.id, record.status.label(), json_string(&record.body), json_optional(record.quote.as_deref()), json_optional(record.section.as_deref()), record.attached, json_optional(record.client_id.as_deref()));
         }
         output.push_str("]}");
         output
@@ -488,6 +491,19 @@ pub struct Selection {
     range: Range<usize>,
 }
 
+/// The metadata key that holds the idempotency key of an add.
+const CLIENT_ID: &str = "client_id";
+
+/// What an add may be conditional on, besides its source revision.
+#[derive(Debug, Default)]
+pub struct AddGuard {
+    /// Refuse the add (a conflict) if the store changed since this revision.
+    pub store_revision: Option<String>,
+    /// Make the add idempotent: if an annotation carries this key already,
+    /// the add changes nothing and the current review is the answer.
+    pub client_id: Option<String>,
+}
+
 /// The source revision a request was made against: the one slot both kinds
 /// of add use. A text add always names it; a whole-document add may leave
 /// it out unless the caller's `RevisionPolicy` requires it.
@@ -497,6 +513,7 @@ pub enum Operation {
         body: String,
         selection: Option<Selection>,
         revision: Option<String>,
+        guard: AddGuard,
     },
     Change {
         id: u64,
@@ -635,10 +652,30 @@ impl Request {
                 if policy == RevisionPolicy::Required && revision.is_none() {
                     return Err(Error::Invalid("source revision required"));
                 }
+                let store_revision = fields.remove("store_revision");
+                if store_revision.as_deref() == Some("") {
+                    return Err(Error::Invalid("store revision must not be empty"));
+                }
+                let client_id = fields
+                    .remove("client_id")
+                    .map(|id| {
+                        let valid = (1..=64).contains(&id.len())
+                            && id.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric() || b"._:-".contains(&byte)
+                            });
+                        valid.then_some(id).ok_or(Error::Invalid(
+                            "client id must be 1-64 letters, digits or . _ : -",
+                        ))
+                    })
+                    .transpose()?;
                 Operation::Add {
                     body,
                     selection,
                     revision,
+                    guard: AddGuard {
+                        store_revision,
+                        client_id,
+                    },
                 }
             }
             Some(op @ ("edit" | "status" | "delete")) => {
@@ -770,9 +807,14 @@ fn mutate_with(
 ) -> Result<(Arc<TextProjection>, Review), Error> {
     // Reject invalid or stale adds before creating directories, then validate
     // again against the source read under the lock.
+    // A retried add (it names a client id) may be stale against the source
+    // because its first attempt was applied: the store decides, under the lock.
     if let Operation::Add {
         selection,
         revision,
+        guard: AddGuard {
+            client_id: None, ..
+        },
         ..
     } = &operation
     {
@@ -826,7 +868,25 @@ fn mutate_locked(
             body,
             selection,
             revision,
+            guard,
         } => {
+            // A repeated key is answered before anything else is checked:
+            // the add it repeats was applied, whatever changed since.
+            if let Some(client_id) = &guard.client_id {
+                if store
+                    .annotations
+                    .iter()
+                    .any(|record| record.metadata.get(CLIENT_ID) == Some(client_id))
+                {
+                    let review = Review::from_snapshot(location, bytes.as_deref(), &projection)?;
+                    return Ok((projection, review));
+                }
+            }
+            if let Some(expected) = &guard.store_revision {
+                if *expected != store_revision(&location.path, bytes.as_deref()) {
+                    return Err(Error::Conflict("annotation store changed on disk"));
+                }
+            }
             validate_add(&projection, selection.as_ref(), revision.as_deref())?;
             let id = store
                 .annotations
@@ -838,6 +898,9 @@ fn mutate_locked(
                 .ok_or(Error::Invalid("annotation IDs exhausted"))?;
             let mut record = Annotation::new(id, body);
             record.metadata.insert("created".to_owned(), utc_now());
+            if let Some(client_id) = guard.client_id {
+                record.metadata.insert(CLIENT_ID.to_owned(), client_id);
+            }
             if let Some(selection) = selection {
                 record.quote = Some(validate_selection(&projection, &selection)?);
                 let (before, after) = projection.context(selection.range.clone());

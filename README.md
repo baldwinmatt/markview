@@ -61,7 +61,7 @@ markview --serve --open --daemon docs/       # background server, browser opened
 | `--serve` | Serve the given files, or a directory's Markdown files, over HTTP with navigation between documents. |
 | `--port <PORT>` | Listen on `PORT` (default 7878). `--port 0` picks any free port and prints it, which suits scripts and agents running several servers. Port values use ASCII decimal digits without a sign or leading zeros. The old `--serve 8080 notes.md` positional form is rejected. |
 | `--recurse` | Discover Markdown files at any depth. Takes a single directory; hidden and symlinked directories are skipped. |
-| `--annotate` | Enable adding and changing review comments in the browser. |
+| `--annotate` | Enable adding and changing review comments in the browser. With `MARKVIEW_API_TOKEN` set, agents can also write through the [Agent HTTP API](#agent-http-api). |
 | `--open` | Open the default browser once the server is ready. |
 | `--daemon` | Run in the background and return after the child is ready, printing the PID and URL. Logs go to `.markview-serve-<PORT>.log` in the current directory. |
 

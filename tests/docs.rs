@@ -351,3 +351,14 @@ fn the_credential_model_and_its_threat_model_are_stated() {
         assert!(readme.contains(claim), "README Agent HTTP API: {claim}");
     }
 }
+
+#[test]
+fn the_option_table_points_agents_at_the_api() {
+    let readme = fs::read_to_string("README.md").expect("read README");
+    let row = readme
+        .lines()
+        .find(|line| line.starts_with("| `--annotate` |"))
+        .expect("the --annotate row");
+    assert!(row.contains("MARKVIEW_API_TOKEN"), "{row}");
+    assert!(row.contains("Agent HTTP API"), "{row}");
+}

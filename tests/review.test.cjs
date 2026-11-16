@@ -140,3 +140,115 @@ test('the text points are reused until the document or its revision changes', as
   await page.settle();
   assert.equal(walks, 2);
 });
+
+// The store after the endpoint applied `form`, for tests that follow a write.
+function applied(form, annotations) {
+  const op = form.get('op');
+  if (op === 'delete') return annotations.filter(entry => entry.id !== form.get('id'));
+  if (op === 'edit') return annotations.map(entry => (entry.id === form.get('id') ? {...entry, body: form.get('body')} : entry));
+  return annotations;
+}
+
+async function pageWithComments() {
+  let annotations = [comment('a1'), comment('a2')];
+  let store = 1;
+  const posts = [];
+  const page = await servePage((method, form) => {
+    if (method === 'POST') {
+      posts.push(Object.fromEntries(form));
+      annotations = applied(form, annotations);
+      store += 1;
+    }
+    return response(200, review('store-' + store, annotations));
+  });
+  page.posts = posts;
+  page.card = id => page.panel.querySelectorAll('.markview-review-card').find(card => card.dataset.annotation === id);
+  page.cardButton = (id, label) => page.card(id).querySelectorAll('button').find(button => button.textContent === label && button.visible);
+  return page;
+}
+
+test('Delete asks for confirmation in the card and sends nothing until confirmed', async () => {
+  const page = await pageWithComments();
+  page.cardButton('a1', 'Delete').click();
+  await page.settle();
+  // No native dialog: WKWebView without a UI delegate answers `false`.
+  assert.equal(page.confirmCalls, 0);
+  assert.deepEqual(page.posts, []);
+  const prompt = page.card('a1').querySelector('.markview-review-confirm');
+  assert.equal(prompt.visible, true);
+  assert.match(prompt.textContent, /Delete this comment\?/);
+  assert.equal(page.card('a2').querySelector('.markview-review-confirm'), null);
+  // The destructive choice takes focus, as the native dialog's default did.
+  assert.equal(page.document.activeElement, page.cardButton('a1', 'Confirm'));
+
+  page.cardButton('a1', 'Confirm').click();
+  await page.settle();
+  assert.deepEqual(page.posts, [{op: 'delete', id: 'a1', store_revision: 'store-1', doc: '/doc.md'}]);
+  assert.equal(page.card('a1'), undefined);
+  assert.equal(page.confirmCalls, 0);
+});
+
+test('cancelling a delete sends nothing and restores the card actions', async () => {
+  const page = await pageWithComments();
+  page.cardButton('a1', 'Delete').click();
+  page.cardButton('a1', 'Cancel').click();
+  await page.settle();
+  assert.deepEqual(page.posts, []);
+  assert.equal(page.card('a1').querySelector('.markview-review-confirm'), null);
+  assert.equal(page.document.activeElement, page.cardButton('a1', 'Delete'));
+
+  // Escape is the keyboard way out of the prompt.
+  page.cardButton('a1', 'Delete').click();
+  const escape = {type: 'keydown', key: 'Escape'};
+  page.cardButton('a1', 'Confirm').dispatchEvent(escape);
+  await page.settle();
+  assert.equal(escape.defaultPrevented, true);
+  assert.deepEqual(page.posts, []);
+  assert.equal(page.card('a1').querySelector('.markview-review-confirm'), null);
+  assert.equal(page.document.activeElement, page.cardButton('a1', 'Delete'));
+  assert.equal(page.confirmCalls, 0);
+});
+
+test('a delete prompt survives a refresh of the list', async () => {
+  const page = await pageWithComments();
+  page.cardButton('a2', 'Delete').click();
+  page.window.markviewReviewRefresh();
+  await page.settle();
+  assert.equal(page.card('a2').querySelector('.markview-review-confirm').visible, true);
+  page.cardButton('a2', 'Confirm').click();
+  await page.settle();
+  assert.equal(page.posts.length, 1);
+  assert.equal(page.posts[0].id, 'a2');
+});
+
+test('replacing a draft asks in the composer instead of a native dialog', async () => {
+  const page = await pageWithComments();
+  page.button('Comment on document').click();
+  const body = page.find('textarea');
+  body.value = 'Unsaved thought';
+  body.dispatchEvent({type: 'input'});
+
+  page.cardButton('a1', 'Edit').click();
+  await page.settle();
+  assert.equal(page.confirmCalls, 0);
+  const prompt = page.find('form').querySelector('.markview-review-confirm');
+  assert.equal(prompt.visible, true);
+  assert.match(prompt.textContent, /Discard the current comment draft\?/);
+  assert.equal(body.value, 'Unsaved thought');
+
+  // Keeping the draft changes nothing and returns to it.
+  page.button('Keep draft').click();
+  assert.equal(page.find('form').querySelector('.markview-review-confirm'), null);
+  assert.equal(body.value, 'Unsaved thought');
+  assert.equal(page.document.activeElement, body);
+
+  // Discarding it starts the edit that was asked for.
+  page.cardButton('a1', 'Edit').click();
+  page.button('Discard draft').click();
+  assert.equal(body.value, 'Body of a1');
+  assert.equal(page.find('form').querySelector('.markview-review-confirm'), null);
+  page.find('form').requestSubmit();
+  await page.settle();
+  assert.deepEqual(page.posts.map(post => post.op), ['edit']);
+  assert.equal(page.confirmCalls, 0);
+});

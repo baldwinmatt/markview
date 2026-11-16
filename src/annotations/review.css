@@ -16,7 +16,7 @@ body > .markview-review {
   border: 1px solid var(--rule, #8886);
   border-radius: 8px;
 }
-.markview-review-toolbar, .markview-review-actions {
+.markview-review-toolbar, .markview-review-actions, .markview-review-confirm {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -47,6 +47,8 @@ body > .markview-review {
   overflow-wrap: anywhere;
 }
 .markview-review-body { white-space: pre-wrap; margin: 0.4rem 0; }
+.markview-review-confirm { margin-top: 0.4rem; }
+.markview-review-confirm span { font-weight: 600; }
 .markview-review-message { margin: 0.45rem 0; }
 .markview-review-composer textarea {
   display: block;

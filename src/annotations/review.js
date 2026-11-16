@@ -82,6 +82,23 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
     node.addEventListener('click', action);
     return node;
   }
+  // The in-page stand-in for window.confirm: a question and two buttons. The
+  // GUI's WKWebView has no dialog delegate, so a native dialog there answers
+  // "no" without ever being shown.
+  function confirmation(question, confirmLabel, cancelLabel, onConfirm, onCancel) {
+    const prompt = element('div', 'markview-review-confirm');
+    prompt.setAttribute('role', 'group');
+    prompt.setAttribute('aria-label', question);
+    const confirm = button(confirmLabel, onConfirm);
+    prompt.append(element('span', '', question), confirm, button(cancelLabel, onCancel));
+    prompt.addEventListener('keydown', event => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation();
+      onCancel();
+    });
+    return {prompt, confirm};
+  }
   const panel = element('section', 'markview-review');
   panel.setAttribute('aria-label', 'Annotations');
   const toolbar = element('header', 'markview-review-toolbar');
@@ -137,6 +154,14 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
   let selected = null;
   let ranges = [];
   let lastHit = null;
+  // The card whose Delete awaits confirmation, and the control to focus once
+  // the cards are rebuilt: {id, label}.
+  let deleting = null;
+  let focusNext = null;
+  // The draft the reader asked to start while another one was open, and the
+  // prompt that asks whether to discard the open one for it.
+  let replacing = null;
+  let replacingPrompt = null;
   // The text points of `root`, kept until the document changes. Walking the
   // whole document on every `selectionchange` makes dragging a selection slow.
   let points = null;
@@ -184,11 +209,17 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
     message.textContent = text;
     message.hidden = !text;
   }
-  function startDraft(fields) {
+  function startDraft(fields, discard = false) {
     if (!writable || (fields.op === 'add' && !canAdd) || pending.has(key)) return;
     const previous = getDraft();
     const reuseBody = previous?.op === 'add' && fields.op === 'add';
-    if (previous && !reuseBody && !window.confirm('Discard the current comment draft?')) return;
+    if (previous && !reuseBody && !discard) {
+      replacing = fields;
+      renderComposer();
+      reveal();
+      return;
+    }
+    replacing = null;
     keepDraft({body: reuseBody ? previous.body : '', ...fields});
     setMessage('');
     renderComposer();
@@ -212,6 +243,22 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
     const draft = getDraft();
     composer.hidden = !writable || !draft;
     refreshMessage();
+    if (!draft || !writable) replacing = null;
+    if (!replacing && replacingPrompt) {
+      replacingPrompt.remove();
+      replacingPrompt = null;
+    } else if (replacing && !replacingPrompt) {
+      const {prompt, confirm} = confirmation('Discard the current comment draft?', 'Discard draft', 'Keep draft',
+        () => startDraft(replacing, true),
+        () => {
+          replacing = null;
+          renderComposer();
+          body.focus();
+        });
+      replacingPrompt = prompt;
+      composer.append(prompt);
+      confirm.focus();
+    }
     if (!draft || !writable) return;
     const changedSource = draft.source_revision && draft.source_revision !== revision;
     const changedStore = draft.op === 'edit' && review && draft.store_revision !== review.store_revision;
@@ -309,6 +356,7 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
     resolvedLabel.hidden = !entries.some(entry => entry.status === 'resolved');
     count.textContent = openCount + (openCount === 1 ? ' open comment' : ' open comments');
     const focused = document.activeElement?.closest('.markview-review-card')?.dataset.annotation;
+    if (!writable || !entries.some(entry => entry.id === deleting)) deleting = null;
     cards.replaceChildren();
     for (const entry of entries) {
       if (entry.status === 'resolved' && !resolvedToggle.checked) continue;
@@ -326,20 +374,42 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
       };
       card.addEventListener('click', event => { if (!event.target.closest('button')) navigate(); });
       card.addEventListener('keydown', event => { if (event.target === card && event.key === 'Enter') navigate(); });
-      if (writable) {
+      const controls = {};
+      if (writable && deleting === entry.id) {
+        const fields = {id: entry.id, store_revision: review.store_revision};
+        const {prompt, confirm} = confirmation('Delete this comment?', 'Confirm', 'Cancel',
+          () => {
+            deleting = null;
+            send({op: 'delete', ...fields});
+          },
+          () => {
+            deleting = null;
+            focusNext = {id: entry.id, label: 'Delete'};
+            render();
+          });
+        controls.Confirm = confirm;
+        card.append(prompt);
+      } else if (writable) {
         const cardActions = element('div', 'markview-review-actions');
         const fields = {id: entry.id, store_revision: review.store_revision};
         const nextStatus = entry.status === 'open' ? 'resolved' : 'open';
+        controls.Delete = button('Delete', () => {
+          deleting = entry.id;
+          focusNext = {id: entry.id, label: 'Confirm'};
+          render();
+        });
         cardActions.append(
           button('Edit', () => startDraft({op: 'edit', ...fields, body: entry.body})),
           button(entry.status === 'open' ? 'Resolve' : 'Reopen', () => send({op: 'status', ...fields, status: nextStatus})),
-          button('Delete', () => { if (window.confirm('Delete this comment?')) send({op: 'delete', ...fields}); })
+          controls.Delete
         );
         card.append(cardActions);
       }
       cards.append(card);
-      if (focused === entry.id) card.focus({preventScroll: true});
+      if (focusNext?.id === entry.id && controls[focusNext.label]) controls[focusNext.label].focus();
+      else if (focused === entry.id) card.focus({preventScroll: true});
     }
+    focusNext = null;
     renderComposer();
     repaint();
   }
@@ -385,6 +455,7 @@ function createMarkviewReview(root, mount, submit, reveal = () => {}) {
         review = null;
         points = null;
       }
+      if (key !== documentKey) deleting = replacing = null;
       key = documentKey;
       revision = nextRevision;
       writable = write;

@@ -76,3 +76,58 @@ fn review_comments_are_documented_for_people_and_agents() {
         assert!(skill.contains(mistake), "{mistake}");
     }
 }
+
+#[test]
+fn review_workflow_is_documented_for_reviewers_and_agents() {
+    let readme = fs::read_to_string("README.md").expect("read README");
+    // The single-key shortcuts, their toggle and the quick labels.
+    for row in [
+        "| `j` / `k` | Focus the next or previous visible annotation, wrapping at the ends. |",
+        "| `c` | Comment on the selection or, with no selection, on the document. |",
+        "| `e` | Edit the focused comment. |",
+        "| `r` | Resolve or reopen the focused comment. |",
+        "| `Escape` | Cancel the composer or clear the focused annotation. |",
+    ] {
+        assert_eq!(readme.matches(row).count(), 1, "{row}");
+    }
+    assert!(readme.contains("**Single-key shortcuts** toggle"));
+    for label in [
+        "**Question**",
+        "**Needs a test**",
+        "**Out of scope**",
+        "**Nit**",
+    ] {
+        assert!(readme.contains(label), "{label}");
+    }
+    for flag in ["`--review`", "`--gate`", "`--no-open`"] {
+        assert!(readme.contains(flag), "{flag}");
+    }
+
+    // An agent is told how to wait for a verdict and where each part of the
+    // result arrives.
+    let skill = fs::read_to_string("skills/markview/SKILL.md").expect("read skill");
+    let verdict = skill
+        .split("## Request a human verdict\n")
+        .nth(1)
+        .expect("the skill explains --review")
+        .split("\n## ")
+        .next()
+        .unwrap();
+    for term in [
+        "`markview --review [--recurse] <FILE>... | <DIR>`",
+        "foreground process and keep it alive",
+        "Read stderr\nfor the browser URL",
+        "Capture stdout through completion",
+        "`--gate`",
+        "`--no-open --port <PORT>`",
+        "recover saved comments with `markview --annotations`",
+        "ended without a verdict",
+    ] {
+        assert!(verdict.contains(term), "{term}");
+    }
+
+    let architecture = fs::read_to_string("ARCHITECTURE.md").expect("read ARCHITECTURE.md");
+    assert!(architecture.contains("--review"));
+    let roadmap = fs::read_to_string("ROADMAP.md").expect("read ROADMAP.md");
+    assert!(roadmap.contains("[Review workflow specification](REVIEW_WORKFLOW_SPEC.md)"));
+}

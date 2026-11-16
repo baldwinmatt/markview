@@ -47,3 +47,28 @@ fn review_script_tests_run_wherever_the_editor_tests_do() {
     }
     assert!(fs::metadata("tests/review.test.cjs").is_ok());
 }
+
+#[test]
+fn browser_harness_runs_in_ci_and_from_the_makefile() {
+    // tests/review.browser.js is the only cover for focus, layout and the
+    // nonce policy in a real browser. A plain `cargo test` skips it when no
+    // Chrome is installed; CI and `make test-browser` must not.
+    let run = "cargo test --bin markview review_browser_harness -- --nocapture";
+    let workflow = fs::read_to_string(".github/workflows/ci.yml").expect("read CI workflow");
+    let step = workflow
+        .split("\n      - ")
+        .find(|step| step.contains(run))
+        .expect("a CI step that runs the browser harness");
+    assert!(step.contains("MARKVIEW_REQUIRE_BROWSER: 1"), "{step}");
+    let makefile = fs::read_to_string("Makefile").expect("read Makefile");
+    assert!(makefile.contains(&format!(
+        "test-browser:\n\tMARKVIEW_REQUIRE_BROWSER=1 {run}\n"
+    )));
+    assert!(makefile.contains(".PHONY: test test-browser package-macos"));
+    // The test those commands select exists, and so does what it runs.
+    let tests = fs::read_to_string("src/serve_annotations.rs").expect("read serve tests");
+    assert!(tests.contains("fn review_browser_harness_passes_in_headless_chrome()"));
+    assert!(fs::metadata("tests/review.browser.js").is_ok());
+    let architecture = fs::read_to_string("ARCHITECTURE.md").expect("read ARCHITECTURE.md");
+    assert!(architecture.contains("make test-browser"));
+}

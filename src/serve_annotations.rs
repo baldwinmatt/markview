@@ -1085,8 +1085,8 @@ mod tests {
         assert!(!token_matches(Some("guessed"), &token));
     }
 
-    #[test]
-    fn server_renders_normalized_safe_destinations_and_nonce_scripts() {
+    /// The review fixture as a `--review` page with its token and nonce.
+    fn review_page() -> (String, String) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("review.md");
         let target = dir.path().join("target.md");
@@ -1105,6 +1105,12 @@ mod tests {
             }),
         )
         .unwrap();
+        (html, nonce)
+    }
+
+    #[test]
+    fn server_renders_normalized_safe_destinations_and_nonce_scripts() {
+        let (html, nonce) = review_page();
         assert_eq!(
             html.matches(&format!("<script nonce=\"{nonce}\">")).count(),
             2
@@ -1127,12 +1133,23 @@ mod tests {
             r#"<script nonce="{nonce}" src="/_markview/review.js?v={}"></script>"#,
             static_version()
         )));
+        // For a look at the harness in a browser window.
         if let Some(path) = std::env::var_os("MARKVIEW_REVIEW_BROWSER_FIXTURE") {
-            let policy = content_security_policy(&nonce);
-            let projection = markview::annotations::TextProjection::new(SOURCE);
-            let expected = annotations::json_string(&projection.text());
-            let setup = format!(
-                r#"<meta http-equiv="Content-Security-Policy" content="{policy}">
+            std::fs::write(path, browser_fixture()).unwrap();
+        }
+    }
+
+    /// One self-contained page that runs `tests/review.browser.js` against
+    /// the review fixture: the served page with its scripts inlined under
+    /// the real policy, a stubbed network, and the harness appended. The
+    /// harness writes `PASS — ...` or `FAIL — <why>` into an `<output>`.
+    fn browser_fixture() -> String {
+        let (html, nonce) = review_page();
+        let policy = content_security_policy(&nonce);
+        let projection = markview::annotations::TextProjection::new(SOURCE);
+        let expected = annotations::json_string(&projection.text());
+        let setup = format!(
+            r#"<meta http-equiv="Content-Security-Policy" content="{policy}">
 <script nonce="{nonce}">const expectedText = {expected};
 window.fixtureFetch = () => new Promise(() => {{}});
 window.fetch = (...args) => window.fixtureFetch(...args);
@@ -1142,32 +1159,134 @@ window.EventSource = class extends EventTarget {{
 }};
 </script>
 <script>window.untrustedScriptRan = true;</script>"#
+        );
+        let mut html = html.replacen("<head>", &format!("<head>{setup}"), 1);
+        for (name, source) in [
+            ("copy.js", annotations::COPY_SCRIPT),
+            ("review.js", annotations::REVIEW_SCRIPT),
+            ("verdict.js", VERDICT_SCRIPT),
+        ] {
+            let version = if name == "copy.js" {
+                copy_version()
+            } else {
+                static_version()
+            };
+            let link =
+                format!(r#"<script nonce="{nonce}" src="/_markview/{name}?v={version}"></script>"#);
+            assert!(html.contains(&link), "{name} is not linked");
+            html = html.replace(
+                &link,
+                &format!(r#"<script nonce="{nonce}">{source}</script>"#),
             );
-            let mut html = html.replacen("<head>", &format!("<head>{setup}"), 1);
-            for (name, source) in [
-                ("copy.js", annotations::COPY_SCRIPT),
-                ("review.js", annotations::REVIEW_SCRIPT),
-                ("verdict.js", VERDICT_SCRIPT),
-            ] {
-                let version = if name == "copy.js" {
-                    copy_version()
-                } else {
-                    static_version()
-                };
-                let link = format!(
-                    r#"<script nonce="{nonce}" src="/_markview/{name}?v={version}"></script>"#
-                );
-                html = html.replace(
-                    &link,
-                    &format!(r#"<script nonce="{nonce}">{source}</script>"#),
-                );
-            }
-            let harness = include_str!("../tests/review.browser.js");
-            let html = html.replace(
-                "</body>",
-                &format!(r#"<script nonce="{nonce}">{harness}</script></body>"#),
-            );
-            std::fs::write(path, html).unwrap();
         }
+        // The stylesheets too, so the page is laid out as a served one is.
+        for (name, version, source) in [
+            ("review.css", static_version(), annotations::REVIEW_STYLE),
+            ("copy.css", copy_version(), annotations::COPY_STYLE),
+        ] {
+            let link = format!(r#"<link rel="stylesheet" href="/_markview/{name}?v={version}">"#);
+            assert!(html.contains(&link), "{name} is not linked");
+            html = html.replace(
+                &link,
+                &format!(r#"<style data-markview-style="{name}">{source}</style>"#),
+            );
+        }
+        let harness = include_str!("../tests/review.browser.js");
+        html.replace(
+            "</body>",
+            &format!(r#"<script nonce="{nonce}">{harness}</script></body>"#),
+        )
+    }
+
+    /// The Chrome or Chromium to run the harness in: `MARKVIEW_BROWSER`, or
+    /// the usual install locations and names.
+    fn headless_browser() -> Option<PathBuf> {
+        if let Some(path) = std::env::var_os("MARKVIEW_BROWSER") {
+            return Some(path.into());
+        }
+        let installed = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ];
+        let named = [
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+        ];
+        let on_path = std::env::var_os("PATH").into_iter().flat_map(|path| {
+            std::env::split_paths(&path)
+                .flat_map(|dir| named.map(|name| dir.join(name)))
+                .collect::<Vec<_>>()
+        });
+        installed
+            .into_iter()
+            .map(PathBuf::from)
+            .chain(on_path)
+            .find(|path| path.is_file())
+    }
+
+    /// Runs `tests/review.browser.js` in a real, headless browser: focus,
+    /// layout, selections, the nonce policy and `CSS.highlights` are only
+    /// what they are in one. Skipped, with the reason, when no Chrome or
+    /// Chromium is installed; `MARKVIEW_REQUIRE_BROWSER` makes that a failure.
+    #[test]
+    fn review_browser_harness_passes_in_headless_chrome() {
+        let Some(browser) = headless_browser() else {
+            assert!(
+                std::env::var_os("MARKVIEW_REQUIRE_BROWSER").is_none(),
+                "MARKVIEW_REQUIRE_BROWSER is set, but no Chrome or Chromium was found"
+            );
+            eprintln!(
+                "skipped: no Chrome or Chromium found for tests/review.browser.js; set MARKVIEW_BROWSER to one"
+            );
+            return;
+        };
+        // A new profile each time: the page remembers a preference per origin.
+        let dir = tempfile::tempdir().unwrap();
+        let page = dir.path().join("harness.html");
+        std::fs::write(&page, browser_fixture()).unwrap();
+        let mut command = std::process::Command::new(&browser);
+        command
+            .arg("--headless=new")
+            .args([
+                "--disable-gpu",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ])
+            .arg(format!(
+                "--user-data-dir={}",
+                dir.path().join("profile").display()
+            ))
+            // The harness waits on timers. Virtual time runs them at once.
+            .args(["--virtual-time-budget=20000", "--dump-dom"])
+            .arg(format!("file://{}", page.display()))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        if std::env::var_os("CI").is_some() {
+            // Hosted runners do not let Chrome build its sandbox. The only
+            // page loaded is the fixture written above.
+            command.arg("--no-sandbox");
+        }
+        let mut child = command.spawn().expect("start the browser");
+        let mut stdout = child.stdout.take().unwrap();
+        let (done, dumped) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut dom = String::new();
+            let _ = std::io::Read::read_to_string(&mut stdout, &mut dom);
+            let _ = done.send(dom);
+        });
+        let dom = dumped.recv_timeout(Duration::from_secs(120));
+        let _ = child.kill();
+        let _ = child.wait();
+        let dom = dom.expect("the browser did not finish within two minutes");
+        let verdict = dom
+            .split("<output")
+            .nth(1)
+            .and_then(|rest| rest.split_once('>'))
+            .and_then(|(_, rest)| rest.split("</output>").next())
+            .unwrap_or_else(|| panic!("the harness did not run in {}", browser.display()));
+        println!("{}: {verdict}", browser.display());
+        assert!(verdict.starts_with("PASS"), "{verdict}");
     }
 }

@@ -129,7 +129,14 @@ uses the loopback-only annotation endpoint, and the WebView adapter sends
 form-encoded IPC addressed to a tab. The GUI renders the current annotation
 state into `AppView` and sends annotation-only changes as a smaller update,
 skipping one that repeats the last. `tests/review.test.cjs` runs the script
-against the stub DOM in `tests/support/review-dom.cjs`.
+against the stub DOM in `tests/support/review-dom.cjs`. What only a real
+browser decides (focus, layout, selections, the nonce policy, highlights) is
+checked by `tests/review.browser.js`: the Rust test
+`review_browser_harness_passes_in_headless_chrome` loads the rendered review
+fixture with that harness in headless Chrome or Chromium and reads its
+verdict. `cargo test` skips it, saying so, when neither browser is installed;
+`make test-browser` and CI set `MARKVIEW_REQUIRE_BROWSER` so that a missing
+browser fails instead.
 
 A served page carries the review script only when it can use it: always with
 `--annotate`, otherwise only for a document that has a store. Any other page
@@ -192,9 +199,10 @@ The bundle includes `Info.plist`, `Markview.icns`, document registration for Mar
 4. Run `cargo test --features gui`.
 5. Run `node --test tests/editor.test.cjs`.
 6. Run `node --test tests/review.test.cjs`.
-7. Run `cargo clippy --all-targets -- -D warnings`.
-8. Run `cargo clippy --features gui --all-targets -- -D warnings`.
-9. Run `cargo build --features gui --bin markview-gui`.
-10. Run `make package-macos`.
-11. Tag the release as `v<version>` after the reviewed release commit lands.
-12. Push the tag. The release workflow builds the macOS zip and attaches it to the GitHub release.
+7. Run `make test-browser`.
+8. Run `cargo clippy --all-targets -- -D warnings`.
+9. Run `cargo clippy --features gui --all-targets -- -D warnings`.
+10. Run `cargo build --features gui --bin markview-gui`.
+11. Run `make package-macos`.
+12. Tag the release as `v<version>` after the reviewed release commit lands.
+13. Push the tag. The release workflow builds the macOS zip and attaches it to the GitHub release.

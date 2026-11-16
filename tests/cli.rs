@@ -59,6 +59,34 @@ fn renders_html_file() {
 }
 
 #[test]
+fn html_export_has_code_blocks_without_copy_or_review_controls() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("sample.md");
+    std::fs::write(
+        &file,
+        "# Code\n\n```rust\nlet a = 1;\n```\n\n    indented\n",
+    )
+    .unwrap();
+    let output = Command::cargo_bin("markview")
+        .unwrap()
+        .arg("--html")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let html = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(html.matches("<pre><code").count(), 2, "{html}");
+    // An exported file has no server and no script: nothing could copy.
+    for control in [
+        "markview-copy",
+        "markview-code-block",
+        "/_markview/",
+        "<script",
+    ] {
+        assert!(!html.contains(control), "{control}");
+    }
+}
+
+#[test]
 fn renders_html_stdin() {
     let mut cmd = Command::cargo_bin("markview").expect("binary");
     cmd.arg("--html")

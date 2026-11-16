@@ -37,6 +37,24 @@
     require(JSON.stringify(payloads) === JSON.stringify(['-old\n+new\n', '\tlet ready = true;\n', 'indented & text\n']),
       'Code text changed after adding buttons: ' + JSON.stringify(payloads));
     require(copyButtons.length === payloads.length && copyButtons.every(btn => btn.tabIndex === 0), 'Code copy buttons are missing');
+    // The stylesheet as this browser parsed it: when the button shows.
+    const copyRules = [...document.querySelector('style[data-markview-style="copy.css"]').sheet.cssRules];
+    const within = media => copyRules.filter(rule => rule instanceof CSSMediaRule && rule.conditionText === media)
+      .flatMap(rule => [...rule.cssRules]);
+    const shows = rule => rule.style.opacity === '1' && rule.style.pointerEvents === 'auto';
+    require(copyRules.some(rule => rule.selectorText?.includes('.markview-code-block:hover > .markview-copy-code') && shows(rule)),
+      'The Copy button is not shown on hover');
+    require(within('(hover: none)').some(rule => rule.selectorText === '.markview-copy-code' && shows(rule)),
+      'The Copy button is not shown on devices without hover');
+    require(within('print').some(rule => rule.selectorText.includes('.markview-copy-code') && rule.style.display === 'none'),
+      'The Copy button is printed');
+    if (!matchMedia('(hover: none)').matches) {
+      document.body.focus();
+      require(getComputedStyle(copyButtons[0]).opacity === '0', 'The Copy button is visible before hover or focus');
+      copyButtons[0].focus();
+      require(getComputedStyle(copyButtons[0]).opacity === '1', 'The Copy button stays hidden with keyboard focus');
+      copyButtons[0].blur();
+    }
     let copied = '';
     Object.defineProperty(navigator, 'clipboard', {configurable: true, value: {writeText: async text => { copied = text; }}});
     copyButtons[1].focus();
@@ -57,10 +75,16 @@
     require(extra.parentElement.querySelector('.markview-copy-code'), 'Refreshed code block lacks a copy button');
     extra.parentElement.remove();
 
-    document.querySelector('.markview-review-toolbar label:last-child input').click();
+    // The served page's own shortcuts would answer the keys pressed below.
+    // Turn them off whatever preference an earlier run left in this profile.
+    const servedShortcuts = document.querySelector('.markview-review-toolbar label:last-child input');
+    if (servedShortcuts.checked) servedShortcuts.click();
     const mount = document.createElement('aside');
     document.body.append(mount);
     let submitted = null;
+    // What the next save answers with. Without it, saving fails like a conflict.
+    let saved = null;
+    const turns = async () => { for (let turn = 0; turn < 10; turn++) await Promise.resolve(); };
     const entry = (id, range) => ({id, status: 'open', body: '<b>literal</b>\nnext', lines: [3, 3], range, attached: true});
     const revision = 'test-source';
     const data = {source_revision: revision, store_revision: 'test-store', annotations: [
@@ -70,6 +94,7 @@
     const preview = root.firstElementChild;
     const review = createMarkviewReview(root, mount, async fields => {
       submitted = Object.fromEntries(fields);
+      if (saved) return saved;
       throw new Error('Expected test conflict');
     });
     review.show('browser-fixture', revision, true, true);
@@ -110,7 +135,25 @@
     require(press('e'), 'E did not open the focused comment for editing');
     const draftField = mount.querySelector('textarea');
     require(document.activeElement === draftField && !press('j'), 'A shortcut ran in the active text field');
-    require(press('Escape') && document.activeElement === firstCard, 'Escape did not restore card focus');
+    // Escape gives focus back to what opened the draft: E stands for the
+    // card's Edit button, so that button takes it, not the card.
+    const editButton = firstCard.querySelector('button');
+    require(press('Escape') && editButton.textContent === 'Edit' && document.activeElement === editButton,
+      'Escape did not restore focus to the Edit button of the card');
+    // C from a card: the save rebuilds every card, and focus returns to the
+    // card for the same comment, not to a detached node or <body>.
+    firstCard.focus();
+    require(press('c') && document.activeElement === draftField, 'C did not open a draft from a focused card');
+    draftField.value = 'From a card';
+    draftField.dispatchEvent(new Event('input'));
+    saved = {...data, store_revision: 'added-store', annotations: [...data.annotations, entry('a5', null)]};
+    mount.querySelector('form').requestSubmit();
+    await turns();
+    saved = null;
+    const rebuiltCard = mount.querySelector('.markview-review-card');
+    require(submitted.body === 'From a card' && rebuiltCard !== firstCard && rebuiltCard.dataset.annotation === 'a1' &&
+      document.activeElement === rebuiltCard, 'Saving a draft opened with C did not return focus to the card');
+    review.update({...data, store_revision: 'restored-store'});
     review.show('browser-fixture', revision, false, false);
     require(!press('c') && !press('e') && !press('r'), 'Read-only annotation writes were enabled');
     review.show('browser-fixture', revision, true, false);
@@ -161,7 +204,8 @@
     require(!approve.disabled && changes.disabled, 'An empty review offered Request changes');
     summary = {comments: 2, documents: 1, review_revision: 'saved'};
     window.fixtureEvents.dispatchEvent(new MessageEvent('annotations', {data: '/other.md'}));
-    const settle = () => new Promise(requestAnimationFrame);
+    // A timer, not an animation frame: a headless browser paints no frames.
+    const settle = () => new Promise(resolve => setTimeout(resolve, 20));
     await settle();
     require(!changes.disabled && bar.textContent.includes('2 open comments in 1 document'), 'Another page did not refresh collection counts');
 

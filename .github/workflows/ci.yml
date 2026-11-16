@@ -23,6 +23,10 @@ jobs:
           node-version: '22'
       - run: node --test tests/editor.test.cjs
       - run: node --test tests/review.test.cjs
+      - name: Review harness in headless Chrome
+        run: cargo test --bin markview review_browser_harness -- --nocapture
+        env:
+          MARKVIEW_REQUIRE_BROWSER: 1
 
   macos-gui:
     name: macOS GUI checks

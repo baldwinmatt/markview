@@ -102,7 +102,26 @@ class StubElement extends StubNode {
   setAttribute(name, value) { this.attributes[name] = String(value); }
   getAttribute(name) { return name in this.attributes ? this.attributes[name] : null; }
   removeAttribute(name) { delete this.attributes[name]; }
-  matches(selectors) { return selectors.split(',').some(selector => matchesSimple(this, selector)); }
+  // Each alternative is a simple selector, or a chain of them joined by the
+  // child combinator: `pre > code`.
+  matches(selectors) {
+    return selectors.split(',').some(selector => {
+      const steps = selector.split('>');
+      let node = this;
+      for (let index = steps.length - 1; index >= 0; index--, node = node.parentNode) {
+        if (!node || node.nodeType !== 1 || !matchesSimple(node, steps[index])) return false;
+      }
+      return true;
+    });
+  }
+  get classList() { return {contains: name => this.className.split(/\s+/).includes(name)}; }
+  // Inserts `node` as the sibling just before this element.
+  before(node) {
+    node.remove();
+    const siblings = this.parentNode.childNodes;
+    siblings.splice(siblings.indexOf(this), 0, node);
+    node.parentNode = this.parentNode;
+  }
   closest(selectors) {
     for (let node = this; node && node.nodeType === 1; node = node.parentNode) if (node.matches(selectors)) return node;
     return null;
@@ -293,6 +312,8 @@ function createPage({revision = 'source-1'} = {}) {
   run('annotations/review.js');
   // The verdict bar of a blocking review. It confirms with a native dialog,
   // which a browser has; `page.confirmations` records what it asked.
+  // The copy buttons every served page and GUI preview attaches.
+  page.loadCopy = () => run('annotations/copy.js');
   page.loadVerdictAnswer = answer => { window.confirm = text => { page.confirmations.push(text); return answer; }; };
   page.loadVerdict = (answer = true) => {
     page.confirmations = [];

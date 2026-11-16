@@ -155,6 +155,7 @@ function applied(form, annotations) {
   if (op === 'delete') return annotations.filter(entry => entry.id !== form.get('id'));
   if (op === 'edit') return annotations.map(entry => (entry.id === form.get('id') ? {...entry, body: form.get('body')} : entry));
   if (op === 'add') return [...annotations, comment('a' + (annotations.length + 1), {body: form.get('body')})];
+  if (op === 'status') return annotations.map(entry => (entry.id === form.get('id') ? {...entry, status: form.get('status')} : entry));
   return annotations;
 }
 
@@ -693,11 +694,11 @@ test('an annotation-only update leaves the document and an open draft alone', as
 
 // A panel driven directly, as the macOS app drives it: `submit` receives the
 // form and returns a promise the test settles.
-function directPage(submit = () => new Promise(() => {})) {
+function directPage(submit = () => new Promise(() => {}), options) {
   const page = createPage();
   page.mount = page.h('aside');
   page.document.body.append(page.mount);
-  page.review = page.context.createMarkviewReview(page.main, page.mount, submit);
+  page.review = page.context.createMarkviewReview(page.main, page.mount, submit, options);
   page.panel = page.mount.querySelector('.markview-review');
   page.find = selector => page.panel.querySelector(selector);
   page.button = label => page.panel.querySelectorAll('button').find(button => button.textContent === label && button.visible);
@@ -863,6 +864,420 @@ test('a response that arrives after switching documents is not applied to the ne
   assert.equal(page.find('form').visible, false);
 });
 
+// A page with one highlighted comment, one on the whole document, one
+// detached and one resolved, as the panel orders them: a1, a2, a3.
+function shortcutPage(write = true, add = true, options) {
+  const page = directPage(undefined, options);
+  page.main.append(page.h('p', {}, 'first second'));
+  page.review.show('doc', 'source-1', write, add);
+  page.review.update(review('store-1', [
+    comment('a1', {range: [0, 5], quote: 'first', lines: [1, 1]}),
+    comment('a2'),
+    comment('a3', {range: null, quote: 'gone', lines: [4, 4], attached: false}),
+    comment('a4', {status: 'resolved'}),
+  ]));
+  page.card = id => page.cards().find(card => card.dataset.annotation === id);
+  page.blur = () => { page.document.activeElement = page.document.body; };
+  page.toggle = label => page.panel.querySelectorAll('label').find(node => node.textContent.trim() === label).querySelector('input');
+  return page;
+}
+
+test('J and K move keyboard focus through the visible cards, wrap, and scroll to the comment', () => {
+  const page = shortcutPage();
+  const paragraph = page.main.querySelector('p');
+  // With nothing focused, K starts at the last card and J at the first.
+  assert.ok(press(page, 'k'));
+  focused(page, page.card('a3'));
+  page.blur();
+  assert.ok(press(page, 'j'));
+  focused(page, page.card('a1'));
+  assert.equal(paragraph.scrolledIntoView, 1, 'the highlight is scrolled into view');
+  // A comment without a highlight scrolls its card instead.
+  assert.ok(press(page, 'j'));
+  focused(page, page.card('a2'));
+  assert.equal(page.card('a2').scrolledIntoView, 1);
+  assert.equal(paragraph.scrolledIntoView, 1);
+  assert.ok(press(page, 'j'));
+  focused(page, page.card('a3'));
+  assert.ok(press(page, 'j'));
+  focused(page, page.card('a1'));
+  assert.ok(press(page, 'k'));
+  focused(page, page.card('a3'));
+
+  // Resolved cards take part only while they are shown, before detached ones.
+  assert.equal(page.card('a4'), undefined);
+  const resolved = page.toggle('Show resolved');
+  resolved.checked = true;
+  resolved.dispatchEvent({type: 'change'});
+  page.blur();
+  assert.ok(press(page, 'k'));
+  focused(page, page.card('a3'));
+  assert.ok(press(page, 'k'));
+  focused(page, page.card('a4'));
+});
+
+test('single-key shortcuts stand aside for text fields, modifiers, composition, repeats and dialogs', () => {
+  const saved = [];
+  const page = shortcutPage(true, true, {saveShortcuts: enabled => saved.push(enabled)});
+  for (const fields of [{isComposing: true}, {keyCode: 229}, {repeat: true}, {shiftKey: true}, {ctrlKey: true},
+    {metaKey: true}, {altKey: true}, {defaultPrevented: true}]) {
+    assert.equal(press(page, 'j', fields), Boolean(fields.defaultPrevented), JSON.stringify(fields));
+    focused(page, page.document.body);
+  }
+  // A letter typed into a field is text.
+  const field = page.h('input');
+  page.document.body.append(field);
+  field.focus();
+  assert.equal(press(page, 'j'), false);
+  assert.equal(press(page, 'c'), false);
+  field.remove();
+  page.blur();
+  // An open dialog owns the keyboard.
+  const dialog = page.h('dialog', {open: ''});
+  page.document.body.append(dialog);
+  assert.equal(press(page, 'c'), false);
+  dialog.remove();
+
+  // The toggle turns the letters off and reports the preference.
+  const toggle = page.toggle('Single-key shortcuts');
+  assert.equal(toggle.checked, true);
+  toggle.checked = false;
+  toggle.dispatchEvent({type: 'change'});
+  assert.deepEqual(saved, [false]);
+  assert.equal(press(page, 'j'), false);
+  assert.equal(press(page, 'c'), false);
+  assert.equal(page.find('form').visible, false);
+  // Escape still leaves a focused card, as it does with the toggle on.
+  page.card('a2').focus();
+  assert.ok(press(page, 'Escape'));
+  focused(page, page.panel);
+  assert.equal(press(page, 'Escape'), false, 'nothing to leave');
+  toggle.checked = true;
+  toggle.dispatchEvent({type: 'change'});
+  assert.deepEqual(saved, [false, true]);
+  assert.ok(press(page, 'j'));
+});
+
+test('shortcuts are inactive without a document or while the host says so, and navigation reveals the panel', () => {
+  let blocked = false;
+  let revealed = 0;
+  const page = shortcutPage(true, true, {shortcutsBlocked: () => blocked, reveal: () => { revealed += 1; }});
+  // The GUI keeps its sidebar closed until there is something to show.
+  assert.ok(press(page, 'j'));
+  assert.equal(revealed, 1);
+  // The GUI's editor and Find own the keyboard while they are open.
+  blocked = true;
+  for (const key of ['j', 'k', 'c', 'e', 'r']) assert.equal(press(page, key), false, key);
+  blocked = false;
+  assert.ok(press(page, 'k'));
+  // An untitled tab has no document to annotate.
+  page.review.show(null, null, false, false);
+  for (const key of ['j', 'k', 'c', 'e', 'r']) assert.equal(press(page, key), false, key);
+});
+
+test('the controls that have a shortcut say so in their tooltips', () => {
+  const page = shortcutPage();
+  assert.equal(page.button('Comment on document').title, 'Comment on document (C)');
+  assert.equal(page.toggle('Single-key shortcuts').parentNode.title, 'J/K navigate, C comments, E edits, R resolves or reopens');
+  const buttons = page.card('a1').querySelectorAll('button');
+  assert.deepEqual(buttons.map(button => [button.textContent, button.title || null]),
+    [['Edit', 'Edit (E)'], ['Resolve', 'Resolve (R)'], ['Delete', null]]);
+});
+
+test('C comments on a valid selection or the whole document, and leaves an unusable selection alone', () => {
+  const page = shortcutPage();
+  const text = page.main.querySelector('p').childNodes[0];
+  // No selection: a whole-document comment.
+  assert.ok(press(page, 'c'));
+  assert.equal(page.find('form').visible, true);
+  assert.equal(page.find('form').querySelector('blockquote').visible, false);
+  focused(page, page.find('textarea'));
+  page.button('Cancel').click();
+
+  // A selection inside the document: a comment on that text.
+  const range = page.document.createRange();
+  range.setStart(text, 6);
+  range.setEnd(text, 12);
+  page.select(range);
+  page.blur();
+  assert.ok(press(page, 'c'));
+  assert.equal(page.find('form').querySelector('blockquote').textContent, 'second');
+  page.button('Cancel').click();
+
+  // A selection that is not document text is neither commented on nor
+  // replaced by a whole-document draft, and the key is left to the page.
+  const outside = page.h('p', {}, 'not the document');
+  page.document.body.append(outside);
+  const stray = page.document.createRange();
+  stray.setStart(outside.childNodes[0], 0);
+  stray.setEnd(outside.childNodes[0], 3);
+  page.select(stray);
+  page.blur();
+  assert.equal(press(page, 'c'), false);
+  assert.equal(page.find('form').visible, false);
+});
+
+test('E edits and R resolves or reopens the focused comment through the same actions as the buttons', async () => {
+  const page = await pageWithComments();
+  // Without a focused card there is nothing to act on.
+  assert.equal(press(page, 'e'), false);
+  assert.equal(press(page, 'r'), false);
+  assert.equal(page.posts.length, 0);
+
+  assert.ok(press(page, 'j'));
+  assert.ok(press(page, 'e'));
+  const body = page.find('textarea');
+  focused(page, body);
+  assert.equal(body.value, 'Body of a1');
+  await saveDraft(page, 'Edited from the keyboard');
+  assert.deepEqual(page.posts[0], {op: 'edit', id: 'a1', store_revision: 'store-1', body: 'Edited from the keyboard', doc: '/doc.md'});
+
+  page.card('a1').focus();
+  assert.ok(press(page, 'r'));
+  await page.settle();
+  assert.deepEqual(page.posts[1], {op: 'status', id: 'a1', store_revision: 'store-2', status: 'resolved', doc: '/doc.md'});
+  assert.equal(page.card('a1'), undefined, 'resolved comments leave the list');
+
+  const resolved = page.panel.querySelectorAll('input')[0];
+  resolved.checked = true;
+  resolved.dispatchEvent({type: 'change'});
+  page.card('a1').focus();
+  assert.ok(press(page, 'r'));
+  await page.settle();
+  assert.equal(page.posts[2].status, 'open');
+});
+
+test('shortcuts respect what the page may do: none write when read-only, C waits for a saved document', () => {
+  const page = shortcutPage(false, false);
+  assert.ok(press(page, 'j'), 'navigation needs no permission');
+  focused(page, page.card('a1'));
+  for (const key of ['c', 'e', 'r']) assert.equal(press(page, key), false, key);
+  assert.equal(page.find('form').visible, false);
+
+  // A GUI preview with unsaved edits: existing comments can change, but a
+  // new one would be anchored to text that is not on disk.
+  const dirty = shortcutPage(true, false);
+  assert.ok(press(dirty, 'j'));
+  assert.equal(press(dirty, 'c'), false);
+  assert.ok(press(dirty, 'e'));
+  focused(dirty, dirty.find('textarea'));
+});
+
+test('the composer offers four quick labels for a new comment, each a keyboard-reachable button', async () => {
+  const page = await pageWithComments();
+  page.button('Comment on document').click();
+  const group = page.panel.querySelectorAll('div').find(node => node.getAttribute('aria-label') === 'Quick labels');
+  assert.equal(group.getAttribute('role'), 'group');
+  assert.equal(group.visible, true);
+  const labels = group.querySelectorAll('button');
+  assert.deepEqual(labels.map(label => label.textContent), ['Question', 'Needs a test', 'Out of scope', 'Nit']);
+  // A real <button> that does not submit the form: Tab reaches it, and
+  // Enter or Space activates it.
+  for (const label of labels) assert.deepEqual([label.tagName, label.type, label.disabled], ['BUTTON', 'button', false]);
+  // Above the text field, in the composer.
+  const parts = page.find('form').children;
+  assert.ok(parts.indexOf(group) < parts.indexOf(page.find('textarea')));
+  // The labels start a comment; an edit keeps the text it has.
+  page.button('Cancel').click();
+  page.cardButton('a1', 'Edit').click();
+  assert.equal(group.visible, false);
+});
+
+test('a quick label saves an empty comment at once and prefixes one that has text', async () => {
+  const page = await pageWithComments();
+  page.button('Comment on document').click();
+  page.button('Question').click();
+  await page.settle();
+  assert.deepEqual(page.posts, [{op: 'add', body: 'Question', doc: '/doc.md'}]);
+  assert.equal(page.find('form').visible, false, 'saved through the normal path, which closes the composer');
+  assert.equal(page.card('a3').querySelector('.markview-review-body').textContent, 'Question');
+
+  const body = openDocumentDraft(page, 'is this right?');
+  page.button('Nit').click();
+  assert.equal(body.value, 'Nit: is this right?');
+  assert.equal(page.find('form').visible, true);
+  focused(page, body);
+  assert.equal(page.posts.length, 1, 'text is not saved until the reviewer says so');
+  // The same label again changes nothing; another one goes in front.
+  page.button('Nit').click();
+  assert.equal(body.value, 'Nit: is this right?');
+  page.button('Needs a test').click();
+  page.button('Nit').click();
+  assert.equal(body.value, 'Needs a test: Nit: is this right?');
+  page.find('form').requestSubmit();
+  await page.settle();
+  assert.equal(page.posts[1].body, 'Needs a test: Nit: is this right?');
+});
+
+test('a quick label on a text comment saves the label with the selected quote', async () => {
+  const page = await pageWithComments();
+  page.main.append(page.h('p', {}, 'first second third'));
+  page.mutated(page.main);
+  const text = page.main.querySelector('p').childNodes[0];
+  const range = page.document.createRange();
+  range.setStart(text, 6);
+  range.setEnd(text, 12);
+  page.select(range);
+  page.document.querySelector('.markview-review-selection').click();
+  page.button('Needs a test').click();
+  await page.settle();
+  // An ordinary annotation: the label is simply the first words of its body.
+  assert.deepEqual(page.posts, [{op: 'add', quote: 'second', start: '5', end: '11', source_revision: 'source-1',
+    body: 'Needs a test', doc: '/doc.md'}]);
+});
+
+test('a quick label that fails to save keeps its draft, and labels wait for a request in flight', async () => {
+  const request = deferred();
+  const page = await servePage(method => (method === 'POST' ? request.promise : response(200, review('store-1'))));
+  page.button('Comment on document').click();
+  page.button('Out of scope').click();
+  await page.settle();
+  // The request is out: a second label must not start another.
+  assert.equal(page.button('Nit').disabled, true);
+  page.button('Nit').click();
+  request.resolve(response(409, {error: 'annotation store changed on disk'}));
+  await page.settle();
+  assert.deepEqual(page.requests.filter(method => method === 'POST'), ['POST']);
+  assert.equal(messageOf(page), 'annotation store changed on disk');
+  assert.equal(page.find('form').visible, true);
+  assert.equal(page.find('textarea').value, 'Out of scope');
+  assert.equal(page.button('Nit').disabled, false);
+});
+
+// A document with a fenced block and one nested in a quote, and the copy
+// buttons attached to it. `page.copied` collects what was copied.
+function codePage() {
+  const page = createPage();
+  page.loadCopy();
+  const {h} = page;
+  page.main.append(
+    h('p', {}, 'Before'),
+    h('pre', {}, h('code', {}, '-old\n+new\n')),
+    h('blockquote', {}, h('pre', {}, h('code', {class: 'language-rust'}, '\tlet ready = true;\n'))),
+    h('p', {}, h('code', {}, 'inline')),
+  );
+  page.copied = [];
+  page.copy = async text => { page.copied.push(text); };
+  page.attach = page.context.createMarkviewCodeCopy(page.main);
+  page.attach(text => page.copy(text));
+  page.copyButtons = () => page.main.querySelectorAll('.markview-copy-code');
+  page.announced = () => page.document.querySelector('.markview-copy-status');
+  return page;
+}
+
+test('every code block gets one Copy button outside its code, and inline code gets none', () => {
+  const page = codePage();
+  const buttons = page.copyButtons();
+  assert.equal(buttons.length, 2);
+  for (const button of buttons) {
+    assert.deepEqual([button.tagName, button.type, button.textContent], ['BUTTON', 'button', 'Copy']);
+    assert.ok('data-markview-review-exclude' in button.attributes);
+    const wrapper = button.parentNode;
+    assert.equal(wrapper.className, 'markview-code-block');
+    assert.deepEqual(wrapper.children.map(child => child.tagName), ['PRE', 'BUTTON']);
+    assert.equal(button.closest('code'), null);
+  }
+  // The blocks stay where they were, and their text is untouched.
+  assert.deepEqual(page.main.children.map(child => child.tagName), ['P', 'DIV', 'BLOCKQUOTE', 'P']);
+  assert.deepEqual(page.main.querySelectorAll('pre > code').map(code => code.textContent), ['-old\n+new\n', '\tlet ready = true;\n']);
+  assert.equal(page.announced().getAttribute('role'), 'status');
+});
+
+test('Copy sends the exact code text, reports the result on the button and announces it', async () => {
+  const page = codePage();
+  const [diff, rust] = page.copyButtons();
+  rust.focus();
+  rust.click();
+  await page.settle();
+  assert.deepEqual(page.copied, ['\tlet ready = true;\n']);
+  assert.equal(rust.textContent, 'Copied');
+  assert.equal(page.announced().textContent, 'Copied');
+  focused(page, rust);
+
+  page.copy = async () => { throw new Error('blocked'); };
+  diff.click();
+  await page.settle();
+  assert.equal(diff.textContent, 'Copy failed');
+  assert.equal(page.announced().textContent, 'Copy failed');
+  assert.equal(rust.textContent, 'Copied', 'one button does not speak for another');
+});
+
+test('a second click while the clipboard is busy copies nothing more', async () => {
+  const page = codePage();
+  const pending = deferred();
+  let calls = 0;
+  page.copy = () => { calls += 1; return pending.promise; };
+  const [button] = page.copyButtons();
+  button.click();
+  button.click();
+  assert.equal(calls, 1);
+  assert.equal(button.getAttribute('aria-busy'), 'true');
+  pending.resolve();
+  await page.settle();
+  assert.equal(button.getAttribute('aria-busy'), null);
+  assert.equal(button.textContent, 'Copied');
+});
+
+test('attaching again after a refresh adds buttons only to blocks that lack one', () => {
+  const page = codePage();
+  page.attach(text => page.copy(text));
+  assert.equal(page.copyButtons().length, 2);
+  page.main.append(page.h('pre', {}, page.h('code', {}, 'indented & text\n')));
+  page.attach(text => page.copy(text));
+  assert.equal(page.copyButtons().length, 3);
+});
+
+test('a served page copies with the browser clipboard and attaches buttons again after a live reload', async () => {
+  const page = createPage({revision: null});
+  page.loadCopy();
+  page.main.append(page.h('pre', {}, page.h('code', {}, 'one\n')));
+  const events = page.loadShell();
+  const written = [];
+  page.context.navigator.clipboard.writeText = async text => { written.push(text); };
+  const buttons = () => page.main.querySelectorAll('.markview-copy-code');
+  assert.equal(buttons().length, 1);
+  buttons()[0].click();
+  await page.settle();
+  assert.deepEqual(written, ['one\n']);
+  assert.equal(buttons()[0].textContent, 'Copied');
+
+  // The reload replaces the document, here with one more block.
+  page.next = {root: page.h('html', {}, page.h('main', {}))};
+  page.fetch = async () => ({ok: true, status: 200, text: async () => ''});
+  // The stub has no HTML parser: stand in for `innerHTML` taking effect.
+  Object.defineProperty(page.main, 'innerHTML', {set() {
+    page.main.replaceChildren(page.h('pre', {}, page.h('code', {}, 'one\n')), page.h('pre', {}, page.h('code', {}, 'two\n')));
+  }});
+  events.dispatchEvent({type: 'message', data: 'reload'});
+  await page.settle();
+  assert.equal(buttons().length, 2);
+  assert.deepEqual(buttons().map(button => button.textContent), ['Copy', 'Copy']);
+});
+
+test('copy buttons do not change the text an annotation is anchored to', () => {
+  const plain = createPage();
+  const build = page => page.main.append(
+    page.h('p', {}, 'Before'),
+    page.h('pre', {}, page.h('code', {}, 'let a = 1;\n')),
+    page.h('p', {}, 'After'),
+  );
+  build(plain);
+  const scalars = page => page.context.markviewReviewText(page.main).map(point => point.scalar).join('');
+  const expected = scalars(plain);
+  assert.equal(expected, 'Beforeleta=1;After');
+
+  const page = createPage();
+  page.loadCopy();
+  build(page);
+  page.context.createMarkviewCodeCopy(page.main)(async () => {});
+  assert.equal(page.main.querySelectorAll('.markview-copy-code').length, 1);
+  assert.equal(scalars(page), expected);
+  // A selection that starts on the button is not a selection of the document.
+  const label = page.main.querySelector('.markview-copy-code').childNodes[0];
+  const {selection} = selectionBetween(page, label, 0, label, 4);
+  assert.equal(page.context.markviewReviewSelection(page.main, selection), null);
+});
+
 // A blocking review page as `markview --review` serves it: the review
 // script, the verdict bar and the live-reload shell. `page.summaries` holds
 // one function per summary request still in flight; calling it answers.
@@ -931,6 +1346,64 @@ async function openedReviewPage(summary) {
   await page.answerSummaries();
   return page;
 }
+
+test('the verdict bar states its scope and counts, and needs an open comment to request changes', async () => {
+  const page = await openedReviewPage({review_revision: 'r1', comments: 0, documents: 0});
+  assert.equal(page.bar.getAttribute('aria-label'), 'Collection verdict');
+  assert.equal(page.bar.querySelector('strong').textContent, 'Review the entire served collection');
+  assert.equal(page.bar.querySelector('p').getAttribute('role'), 'status');
+  assert.equal(page.status(), '0 open comments in 0 documents.');
+  assert.equal(page.verdictButton('Approve').disabled, false);
+  assert.equal(page.verdictButton('Request changes').disabled, true);
+  assert.equal(page.verdictButton('Retry review summary').hidden, true);
+
+  // Singular nouns for one, and both verdicts once there is a comment.
+  page.summary = {review_revision: 'r2', comments: 1, documents: 1};
+  page.events.dispatchEvent({type: 'annotations', data: '/other.md'});
+  // No verdict while the counts on screen may be out of date.
+  assert.equal(page.verdictButton('Approve').disabled, true);
+  assert.equal(page.status(), 'Refreshing collection counts…');
+  await page.settle();
+  await page.answerSummaries();
+  assert.equal(page.status(), '1 open comment in 1 document.');
+  assert.equal(page.verdictButton('Request changes').disabled, false);
+});
+
+test('a verdict is confirmed with its scope and counts, posted with the confirmed revisions, and ends the review', async () => {
+  const page = await openedReviewPage({review_revision: 'r7', comments: 2, documents: 2});
+  // Declined in the dialog: nothing is sent.
+  page.loadVerdictAnswer(false);
+  page.verdictButton('Request changes').click();
+  await page.settle();
+  assert.deepEqual(page.confirmations, ['Request changes for the entire served collection?\n2 open comments in 2 documents.']);
+  assert.equal(page.finishes.length, 0);
+
+  page.loadVerdictAnswer(true);
+  page.verdictButton('Approve').click();
+  await page.settle();
+  assert.equal(page.confirmations[1], 'Approve the entire served collection?\n2 open comments in 2 documents.');
+  assert.deepEqual(page.finishes, [{op: 'finish', verdict: 'approved', review_revision: 'r7', doc: '/doc.md', source_revision: 'source-1'}]);
+  const [, init] = page.fetchCalls.find(([url, init]) => url === '/_markview/review' && init?.method === 'POST');
+  assert.equal(init.headers['X-Markview-Token'], 'token');
+  assert.equal(page.status(), 'Review finished. You can close this tab.');
+  assert.equal(page.verdictButton('Approve').disabled, true);
+  assert.equal(page.verdictButton('Request changes').disabled, true);
+  // The page is read-only from here on.
+  const panel = page.document.querySelector('.markview-review');
+  assert.equal(panel.querySelectorAll('button').find(button => button.textContent === 'Comment on document').visible, false);
+});
+
+test('a verdict accepted in another tab closes this one through the event stream', async () => {
+  const page = await openedReviewPage({review_revision: 'r1', comments: 1, documents: 1});
+  page.events.dispatchEvent({type: 'review-finished'});
+  assert.equal(page.events.closed, true);
+  assert.equal(page.status(), 'Review finished. You can close this tab.');
+  assert.equal(page.verdictButton('Approve').disabled, true);
+  // Later events change nothing.
+  page.events.dispatchEvent({type: 'annotations', data: '/other.md'});
+  await page.settle();
+  assert.equal(page.summaries.length, 1);
+});
 
 test('the reconfirm warning after a conflict is shown once, not on every later refresh', async () => {
   const page = await openedReviewPage({review_revision: 'r1', comments: 2, documents: 1});

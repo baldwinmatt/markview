@@ -2,7 +2,7 @@
 
 A follow-up to the [Annotations Spec](ANNOTATIONS_SPEC.md). Annotations give Markview comments that persist on disk. This spec adds a review loop an agent can drive and improvements for reading and commenting on documents. The review command, quick labels, alerts, code copying, and keyboard navigation can ship independently.
 
-Status: implemented on top of the annotations work.
+Status: implemented on top of the annotations work. A ticked box has a passing automated test: a Rust test, a `tests/review.test.cjs` case, or `tests/review.browser.js` run in headless Chrome by `make test-browser` and CI. An unticked box is implemented and was checked by hand, but nothing automated covers it yet.
 
 ## Decisions
 
@@ -40,7 +40,8 @@ Status: implemented on top of the annotations work.
 
 - [x] `--review` runs in the foreground, binds an ephemeral loopback port by default, and inherits serve's input validation, discovery, and live rescans. `--port` and `--recurse` retain their serve meanings.
 - [x] Reject `--review` combined with `--serve`, `--daemon`, `--annotations`, `--include-resolved`, `--html`, `--open`, or `--annotate` in the existing CLI error style. Review enables annotation writes and browser launch by default.
-- [x] `--no-open` requires `--review` and skips launching the browser. For SSH forwarding, choose a fixed `--port` and use the same local and remote port so the browser's `Host` passes the loopback check. If launching the browser fails, warn on stderr and keep the printed URL available for manual use.
+- [x] `--no-open` requires `--review` and skips launching the browser. For SSH forwarding, choose a fixed `--port` and use the same local and remote port so the browser's `Host` passes the loopback check.
+- [ ] If launching the browser fails, warn on stderr and keep the printed URL available for manual use. No automated test: a test cannot make the system launcher fail without also letting it open a real browser on machines where it works.
 - [x] Print the URL and a one-line "waiting for review" notice to stderr. Stdout carries only the result, so an agent can capture it directly.
 - [x] Every review page labels the verdict as applying to the entire served collection. The bar shows the collection-wide counts of open comments and documents with open comments. Request changes requires at least one open comment. Both actions confirm the verdict, scope, and counts. An unsaved draft on the current page is called out in the confirmation. Only saved comments count.
 - [x] `GET /_markview/review` returns the collection counts and an opaque review revision derived from the current served routes and each document's source and store revisions. The bar refreshes on source changes, collection rescans, and annotation changes on any served route. Disable verdict actions while the summary is unavailable or being refreshed. A read error for any served document or store makes the summary unavailable, with an error the reviewer can retry.
@@ -86,7 +87,8 @@ This contradicts the favicon rule two sections down. Pick one.
 
 ## Copy Button
 
-- [x] Each fenced or indented code block in serve and GUI Preview gets a Copy button. Show it on hover, keyboard focus, and on devices without hover. Reattach buttons after document refreshes or GUI tab switches. `--html` export has no copy controls.
+- [x] Each fenced or indented code block in serve gets a Copy button. Show it on hover, keyboard focus, and on devices without hover. Reattach buttons after document refreshes. `--html` export has no copy controls.
+- [ ] GUI Preview attaches the same buttons and reattaches them after tab switches. No automated test: the wiring lives in the GUI shell script, which only runs in a WKWebView.
 - [x] Copy the rendered code payload, using decoded text from the block's `<code>` element. Preserve spaces, tabs, diff markers, and the exact trailing newline in that payload. Fences, Markdown container prefixes, and indentation consumed by the parser are outside the payload. Line endings and any renderer normalization follow the displayed code.
 - [x] Keep the control outside `<code>` and exclude it explicitly from the annotation DOM walk and quote extraction. The control never changes a code block's text or annotation offsets.
 - [x] Show "Copied" after clipboard success and "Copy failed" on error. Announce the result to assistive technology and keep focus on the button.

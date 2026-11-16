@@ -609,15 +609,55 @@ mod daemon_tests {
             .contains("exited before"));
     }
 
+    /// Whether `port` can be bound again, allowing a moment for it to free.
+    /// While this process spawns a child, the child holds a copy of every
+    /// open descriptor until its exec closes the close-on-exec ones. A
+    /// listener dropped during that window keeps its port for a fraction of
+    /// a millisecond longer (about 0.1 ms when measured), so "free at once"
+    /// is not something a multi-threaded test binary can promise.
+    #[cfg(unix)]
+    fn port_released(port: u16) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if bind_serve_listener(port).is_ok() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn inherited_listener_keeps_port_reserved() {
-        let listener = bind_serve_listener(0).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let inherited = Stdio::from(OwnedFd::from(listener));
-        assert!(bind_serve_listener(port).is_err());
-        drop(inherited);
-        assert!(bind_serve_listener(port).is_ok());
+        // Other tests in this binary spawn processes, and a spawn in progress
+        // matters here (see `port_released`). Spawn throughout, so the test
+        // meets that case every run instead of once in a while.
+        const SPAWNS: u64 = 20;
+        let spawned = Arc::new(AtomicU64::new(0));
+        let spawner = {
+            let spawned = spawned.clone();
+            thread::spawn(move || {
+                while spawned.load(Ordering::Relaxed) < SPAWNS {
+                    Command::new("sh").args(["-c", "exit 0"]).status().unwrap();
+                    spawned.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+        while spawned.load(Ordering::Relaxed) < SPAWNS {
+            let listener = bind_serve_listener(0).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let inherited = Stdio::from(OwnedFd::from(listener));
+            assert!(bind_serve_listener(port).is_err());
+            drop(inherited);
+            assert!(
+                port_released(port),
+                "port {port} stayed reserved after its last handle was dropped"
+            );
+        }
+        spawner.join().unwrap();
     }
 }
 

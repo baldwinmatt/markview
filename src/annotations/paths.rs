@@ -333,10 +333,24 @@ impl Parent {
 }
 
 pub fn read_source(location: &Location) -> io::Result<String> {
-    let parent = canonical_directory(location.document.parent().expect("source parent"))?;
+    read_canonical_source(&location.document)
+}
+
+/// Reads a canonical document path without following symlinks in any component.
+pub fn read_canonical_source(path: &Path) -> io::Result<String> {
+    let parent = path
+        .parent()
+        .filter(|_| path.is_absolute())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected an absolute file path",
+            )
+        })?;
+    let parent = canonical_directory(parent)?;
     let mut file = regular(open_at(
         &parent,
-        location.document.file_name().expect("source filename"),
+        path.file_name().expect("source filename"),
         libc::O_RDONLY,
     )?)?;
     let mut source = String::new();

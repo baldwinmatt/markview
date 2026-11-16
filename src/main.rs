@@ -1,4 +1,5 @@
 mod serve_annotations;
+mod serve_api;
 mod serve_review;
 
 use std::collections::HashMap;
@@ -323,6 +324,8 @@ struct ServeConfig {
 struct ServeSession {
     /// The write token of `--annotate` and `--review`.
     review_token: Option<String>,
+    /// The independently configured credential for versioned API writes.
+    api_token: Option<String>,
     /// Whether this is `--review`, which watches every document's store.
     blocking_review: bool,
     /// Which scan published this config. Later scans have higher numbers.
@@ -446,6 +449,9 @@ fn serve_markdown(
     let mut config = ServeConfig::from_inputs(inputs.clone(), port, recurse)?;
     config.session.blocking_review = review.is_some();
     config.session.review_token = annotate.then(annotations::random_hex).transpose()?;
+    if annotate {
+        config.session.api_token = serve_api::configured_token()?;
+    }
     // Said once, at startup: a rescan builds a fresh config but stays quiet.
     for directory in &config.reserved {
         eprintln!(

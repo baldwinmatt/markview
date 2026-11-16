@@ -98,6 +98,72 @@ The default port is ephemeral. For SSH, use `--no-open` with a fixed
 `--port` and forward the same port on both sides, for example
 `ssh -L 8080:localhost:8080 user@host`.
 
+### Agent HTTP API
+
+Every running serve or review session exposes a JSON API at
+`/_markview/api/v1` on its existing loopback URL. Reads need no token. The
+API uses the server's document allowlist and requires a `Host` of
+`localhost:<port>` or `127.0.0.1:<port>`.
+
+| Method and path relative to the API base | Response or operation |
+| --- | --- |
+| `GET /documents` | `documents` in served order, each with its `route`. Also returns `default_document` (a route) and the `can_annotate` and `can_finish` configuration flags. |
+| `GET /document?doc=…` | `route`, current `title`, raw `markdown`, `source_revision`, and `projected_text` for anchoring comments. |
+| `GET /annotations?doc=…` | `source_revision`, `store_revision`, and `annotations` including open and resolved comments. Each annotation includes `id`, `status`, `body`, `quote`, `lines`, `section`, `attached`, and `range`. |
+| `POST /annotations` | Add or update a saved comment. Returns the updated annotation response. |
+| `GET /review` | In `--review`, returns `review_revision`, the number of open `comments`, and the number of `documents` with open comments. |
+| `POST /review` | In `--review`, submit a collection verdict. Returns `{"finished":true}` and completes the waiting CLI command. |
+
+Use the route as returned by the catalog, then encode it as a query or form
+value. For example, the route `/Release%20notes.md` becomes
+`doc=%2FRelease%2520notes.md`. The route `/` selects the default document.
+
+```sh
+API=http://localhost:7878/_markview/api/v1
+curl -fsS "$API/documents"
+curl -fsSG --data-urlencode 'doc=/Release%20notes.md' "$API/document"
+```
+
+To enable API writes, start the server with `MARKVIEW_API_TOKEN` set to a
+random 64-character lowercase hex string (for example, generate it with
+`openssl rand -hex 32`). Use `--serve --annotate` for comments or
+`--review` for comments and a verdict. Give the agent the server URL and
+token. All POST requests use `Authorization: Bearer <token>` and
+`application/x-www-form-urlencoded` bodies.
+
+| Operation | Form fields |
+| --- | --- |
+| Add a document comment | `op=add`, `doc`, `body`, `source_revision` from the document response |
+| Add an anchored comment | The same fields plus `quote`, `start`, `end` |
+| Edit a comment | `op=edit`, `doc`, `id`, `body`, `store_revision` from the annotations response |
+| Resolve or reopen a comment | `op=status`, `doc`, `id`, `status=resolved` or `status=open`, `store_revision` |
+| Delete a comment | `op=delete`, `doc`, `id`, `store_revision` |
+| Submit a verdict | `op=finish`, `doc`, `source_revision` from that document, `review_revision` from the collection summary, and `verdict=approved` or `verdict=changes` |
+
+For an anchored comment, select a substring in `projected_text` and use it
+as the quote. Count Unicode code points excluding whitespace to get the
+zero-based, half-open range `[start, end)`. Returned `range` uses the
+same offsets. Returned `lines` contains the first and last source lines,
+both 1-based and inclusive.
+
+```sh
+curl -fsS "$API/annotations" \
+  -H "Authorization: Bearer $MARKVIEW_API_TOKEN" \
+  --data-urlencode 'op=add' \
+  --data-urlencode 'doc=/Release%20notes.md' \
+  --data-urlencode 'body=Please include the rollback steps.' \
+  --data-urlencode "source_revision=$SOURCE_REVISION"
+```
+
+A verdict covers the entire collection. For `verdict=changes`, save at least
+one open comment first. For either verdict, fetch the collection summary
+after saving comments, then verify that each document still has the
+`source_revision` you reviewed before submitting. An HTTP `409` means
+the revision is stale, a store conflict needs attention, or the verdict
+has already been accepted. Re-fetch the relevant state before resubmitting.
+If an add request loses its response, check the annotations before retrying
+so the same finding is only added once.
+
 ### Review comments
 
 ```sh

@@ -9,6 +9,8 @@ mod store;
 mod unsupported;
 mod watch;
 
+#[cfg(unix)]
+pub use paths::read_canonical_source;
 pub use paths::{read_source, resolve, Location};
 pub use projection::{collapse, TextProjection};
 pub use store::{Annotation, Status, Store};
@@ -476,6 +478,7 @@ pub enum Operation {
     Add {
         body: String,
         selection: Option<Selection>,
+        document_revision: Option<String>,
     },
     Change {
         id: u64,
@@ -555,26 +558,33 @@ impl Request {
         let operation = match fields.remove("op").as_deref() {
             Some("add") => {
                 let body = take_body(&mut fields)?;
-                let selection = match (
+                let (selection, document_revision) = match (
                     fields.remove("quote"),
                     fields.remove("start"),
                     fields.remove("end"),
                     fields.remove("source_revision"),
                 ) {
-                    (None, None, None, None) => None,
+                    (None, None, None, revision) => (None, revision),
                     (Some(quote), Some(start), Some(end), Some(revision)) => {
                         let start =
                             decimal(&start).ok_or(Error::Invalid("invalid selection start"))?;
                         let end = decimal(&end).ok_or(Error::Invalid("invalid selection end"))?;
-                        Some(Selection {
-                            quote,
-                            range: start..end,
-                            revision,
-                        })
+                        (
+                            Some(Selection {
+                                quote,
+                                range: start..end,
+                                revision,
+                            }),
+                            None,
+                        )
                     }
                     _ => return Err(invalid),
                 };
-                Operation::Add { body, selection }
+                Operation::Add {
+                    body,
+                    selection,
+                    document_revision,
+                }
             }
             Some(op @ ("edit" | "status" | "delete")) => {
                 let id = fields
@@ -651,6 +661,15 @@ fn validate_selection(projection: &TextProjection, selection: &Selection) -> Res
     Ok(quote)
 }
 
+fn validate_document_revision(projection: &TextProjection, revision: &str) -> Result<(), Error> {
+    if revision != projection.revision {
+        return Err(Error::Conflict(
+            "document changed, fetch the current revision",
+        ));
+    }
+    Ok(())
+}
+
 pub fn mutate(location: &Location, operation: Operation) -> Result<Review, Error> {
     ReviewCache::default().mutate(location, operation)
 }
@@ -670,14 +689,19 @@ fn mutate_with(
     operation: Operation,
     project: Project<'_>,
 ) -> Result<(Arc<TextProjection>, Review), Error> {
-    // Reject invalid text adds before creating directories, and validate again
-    // against the source read under the lock.
+    // Reject invalid or stale adds before creating directories, then validate
+    // again against the source read under the lock.
     if let Operation::Add {
-        selection: Some(selection),
+        selection,
+        document_revision,
         ..
     } = &operation
     {
-        validate_selection(&project(&read_source(location)?), selection)?;
+        if let Some(selection) = selection {
+            validate_selection(&project(&read_source(location)?), selection)?;
+        } else if let Some(revision) = document_revision {
+            validate_document_revision(&project(&read_source(location)?), revision)?;
+        }
     }
     let existing = snapshot(location)?;
     if matches!(&operation, Operation::Change { .. }) && existing.is_none() {
@@ -708,7 +732,14 @@ fn mutate_locked(
     let mut store = parse_snapshot(location, bytes.as_deref())?;
     store.check_ids()?;
     match operation {
-        Operation::Add { body, selection } => {
+        Operation::Add {
+            body,
+            selection,
+            document_revision,
+        } => {
+            if let Some(revision) = document_revision {
+                validate_document_revision(&projection, &revision)?;
+            }
             let id = store
                 .annotations
                 .iter()

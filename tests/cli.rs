@@ -3456,6 +3456,165 @@ fn start_review(cwd: &std::path::Path, options: &[&str]) -> ServeProcess {
     start_review_of(cwd, "sample.md", options)
 }
 
+#[test]
+fn agent_api_lists_and_fetches_only_served_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = dir.path().join("a + b%.md");
+    let other = dir.path().join("other.md");
+    std::fs::write(&doc, "# Example\r\n\r\n**bold**\r\n").unwrap();
+    std::fs::write(&other, "# Excluded\n").unwrap();
+    let server = ServeProcess::start(&doc);
+    let port = server.port;
+    let api = "/_markview/api/v1";
+    let catalog = http_get_local(port, &format!("{api}/documents"));
+    assert!(
+        catalog.contains(r#""default_document":"/a%20%2B%20b%25.md""#),
+        "{catalog}"
+    );
+    assert!(
+        catalog.contains(r#""can_annotate":false,"can_finish":false"#),
+        "{catalog}"
+    );
+    assert!(!catalog.contains("other.md"), "{catalog}");
+    assert!(
+        !catalog.contains(&*dir.path().to_string_lossy()),
+        "{catalog}"
+    );
+
+    let path = format!("{api}/document?doc=%2Fa%2520%252B%2520b%2525.md");
+    let response = http_get_local(port, &path);
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.contains("Cache-Control: no-store"), "{response}");
+    assert!(response
+        .contains(r##""markdown":"# Example\u000d\u000a\u000d\u000a**bold**\u000d\u000a""##));
+    assert!(response.contains(r#""projected_text":"Example bold""#));
+    assert!(raw_http(
+        port,
+        &format!("HEAD {path} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n")
+    )
+    .ends_with("\r\n\r\n"));
+    assert!(raw_http(
+        port,
+        &format!("GET {path} HTTP/1.1\r\nHost: example.com:{port}\r\n\r\n")
+    )
+    .starts_with("HTTP/1.1 403"));
+    for route in [
+        "%2Fother.md",
+        "%2F..%2Fother.md",
+        "%2F.markview%2Fannotations%2Fa.md",
+    ] {
+        let response = http_get_local(port, &format!("{api}/document?doc={route}"));
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+    }
+    assert!(http_get_local(port, &format!("{api}/review")).starts_with("HTTP/1.1 404"));
+    assert!(raw_http(
+        port,
+        &format!("POST {api}/annotations HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n")
+    )
+    .contains("API writes are disabled"));
+
+    #[cfg(unix)]
+    {
+        std::fs::remove_file(&doc).unwrap();
+        std::os::unix::fs::symlink(&other, &doc).unwrap();
+        assert!(http_get_local(port, &path).starts_with("HTTP/1.1 404"));
+    }
+}
+
+#[test]
+fn agent_api_saves_revision_bound_comments_and_finishes_a_review() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "# Doc\n\n**😀 anchor**\n";
+    std::fs::write(dir.path().join("sample.md"), source).unwrap();
+    let token = "a1".repeat(32);
+    let child = std::process::Command::new(cargo_bin("markview"))
+        .current_dir(dir.path())
+        .args(["--review", "--no-open", "--gate", "sample.md"])
+        .env("MARKVIEW_API_TOKEN", &token)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut server = waiting_review(child).unwrap();
+    let port = server.port;
+    let api = "/_markview/api/v1";
+    let catalog = http_get_local(port, &format!("{api}/documents"));
+    assert!(catalog.contains(r#""can_annotate":true,"can_finish":true"#));
+    let page = http_get_local(port, "/");
+    assert!(!page.contains(&token));
+    let post = |endpoint: &str, credential: &str, body: &str| {
+        raw_http(port, &format!(
+            "POST {api}/{endpoint} HTTP/1.1\r\nHost: localhost:{port}\r\n{credential}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ))
+    };
+    let credential = format!("Authorization: Bearer {token}");
+    let summary_revision = || {
+        let response = http_get_local(port, &format!("{api}/review"));
+        response
+            .split("\"review_revision\":\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    let initial = summary_revision();
+    let bare = "op=add&doc=%2Fsample.md&body=Explain+the+anchor";
+    let source_revision = markview::annotations::source_revision(source);
+    let comment = format!(
+        "{bare}&source_revision={source_revision}&quote=%F0%9F%98%80+anchor&start=3&end=10"
+    );
+    let browser_credential = format!("X-Markview-Token: {}", review_token(&page));
+    assert!(post("annotations", &browser_credential, &comment).starts_with("HTTP/1.1 403"));
+    assert!(post("annotations", &credential, bare).starts_with("HTTP/1.1 400"));
+    let stale = format!("{bare}&source_revision=old");
+    assert!(post("annotations", &credential, &stale).starts_with("HTTP/1.1 409"));
+    assert!(!dir.path().join(".markview").exists());
+    let saved = post("annotations", &credential, &comment);
+    assert!(saved.starts_with("HTTP/1.1 200"), "{saved}");
+    assert!(
+        saved.contains(r#""quote":"😀 anchor","lines":[3,3]"#),
+        "{saved}"
+    );
+    let whole_document =
+        format!("op=add&doc=%2Fsample.md&body=Overall&source_revision={source_revision}");
+    assert!(post("annotations", &credential, &whole_document).starts_with("HTTP/1.1 200"));
+    let annotations = http_get_local(port, &format!("{api}/annotations?doc=%2Fsample.md"));
+    assert!(
+        annotations.contains("Explain the anchor") && annotations.contains("Overall"),
+        "{annotations}"
+    );
+    let finish = |revision: &str| {
+        let form = format!("op=finish&verdict=changes&doc=%2Fsample.md&source_revision={source_revision}&review_revision={revision}");
+        post("review", &credential, &form)
+    };
+    assert!(finish(&initial).starts_with("HTTP/1.1 409"));
+    assert!(finish(&summary_revision()).starts_with("HTTP/1.1 200"));
+    let until = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < until, "review server did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut output = String::new();
+    server
+        .child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    assert_eq!(status.code(), Some(2));
+    assert!(
+        output.contains("Review: changes requested (2 open comments in 1 document)"),
+        "{output}"
+    );
+}
+
 fn start_review_of(cwd: &std::path::Path, input: &str, options: &[&str]) -> ServeProcess {
     let child = std::process::Command::new(cargo_bin("markview"))
         .current_dir(cwd)

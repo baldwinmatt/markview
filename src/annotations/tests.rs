@@ -6,6 +6,7 @@ fn add(body: &str) -> Operation {
     Operation::Add {
         body: body.to_owned(),
         selection: None,
+        document_revision: None,
     }
 }
 
@@ -17,6 +18,7 @@ fn selection(source: &str, quote: &str, range: Range<usize>, body: &str) -> Oper
             range,
             revision: source_revision(source),
         }),
+        document_revision: None,
     }
 }
 
@@ -26,6 +28,28 @@ fn change(id: u64, review: &Review, change: Change) -> Operation {
         revision: review.store_revision.clone(),
         change,
     }
+}
+
+#[test]
+fn document_comment_revision_rejects_stale_source_before_creating_a_store() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("sample.md");
+    fs::write(&path, "# Original\n").unwrap();
+    let location = resolve(&path).unwrap();
+    let revision = source_revision("# Original\n");
+    let form = format!("op=add&body=Check+this&source_revision={revision}");
+    let operation = || Request::parse(form.as_bytes()).unwrap().operation;
+    fs::write(&path, "# Changed\n").unwrap();
+    assert!(matches!(
+        mutate(&location, operation()),
+        Err(Error::Conflict(_))
+    ));
+    assert!(!location.path.exists());
+    assert!(!dir.path().join(".markview").exists());
+    fs::write(&path, "# Original\n").unwrap();
+    let review = mutate(&location, operation()).unwrap();
+    assert_eq!(review.annotations[0].lines, None);
+    assert_eq!(review.annotations[0].body, "Check this");
 }
 
 #[test]

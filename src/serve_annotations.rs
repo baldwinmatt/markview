@@ -9,8 +9,8 @@ use markview::annotations::{self, Error, Request, FORM_CAP};
 use markview::DestinationKind;
 
 use super::{
-    broadcast_reload, decode_repeated, serve_review, write_response_headers, Clients, ReloadKind,
-    ServeConfig, SharedConfig, WATCH_DEBOUNCE,
+    broadcast_reload, decode_repeated, serve_api, serve_review, write_response_headers, Clients,
+    ReloadKind, ServeConfig, SharedConfig, WATCH_DEBOUNCE,
 };
 
 const ENDPOINT: &str = "/_markview/annotations";
@@ -238,6 +238,7 @@ impl HttpRequest {
                     | "content-type"
                     | "transfer-encoding"
                     | "x-markview-token"
+                    | "authorization"
             ) && headers
                 .insert(key, value.trim_matches([' ', '\t']).to_owned())
                 .is_some()
@@ -323,12 +324,7 @@ fn mutate_review(
     config.review_cache.mutate(location, operation)
 }
 
-fn annotation_response(
-    stream: &mut TcpStream,
-    status: &str,
-    body: &str,
-    head: bool,
-) -> io::Result<()> {
+fn json_response(stream: &mut TcpStream, status: &str, body: &str, head: bool) -> io::Result<()> {
     write_response_headers(
         stream,
         status,
@@ -366,6 +362,13 @@ fn post_body(
     bounded_bytes(reader, deadline, length, false).map_err(|_| "incomplete annotation request")
 }
 
+fn query_document(query: &str) -> Option<String> {
+    query
+        .strip_prefix("doc=")
+        .filter(|route| !route.contains('&'))
+        .and_then(|route| super::percent_decode(&route.replace('+', " ")))
+}
+
 pub fn handle(
     stream: &mut TcpStream,
     reader: &mut BufReader<TcpStream>,
@@ -377,7 +380,7 @@ pub fn handle(
 ) -> io::Result<()> {
     let head = request.method == "HEAD";
     let fail = |stream: &mut TcpStream, status: &str, message: &str| {
-        annotation_response(
+        json_response(
             stream,
             status,
             &format!("{{\"error\":{}}}", annotations::json_string(message)),
@@ -395,6 +398,47 @@ pub fn handle(
         .target
         .split_once('?')
         .unwrap_or((&request.target, ""));
+    let api = path.strip_prefix(serve_api::PREFIX);
+    if matches!(api, Some("documents" | "document")) {
+        if !matches!(request.method.as_str(), "GET" | "HEAD") {
+            return fail(stream, "405 Method Not Allowed", "method not allowed");
+        }
+        if api == Some("documents") {
+            if !query.is_empty() {
+                return fail(stream, "400 Bad Request", "unexpected documents query");
+            }
+            return json_response(
+                stream,
+                "200 OK",
+                &serve_api::catalog(&initial, session.is_some()),
+                head,
+            );
+        }
+        let Some(route) = query_document(query) else {
+            return fail(stream, "400 Bad Request", "expected a document route");
+        };
+        let Some(document) = initial.document_for_route(&route) else {
+            return fail(stream, "404 Not Found", "document is unavailable");
+        };
+        return match serve_api::source(&initial, document) {
+            Ok(body) => json_response(stream, "200 OK", &body, head),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fail(stream, "404 Not Found", "document is unavailable")
+            }
+            Err(error) => {
+                eprintln!(
+                    "markview: cannot read {}: {error}",
+                    document.source_path.display()
+                );
+                fail(stream, "500 Internal Server Error", "cannot read document")
+            }
+        };
+    }
+    let path = match api {
+        Some("annotations") => ENDPOINT,
+        Some("review") => serve_review::ENDPOINT,
+        _ => path,
+    };
     let review_endpoint = session.filter(|_| path == serve_review::ENDPOINT);
     if path != ENDPOINT && review_endpoint.is_none() {
         return if matches!(request.method.as_str(), "GET" | "HEAD") {
@@ -403,16 +447,26 @@ pub fn handle(
             fail(stream, "405 Method Not Allowed", "method not allowed")
         };
     }
-    let body = if request.method == "POST" && initial.session.review_token.is_some() {
-        if !token_matches(
-            request.header("x-markview-token"),
-            initial
-                .session
-                .review_token
-                .as_deref()
-                .expect("checked token"),
-        ) {
-            return fail(stream, "403 Forbidden", "invalid annotation token");
+    let body = if request.method == "POST" {
+        if api.is_some() {
+            let Some(expected) = initial.session.api_token.as_deref() else {
+                return fail(stream, "403 Forbidden", "API writes are disabled");
+            };
+            let presented = request
+                .header("authorization")
+                .and_then(|header| header.split_once(' '))
+                .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+                .map(|(_, token)| token);
+            if !token_matches(presented, expected) {
+                return fail(stream, "403 Forbidden", "invalid API token");
+            }
+        } else {
+            let Some(expected) = initial.session.review_token.as_deref() else {
+                return fail(stream, "405 Method Not Allowed", "method not allowed");
+            };
+            if !token_matches(request.header("x-markview-token"), expected) {
+                return fail(stream, "403 Forbidden", "invalid annotation token");
+            }
         }
         match post_body(reader, request, query, deadline) {
             Ok(body) => Some(body),
@@ -447,21 +501,17 @@ pub fn handle(
                 broadcast_reload(clients, ReloadKind::ReviewFinished);
                 let response = stream
                     .set_write_timeout(Some(Duration::from_millis(250)))
-                    .and_then(|()| annotation_response(stream, "200 OK", &json, false));
+                    .and_then(|()| json_response(stream, "200 OK", &json, false));
                 session.publish(result);
                 response
             }
-            Ok((json, None)) => annotation_response(stream, "200 OK", &json, head),
+            Ok((json, None)) => json_response(stream, "200 OK", &json, head),
             Err(error) => respond_error(stream, error, "review summary is unavailable", fail),
         };
     }
     let result = match request.method.as_str() {
         "GET" | "HEAD" => {
-            let Some(route) = query
-                .strip_prefix("doc=")
-                .filter(|route| !route.contains('&'))
-                .and_then(|route| super::percent_decode(&route.replace('+', " ")))
-            else {
+            let Some(route) = query_document(query) else {
                 return fail(stream, "400 Bad Request", "expected a document route");
             };
             let Some(document) = initial.document_for_route(&route) else {
@@ -474,13 +524,25 @@ pub fn handle(
             page_review(&initial, document).map(Some)
         }
         "POST" if body.is_some() => {
-            // Review mutations use the current allowlist and hold it stable
-            // through validation and writing. Ordinary serve uses its
-            // immutable request snapshot.
-            let published = session.map(|_| shared.read().expect("config lock"));
+            // Agent writes and blocking reviews use the current allowlist
+            // and hold it stable through validation and writing.
+            let published =
+                (session.is_some() || api.is_some()).then(|| shared.read().expect("config lock"));
             let config = published.as_deref().unwrap_or(&initial);
             let mutation = || {
                 let form = Request::parse(body.as_deref().expect("validated POST"))?;
+                if api.is_some()
+                    && matches!(
+                        &form.operation,
+                        annotations::Operation::Add {
+                            selection: None,
+                            document_revision: None,
+                            ..
+                        }
+                    )
+                {
+                    return Err(Error::Invalid("source revision required"));
+                }
                 let route = form
                     .doc
                     .ok_or(Error::Invalid("expected a document route"))?;
@@ -503,7 +565,7 @@ pub fn handle(
         _ => return fail(stream, "405 Method Not Allowed", "method not allowed"),
     };
     match result {
-        Ok(Some(review)) => annotation_response(stream, "200 OK", &review.json(), head),
+        Ok(Some(review)) => json_response(stream, "200 OK", &review.json(), head),
         Ok(None) => fail(
             stream,
             "404 Not Found",
@@ -526,7 +588,7 @@ fn respond_error(
     let message = error.to_string();
     match error {
         Error::Invalid(_) => fail(stream, "400 Bad Request", &message),
-        Error::Conflict(_) if serve_review::is_finished(&error) => annotation_response(
+        Error::Conflict(_) if serve_review::is_finished(&error) => json_response(
             stream,
             "409 Conflict",
             &format!(
